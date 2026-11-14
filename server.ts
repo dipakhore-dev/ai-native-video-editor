@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { connectDatabase } from "./server/config/database.ts";
 import { getEnvConfig } from "./server/config/env.ts";
+import { initializeVideoQueue } from "./server/queues/videoQueue.ts";
 import { apiRouter } from "./server/routes/index.ts";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,6 +19,8 @@ async function startServer() {
 
   // Attempt MongoDB connection when MONGODB_URI is provided; preview mode continues gracefully if unset
   await connectDatabase();
+  // Initialize Redis/BullMQ queue when REDIS_URL is configured; skipped gracefully otherwise
+  await initializeVideoQueue();
 
   app.use(express.json({ limit: "10mb" }));
   app.use(cookieParser());

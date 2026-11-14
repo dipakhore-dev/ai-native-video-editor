@@ -8,6 +8,10 @@ export interface AppEnvConfig {
   authCookieName: string;
   clientOrigin: string;
   geminiApiKey: string;
+  videoProcessorUrl: string;
+  videoProcessorApiKey: string;
+  redisUrl: string;
+  videoUploadMaxMb: number;
 }
 
 export function getEnvConfig(): AppEnvConfig {
@@ -22,6 +26,12 @@ export function getEnvConfig(): AppEnvConfig {
     authCookieName: process.env.AUTH_COOKIE_NAME || "ai_studio_token",
     clientOrigin: process.env.CLIENT_ORIGIN || process.env.APP_URL || "http://localhost:3000",
     geminiApiKey: (process.env.GEMINI_API_KEY || "").trim(),
+    videoProcessorUrl: (process.env.VIDEO_PROCESSOR_URL || "")
+      .trim()
+      .replace(/\/+$/, ""),
+    videoProcessorApiKey: (process.env.VIDEO_PROCESSOR_API_KEY || "").trim(),
+    redisUrl: (process.env.REDIS_URL || "").trim(),
+    videoUploadMaxMb: Math.max(1, Number(process.env.VIDEO_UPLOAD_MAX_MB || 500)),
   };
 }
 
@@ -62,4 +72,12 @@ export function isGeminiConfigured(): boolean {
 export function isJwtConfigured(): boolean {
   const { jwtSecret } = getEnvConfig();
   return Boolean(jwtSecret && jwtSecret.length >= 16 && jwtSecret !== "REPLACE_WITH_SECURE_RANDOM_SECRET");
+}
+
+export function isRedisConfigured(): boolean {
+  return Boolean(getEnvConfig().redisUrl);
+}
+
+export function isVideoProcessorUrlConfigured(): boolean {
+  return Boolean(getEnvConfig().videoProcessorUrl);
 }
