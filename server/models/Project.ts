@@ -38,6 +38,29 @@ export interface ITimelineClipSubdoc {
   textStyle?: ITextOverlayStyleSubdoc;
 }
 
+export interface ISubtitleSegmentSubdoc {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  clipId?: string;
+}
+
+export interface ISubtitleStyleSubdoc {
+  enabled: boolean;
+  fontSize: number;
+  color: string;
+  position: "bottom" | "middle" | "top";
+  backgroundColor: string;
+  backgroundOpacity: number;
+}
+
+export interface ISubtitleMetaSubdoc {
+  language?: string;
+  model?: string;
+  generatedAt?: string;
+}
+
 export interface IProject extends Document {
   userId: mongoose.Types.ObjectId;
   name: string;
@@ -47,6 +70,9 @@ export interface IProject extends Document {
   fps: 24 | 30 | 60;
   tracks: ITimelineTrackSubdoc[];
   clips: ITimelineClipSubdoc[];
+  subtitles?: ISubtitleSegmentSubdoc[];
+  subtitleStyle?: ISubtitleStyleSubdoc;
+  subtitleMeta?: ISubtitleMetaSubdoc;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -98,6 +124,38 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
   { _id: false }
 );
 
+const SubtitleSegmentSchema = new Schema<ISubtitleSegmentSubdoc>(
+  {
+    id: { type: String, required: true },
+    start: { type: Number, required: true, min: 0 },
+    end: { type: Number, required: true, min: 0 },
+    text: { type: String, required: true, maxlength: 500 },
+    clipId: { type: String },
+  },
+  { _id: false }
+);
+
+const SubtitleStyleSchema = new Schema<ISubtitleStyleSubdoc>(
+  {
+    enabled: { type: Boolean, default: true },
+    fontSize: { type: Number, default: 28, min: 12, max: 72 },
+    color: { type: String, default: "#FFFFFF" },
+    position: { type: String, enum: ["bottom", "middle", "top"], default: "bottom" },
+    backgroundColor: { type: String, default: "#09090B" },
+    backgroundOpacity: { type: Number, default: 0.75, min: 0, max: 1 },
+  },
+  { _id: false }
+);
+
+const SubtitleMetaSchema = new Schema<ISubtitleMetaSubdoc>(
+  {
+    language: { type: String },
+    model: { type: String },
+    generatedAt: { type: String },
+  },
+  { _id: false }
+);
+
 const ProjectSchema = new Schema<IProject>(
   {
     userId: {
@@ -145,6 +203,25 @@ const ProjectSchema = new Schema<IProject>(
     clips: {
       type: [TimelineClipSchema],
       default: [],
+    },
+    subtitles: {
+      type: [SubtitleSegmentSchema],
+      default: [],
+    },
+    subtitleStyle: {
+      type: SubtitleStyleSchema,
+      default: () => ({
+        enabled: true,
+        fontSize: 28,
+        color: "#FFFFFF",
+        position: "bottom",
+        backgroundColor: "#09090B",
+        backgroundOpacity: 0.75,
+      }),
+    },
+    subtitleMeta: {
+      type: SubtitleMetaSchema,
+      required: false,
     },
   },
   {

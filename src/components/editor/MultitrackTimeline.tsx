@@ -111,10 +111,18 @@ export function MultitrackTimeline({
       return;
     }
 
+    const initialClip = { ...clip };
+    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({ ...c })),
+      clips: project.clips.map((c) => ({
+        ...c,
+        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+      })),
+      subtitles: initialSubtitles.map((s) => ({ ...s })),
+      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
+      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
     };
 
     const initialX = e.clientX;
@@ -126,7 +134,10 @@ export function MultitrackTimeline({
       if (Math.abs(deltaPx) > 2) moved = true;
       const deltaSec = deltaPx / zoomPxPerSec;
       const nextStart = snapTime(initialStart + deltaSec);
-      updateClip(clip.id, { startTime: nextStart }, false);
+      updateClip(clip.id, { startTime: nextStart }, false, {
+        clip: initialClip,
+        subtitles: initialSubtitles,
+      });
     };
 
     const onUp = () => {
@@ -150,14 +161,21 @@ export function MultitrackTimeline({
     onSelectClip(clip.id);
     if (trackLocked) return;
 
+    const initialClip = { ...clip };
+    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({ ...c })),
+      clips: project.clips.map((c) => ({
+        ...c,
+        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+      })),
+      subtitles: initialSubtitles.map((s) => ({ ...s })),
+      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
+      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
     };
 
     const initialX = e.clientX;
-    const initialClip = { ...clip };
     let moved = false;
 
     const onMove = (moveEv: MouseEvent) => {
@@ -166,7 +184,10 @@ export function MultitrackTimeline({
       const deltaSec = deltaPx / zoomPxPerSec;
       const desiredStart = snapTime(initialClip.startTime + deltaSec);
       const patch = trimClipStart(initialClip, desiredStart);
-      updateClip(clip.id, patch, false);
+      updateClip(clip.id, patch, false, {
+        clip: initialClip,
+        subtitles: initialSubtitles,
+      });
     };
 
     const onUp = () => {
@@ -190,10 +211,18 @@ export function MultitrackTimeline({
     onSelectClip(clip.id);
     if (trackLocked) return;
 
+    const initialClip = { ...clip };
+    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({ ...c })),
+      clips: project.clips.map((c) => ({
+        ...c,
+        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+      })),
+      subtitles: initialSubtitles.map((s) => ({ ...s })),
+      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
+      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
     };
 
     const initialX = e.clientX;
@@ -209,7 +238,10 @@ export function MultitrackTimeline({
       if (Math.abs(deltaPx) > 1) moved = true;
       const deltaSec = deltaPx / zoomPxPerSec;
       const clamped = Math.min(maxDur, Math.max(0.5, snapTime(initialDur + deltaSec)));
-      updateClip(clip.id, { duration: clamped }, false);
+      updateClip(clip.id, { duration: clamped }, false, {
+        clip: initialClip,
+        subtitles: initialSubtitles,
+      });
     };
 
     const onUp = () => {

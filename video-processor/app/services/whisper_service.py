@@ -129,7 +129,13 @@ def _get_whisper_model(model_size: str, device: str, compute_type: str) -> Any:
 
     key = (model_size, device, compute_type)
     if key not in _cached_models:
-        _cached_models[key] = WhisperModel(model_size, device=device, compute_type=compute_type)
+        try:
+            _cached_models[key] = WhisperModel(model_size, device=device, compute_type=compute_type)
+        except Exception as exc:
+            raise SubtitleGenerationError(
+                f"Failed to load faster-whisper model '{model_size}' ({device}/{compute_type}): {exc}",
+                status_code=500,
+            ) from exc
     return _cached_models[key]
 
 
@@ -161,25 +167,35 @@ def transcribe_video_subtitles(
     )
 
     model = _get_whisper_model(model_size, device, compute_type)
-    raw_segments, info = model.transcribe(
-        str(wav_path),
-        language=language or None,
-        vad_filter=True,
-    )
-
-    segments: list[dict[str, Any]] = []
-    for idx, seg in enumerate(raw_segments, start=1):
-        text = (seg.text or "").strip()
-        if not text:
-            continue
-        segments.append(
-            {
-                "id": idx,
-                "start": round(float(seg.start), 3),
-                "end": round(float(seg.end), 3),
-                "text": text,
-            }
+    try:
+        raw_segments, info = model.transcribe(
+            str(wav_path),
+            language=language or None,
+            vad_filter=True,
         )
+
+        segments: list[dict[str, Any]] = []
+        for idx, seg in enumerate(raw_segments, start=1):
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            start_val = max(0.0, round(float(seg.start), 3))
+            end_val = max(start_val + 0.05, round(float(seg.end), 3))
+            segments.append(
+                {
+                    "id": idx,
+                    "start": start_val,
+                    "end": end_val,
+                    "text": text,
+                }
+            )
+    except SubtitleGenerationError:
+        raise
+    except Exception as exc:
+        raise SubtitleGenerationError(
+            f"Subtitle transcription failed: {exc}",
+            status_code=422,
+        ) from exc
 
     return {
         "model": f"faster-whisper-{model_size}",

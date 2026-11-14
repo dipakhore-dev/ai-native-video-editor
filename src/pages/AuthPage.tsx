@@ -4,7 +4,7 @@ import { useStudio } from "../context/StudioContext";
 import { submitAuthLogin, submitAuthRegister } from "../services/api";
 
 export function AuthPage() {
-  const { navigate, updateSessionUser } = useStudio();
+  const { navigate, hydrateAuthenticatedWorkspace } = useStudio();
   const [mode, setMode] = useState<"login" | "register">("login");
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
@@ -27,19 +27,14 @@ export function AuthPage() {
         ? await submitAuthLogin({ email, password })
         : await submitAuthRegister({ fullName, email, password });
 
-    setSubmitting(false);
-
     if (res.ok && res.data?.user) {
-      updateSessionUser({
-        displayName: res.data.user.fullName,
-        email: res.data.user.email,
-        workspaceName: res.data.user.workspaceName,
-        defaultFps: res.data.user.defaultFps,
-        defaultResolution: res.data.user.defaultResolution,
-      });
+      await hydrateAuthenticatedWorkspace(res.data.user);
+      setSubmitting(false);
       navigate("dashboard");
       return;
     }
+
+    setSubmitting(false);
 
     if (!res.ok) {
       setFeedback({

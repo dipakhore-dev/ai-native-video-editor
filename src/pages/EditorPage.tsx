@@ -19,14 +19,16 @@ import {
   Check,
   AlertTriangle,
   Type,
+  Captions,
 } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
 import { MultitrackTimeline } from "../components/editor/MultitrackTimeline";
-import { AiAssistantPanel } from "../components/editor/AiAssistantPanel";
+import { AiAssistantPanel, type EditorPanelTab } from "../components/editor/AiAssistantPanel";
 import { ExportModal } from "../components/editor/ExportModal";
 import { useStudio } from "../context/StudioContext";
 import type { MediaAsset, Project, TimelineClip } from "../types/studio";
 import { formatTimecode } from "../utils/media";
+import { getSubtitleStyle, hexToRgba } from "../utils/subtitles";
 
 export function EditorPage() {
   const {
@@ -66,6 +68,7 @@ export function EditorPage() {
   const [binDragOver, setBinDragOver] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [saveFlash, setSaveFlash] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<EditorPanelTab>("assistant");
 
   const totalDuration = useMemo(() => {
     if (!activeProject || activeProject.clips.length === 0) return 0;
@@ -136,6 +139,18 @@ export function EditorPage() {
       ) ?? null
     );
   }, [activeProject, playheadTime]);
+
+  const subtitleStyle = useMemo(() => getSubtitleStyle(activeProject), [activeProject]);
+
+  const activeSubtitles = useMemo(() => {
+    if (!activeProject || !subtitleStyle.enabled) return [];
+    return (activeProject.subtitles ?? []).filter(
+      (s) =>
+        s.text.trim().length > 0 &&
+        playheadTime >= s.start &&
+        playheadTime < s.end
+    );
+  }, [activeProject, playheadTime, subtitleStyle.enabled]);
 
   const primaryVisualClip = activeV1Clip ?? activeV2Clip;
   const primaryTrackMuted =
@@ -450,6 +465,20 @@ export function EditorPage() {
           <button
             type="button"
             disabled={!activeProject}
+            onClick={() => setRightPanelTab("subtitles")}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 disabled:opacity-40 ${
+              rightPanelTab === "subtitles"
+                ? "border-violet-500/60 bg-violet-500/15 text-violet-200"
+                : "border-zinc-800 bg-zinc-900 text-zinc-200 hover:bg-zinc-800"
+            }`}
+            title="Open AI-Powered Automatic Subtitles"
+          >
+            <Captions className="h-3.5 w-3.5 text-violet-400" />
+            <span>Generate Subtitles</span>
+          </button>
+          <button
+            type="button"
+            disabled={!activeProject}
             onClick={triggerLocalSave}
             className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
             title={
@@ -746,6 +775,40 @@ export function EditorPage() {
                     );
                   })}
 
+                  {/* Synchronized Automatic Subtitles */}
+                  {activeSubtitles.length > 0 && (
+                    <div
+                      className={`absolute left-1/2 -translate-x-1/2 z-10 w-[88%] flex flex-col items-center gap-1 pointer-events-none ${
+                        subtitleStyle.position === "top"
+                          ? "top-9"
+                          : subtitleStyle.position === "middle"
+                            ? "top-1/2 -translate-y-1/2"
+                            : "bottom-5"
+                      }`}
+                    >
+                      {activeSubtitles.map((cue) => (
+                        <div
+                          key={cue.id}
+                          style={{
+                            fontSize: `${Math.max(12, Math.round(subtitleStyle.fontSize * 0.58))}px`,
+                            color: subtitleStyle.color,
+                            backgroundColor: hexToRgba(
+                              subtitleStyle.backgroundColor,
+                              subtitleStyle.backgroundOpacity
+                            ),
+                            textShadow:
+                              subtitleStyle.backgroundOpacity <= 0.05
+                                ? "0 1px 3px rgba(0,0,0,0.95)"
+                                : undefined,
+                          }}
+                          className="px-3 py-1 rounded-md font-medium text-center leading-snug whitespace-pre-wrap max-w-full"
+                        >
+                          {cue.text}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* Hidden synchronized audio element for A1 Audio track */}
                   <audio
                     ref={audioRef}
@@ -887,12 +950,18 @@ export function EditorPage() {
               </div>
             </section>
 
-            {/* Right Inspector & AI Assistant */}
+            {/* Right Inspector, AI Assistant & Subtitles */}
             <AiAssistantPanel
               project={activeProject}
               selectedClip={selectedClip}
               totalDuration={totalDuration}
               playheadTime={playheadTime}
+              onSeek={(t) => {
+                setIsPlaying(false);
+                handleSeek(t);
+              }}
+              activeTab={rightPanelTab}
+              onTabChange={setRightPanelTab}
             />
           </div>
 

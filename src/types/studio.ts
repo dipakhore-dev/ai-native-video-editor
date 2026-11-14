@@ -72,6 +72,31 @@ export interface TimelineClip {
 export type AspectRatioOption = "16:9" | "9:16" | "1:1";
 export type ResolutionOption = "1080p" | "4K" | "720p";
 
+export type SubtitlePosition = "bottom" | "middle" | "top";
+
+export interface SubtitleSegment {
+  id: string;
+  start: number; // timeline seconds
+  end: number; // timeline seconds
+  text: string;
+  clipId?: string;
+}
+
+export interface SubtitleStyle {
+  enabled: boolean;
+  fontSize: number;
+  color: string;
+  position: SubtitlePosition;
+  backgroundColor: string;
+  backgroundOpacity: number;
+}
+
+export interface SubtitleMetadata {
+  language?: string;
+  model?: string;
+  generatedAt?: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -83,6 +108,9 @@ export interface Project {
   createdAt: string;
   tracks: TimelineTrack[];
   clips: TimelineClip[];
+  subtitles?: SubtitleSegment[];
+  subtitleStyle?: SubtitleStyle;
+  subtitleMeta?: SubtitleMetadata;
 }
 
 export interface RenderTimelineClipSpec {
@@ -118,6 +146,9 @@ export interface RenderTimelinePayload {
   };
   tracks: TimelineTrack[];
   clips: RenderTimelineClipSpec[];
+  burnSubtitles?: boolean;
+  subtitles?: SubtitleSegment[];
+  subtitleStyle?: SubtitleStyle;
 }
 
 export interface ExportAttempt {
@@ -149,10 +180,11 @@ export interface IntegrationStatusItem {
 export type IntegrationStatusMap = Record<string, IntegrationStatusItem>;
 
 export interface SessionUser {
+  id?: string;
   displayName: string;
   email: string;
   workspaceName: string;
-  mode: "local_session";
+  mode: "local_session" | "authenticated";
   defaultFps: 24 | 30 | 60;
   defaultResolution: ResolutionOption;
 }

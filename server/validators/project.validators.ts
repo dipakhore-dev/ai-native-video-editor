@@ -38,6 +38,33 @@ export const TimelineClipSchema = z.object({
   textStyle: TextOverlayStyleSchema.optional(),
 });
 
+export const SubtitleSegmentSchema = z
+  .object({
+    id: z.string().min(1),
+    start: z.number().min(0),
+    end: z.number().min(0),
+    text: z.string().trim().min(1).max(500),
+    clipId: z.string().optional(),
+  })
+  .refine((seg) => seg.end > seg.start, {
+    message: "Subtitle end time must be greater than start time.",
+  });
+
+export const SubtitleStyleSchema = z.object({
+  enabled: z.boolean().default(true),
+  fontSize: z.number().min(12).max(72).default(28),
+  color: z.string().min(3).max(32).default("#FFFFFF"),
+  position: z.enum(["bottom", "middle", "top"]).default("bottom"),
+  backgroundColor: z.string().min(3).max(32).default("#09090B"),
+  backgroundOpacity: z.number().min(0).max(1).default(0.75),
+});
+
+export const SubtitleMetaSchema = z.object({
+  language: z.string().max(32).optional(),
+  model: z.string().max(64).optional(),
+  generatedAt: z.string().max(64).optional(),
+});
+
 export const CreateProjectSchema = z.object({
   name: z.string().trim().min(1, "Project name is required.").max(140),
   description: z.string().trim().max(500).optional().default(""),
@@ -46,6 +73,9 @@ export const CreateProjectSchema = z.object({
   fps: z.union([z.literal(24), z.literal(30), z.literal(60)]).default(24),
   tracks: z.array(TimelineTrackSchema).optional(),
   clips: z.array(TimelineClipSchema).optional(),
+  subtitles: z.array(SubtitleSegmentSchema).optional(),
+  subtitleStyle: SubtitleStyleSchema.optional(),
+  subtitleMeta: SubtitleMetaSchema.optional(),
 });
 
 export const UpdateProjectSchema = z
@@ -64,4 +94,13 @@ export const UpdateTimelineSchema = z.object({
   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).optional(),
   tracks: z.array(TimelineTrackSchema).min(1),
   clips: z.array(TimelineClipSchema),
+  subtitles: z.array(SubtitleSegmentSchema).optional(),
+  subtitleStyle: SubtitleStyleSchema.optional(),
+  subtitleMeta: SubtitleMetaSchema.optional(),
+});
+
+export const UpdateSubtitlesSchema = z.object({
+  subtitles: z.array(SubtitleSegmentSchema),
+  subtitleStyle: SubtitleStyleSchema.optional(),
+  subtitleMeta: SubtitleMetaSchema.optional(),
 });

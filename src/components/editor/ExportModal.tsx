@@ -8,11 +8,13 @@ import {
   CheckCircle2,
   Loader2,
   LogIn,
+  Captions,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import { exportTimelineMp4 } from "../../services/api";
 import type { MediaAsset, Project, RenderTimelinePayload, TimelineClip } from "../../types/studio";
 import { formatBytes, formatTimecode } from "../../utils/media";
+import { getSubtitleStyle } from "../../utils/subtitles";
 import { buildStructuredTimelineSpec } from "../../utils/timeline";
 
 interface ExportModalProps {
@@ -149,7 +151,17 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         ? "1280x720"
         : "1920x1080"
   );
+  const validSubtitles = useMemo(
+    () =>
+      (project.subtitles ?? []).filter(
+        (s) => s.text.trim().length > 0 && Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.start >= 0
+      ),
+    [project.subtitles]
+  );
+  const subtitleStyle = useMemo(() => getSubtitleStyle(project), [project]);
+
   const [fps, setFps] = useState<number>(project.fps);
+  const [burnSubtitles, setBurnSubtitles] = useState<boolean>(validSubtitles.length > 0);
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<ExportFeedbackState | null>(null);
 
@@ -220,6 +232,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       }
 
       const resolutionPreset = resolution === "1920x1080" ? "1080p" : "720p";
+      const shouldBurnSubtitles = burnSubtitles && validSubtitles.length > 0;
       const exportSpec: RenderTimelinePayload & { format: "mp4" } = {
         ...structuredSpec,
         format: "mp4",
@@ -231,6 +244,13 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           ...c,
           fileIndex: clipFileIndexById[c.id] ?? 0,
         })),
+        ...(shouldBurnSubtitles
+          ? {
+              burnSubtitles: true,
+              subtitles: validSubtitles,
+              subtitleStyle,
+            }
+          : {}),
       };
 
       const formData = new FormData();
@@ -426,6 +446,34 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
               </select>
             </div>
           </div>
+
+          {/* Burn-in Subtitles Option */}
+          <label
+            className={`flex items-start gap-2.5 rounded-lg border p-3 text-xs transition-colors ${
+              validSubtitles.length > 0
+                ? "border-zinc-800 bg-[#09090B] cursor-pointer hover:border-zinc-700"
+                : "border-zinc-800/60 bg-[#09090B]/60 opacity-60 cursor-not-allowed"
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={burnSubtitles && validSubtitles.length > 0}
+              disabled={submitting || validSubtitles.length === 0}
+              onChange={(e) => setBurnSubtitles(e.target.checked)}
+              className="mt-0.5 accent-violet-500 rounded"
+            />
+            <div className="space-y-0.5 min-w-0">
+              <div className="flex items-center gap-1.5 font-medium text-zinc-200">
+                <Captions className="h-3.5 w-3.5 text-violet-400 shrink-0" />
+                <span>Burn subtitles into exported MP4 (FFmpeg)</span>
+              </div>
+              <p className="text-[11px] text-zinc-400">
+                {validSubtitles.length > 0
+                  ? `${validSubtitles.length} cues · ${subtitleStyle.fontSize}px · ${subtitleStyle.position} position`
+                  : "No subtitle cues in project yet. Generate or add subtitles in the Subtitles tab to burn them into MP4."}
+              </p>
+            </div>
+          </label>
 
           <p className="text-[11px] text-zinc-500 leading-relaxed">
             Uploads local track V1 video clips directly to the authenticated FFmpeg processor for clip trimming, merging, and {project.aspectRatio} MP4 rendering.

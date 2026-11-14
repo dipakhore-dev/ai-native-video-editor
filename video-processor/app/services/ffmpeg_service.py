@@ -30,10 +30,11 @@ def _require_ffmpeg(ffmpeg_bin: str) -> str:
     return resolved
 
 
-def _run_ffmpeg(cmd: list[str], timeout_sec: int) -> None:
+def _run_ffmpeg(cmd: list[str], timeout_sec: int, *, cwd: Path | None = None) -> None:
     try:
         proc = subprocess.run(
             cmd,
+            cwd=str(cwd) if cwd is not None else None,
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -665,9 +666,12 @@ def export_timeline_mp4(
             segments.append(src_path)
 
     if len(segments) == 1:
-        return export_mp4(
+        raw_export_path = (
+            work_dir / "pre_subtitles.mp4" if bool(timeline_spec.get("burnSubtitles")) else output_path
+        )
+        rendered_meta = export_mp4(
             segments[0],
-            output_path,
+            raw_export_path,
             resolution=eff_resolution,
             fps=eff_fps,
             aspect_ratio=eff_aspect,
@@ -676,42 +680,239 @@ def export_timeline_mp4(
             timeout_sec=timeout_sec,
             max_duration_sec=max_duration_sec,
         )
+    else:
+        target_w, target_h = _resolve_export_dimensions(eff_resolution, eff_aspect)
+        target_ratio = target_w / target_h
+        prepared_segments: list[Path] = []
+        for idx, seg_path in enumerate(segments):
+            if eff_aspect is not None:
+                seg_meta = extract_video_metadata(seg_path, ffprobe_bin=ffprobe_bin)
+                seg_w = int(seg_meta["video"]["width"])
+                seg_h = int(seg_meta["video"]["height"])
+                seg_ratio = seg_w / seg_h if seg_h > 0 else target_ratio
+                if abs(seg_ratio - target_ratio) > 0.03:
+                    cropped_path = work_dir / f"seg_{idx}_aspect.mp4"
+                    resize_crop_aspect_ratio(
+                        seg_path,
+                        cropped_path,
+                        target_width=target_w,
+                        target_height=target_h,
+                        fit_mode="crop",
+                        ffmpeg_bin=ffmpeg_bin,
+                        ffprobe_bin=ffprobe_bin,
+                        timeout_sec=timeout_sec,
+                        max_duration_sec=max_duration_sec,
+                    )
+                    prepared_segments.append(cropped_path)
+                    continue
+            prepared_segments.append(seg_path)
 
-    target_w, target_h = _resolve_export_dimensions(eff_resolution, eff_aspect)
-    target_ratio = target_w / target_h
-    prepared_segments: list[Path] = []
-    for idx, seg_path in enumerate(segments):
-        if eff_aspect is not None:
-            seg_meta = extract_video_metadata(seg_path, ffprobe_bin=ffprobe_bin)
-            seg_w = int(seg_meta["video"]["width"])
-            seg_h = int(seg_meta["video"]["height"])
-            seg_ratio = seg_w / seg_h if seg_h > 0 else target_ratio
-            if abs(seg_ratio - target_ratio) > 0.03:
-                cropped_path = work_dir / f"seg_{idx}_aspect.mp4"
-                resize_crop_aspect_ratio(
-                    seg_path,
-                    cropped_path,
-                    target_width=target_w,
-                    target_height=target_h,
-                    fit_mode="crop",
-                    ffmpeg_bin=ffmpeg_bin,
-                    ffprobe_bin=ffprobe_bin,
-                    timeout_sec=timeout_sec,
-                    max_duration_sec=max_duration_sec,
-                )
-                prepared_segments.append(cropped_path)
-                continue
-        prepared_segments.append(seg_path)
+        raw_export_path = (
+            work_dir / "pre_subtitles.mp4" if bool(timeline_spec.get("burnSubtitles")) else output_path
+        )
+        rendered_meta = merge_video_clips(
+            prepared_segments,
+            raw_export_path,
+            target_width=target_w,
+            target_height=target_h,
+            fps=eff_fps,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            timeout_sec=timeout_sec,
+            max_total_duration_sec=max_duration_sec,
+        )
 
-    return merge_video_clips(
-        prepared_segments,
-        output_path,
-        target_width=target_w,
-        target_height=target_h,
-        fps=eff_fps,
-        ffmpeg_bin=ffmpeg_bin,
-        ffprobe_bin=ffprobe_bin,
-        timeout_sec=timeout_sec,
-        max_total_duration_sec=max_duration_sec,
-    )
+    if bool(timeline_spec.get("burnSubtitles")):
+        subtitles = timeline_spec.get("subtitles")
+        if not isinstance(subtitles, list) or len(subtitles) == 0:
+            raise VideoProcessingError(
+                "Subtitle burn-in is enabled, but there are no subtitle cues to burn.",
+                status_code=400,
+            )
+        style = (
+            timeline_spec.get("subtitleStyle")
+            if isinstance(timeline_spec.get("subtitleStyle"), dict)
+            else {}
+        )
+        out_w = int(rendered_meta["video"]["width"])
+        out_h = int(rendered_meta["video"]["height"])
+        ass_path = work_dir / "subtitles.ass"
+        _write_ass_subtitles(subtitles, style, ass_path, width=out_w, height=out_h)
+        return burn_subtitles_into_mp4(
+            raw_export_path,
+            output_path,
+            ass_path,
+            has_audio=bool(rendered_meta.get("has_audio")),
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            timeout_sec=timeout_sec,
+        )
+
+    return rendered_meta
+
+
+def _hex_to_ass_color(hex_color: str, opacity: float = 1.0) -> str:
+    raw = (hex_color or "#FFFFFF").strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(ch * 2 for ch in raw)
+    if len(raw) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in raw):
+        raw = "FFFFFF"
+    rr = raw[0:2].upper()
+    gg = raw[2:4].upper()
+    bb = raw[4:6].upper()
+    clamped = max(0.0, min(1.0, float(opacity)))
+    # ASS alpha is inverted: 00 = opaque, FF = transparent
+    aa = f"{int(round((1.0 - clamped) * 255)):02X}"
+    return f"&H{aa}{bb}{gg}{rr}"
+
+
+def _format_ass_timestamp(seconds: float) -> str:
+    total_cs = max(0, int(round(float(seconds) * 100)))
+    cs = total_cs % 100
+    sec = (total_cs // 100) % 60
+    mins = (total_cs // 6000) % 60
+    hrs = total_cs // 360000
+    return f"{hrs}:{mins:02d}:{sec:02d}.{cs:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = cleaned.replace("{", r"\{").replace("}", r"\}")
+    return cleaned.replace("\n", r"\N").strip()
+
+
+def _write_ass_subtitles(
+    subtitles: Sequence[dict],
+    style: dict,
+    ass_path: Path,
+    *,
+    width: int,
+    height: int,
+) -> None:
+    font_size_ui = float(style.get("fontSize", 28))
+    font_size_ui = max(12.0, min(72.0, font_size_ui))
+    ass_font_size = max(18, int(round(font_size_ui * (height / 540.0))))
+
+    text_color = _hex_to_ass_color(str(style.get("color", "#FFFFFF")), 1.0)
+    bg_opacity = float(style.get("backgroundOpacity", 0.75))
+    bg_opacity = max(0.0, min(1.0, bg_opacity))
+    bg_color_hex = str(style.get("backgroundColor", "#09090B"))
+
+    if bg_opacity > 0.05:
+        border_style = 3
+        outline_colour = _hex_to_ass_color(bg_color_hex, bg_opacity)
+        back_colour = "&HFF000000"
+        outline_width = 8
+        shadow_depth = 0
+    else:
+        border_style = 1
+        outline_colour = "&H00000000"
+        back_colour = "&H80000000"
+        outline_width = 2
+        shadow_depth = 1
+
+    position = str(style.get("position", "bottom")).lower()
+    if position == "top":
+        alignment = 8
+        margin_v = max(24, int(round(height * 0.07)))
+    elif position == "middle":
+        alignment = 5
+        margin_v = 0
+    else:
+        alignment = 2
+        margin_v = max(24, int(round(height * 0.07)))
+
+    margin_h = max(24, int(round(width * 0.05)))
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,Arial,{ass_font_size},{text_color},&H000000FF,{outline_colour},{back_colour},1,0,0,0,100,100,0,0,{border_style},{outline_width},{shadow_depth},{alignment},{margin_h},{margin_h},{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    valid_cues = 0
+    for idx, cue in enumerate(subtitles):
+        if not isinstance(cue, dict):
+            raise VideoProcessingError("Invalid subtitle cue object.", status_code=400)
+        try:
+            start_sec = float(cue["start"])
+            end_sec = float(cue["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VideoProcessingError(
+                f"Subtitle cue #{idx + 1} is missing valid numeric start/end timestamps.",
+                status_code=400,
+            ) from exc
+        if start_sec < 0 or end_sec <= start_sec:
+            raise VideoProcessingError(
+                f"Subtitle cue #{idx + 1} has invalid range ({start_sec:.2f}s to {end_sec:.2f}s).",
+                status_code=400,
+            )
+        escaped_text = _escape_ass_text(str(cue.get("text", "")))
+        if not escaped_text:
+            continue
+        start_ts = _format_ass_timestamp(start_sec)
+        end_ts = _format_ass_timestamp(end_sec)
+        lines.append(f"Dialogue: 0,{start_ts},{end_ts},Default,,0,0,0,,{escaped_text}")
+        valid_cues += 1
+
+    if valid_cues == 0:
+        raise VideoProcessingError(
+            "Subtitle burn-in is enabled, but all subtitle cues have empty text.",
+            status_code=400,
+        )
+
+    ass_path.parent.mkdir(parents=True, exist_ok=True)
+    ass_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def burn_subtitles_into_mp4(
+    input_path: Path,
+    output_path: Path,
+    ass_path: Path,
+    *,
+    has_audio: bool = True,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    timeout_sec: int = 240,
+) -> dict:
+    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
+    resolved_in = input_path.resolve()
+    resolved_out = output_path.resolve()
+    resolved_ass = ass_path.resolve()
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(resolved_in),
+        "-vf",
+        f"ass={resolved_ass.name}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if has_audio:
+        cmd.extend(["-c:a", "copy"])
+    else:
+        cmd.append("-an")
+    cmd.extend(["-movflags", "+faststart", str(resolved_out)])
+
+    _run_ffmpeg(cmd, timeout_sec, cwd=resolved_ass.parent)
+    return extract_video_metadata(resolved_out, ffprobe_bin=ffprobe_bin)
 

@@ -361,6 +361,22 @@ interface ParsedTimelineExportSpec {
     opacity?: number;
     fileIndex?: number;
   }>;
+  burnSubtitles?: boolean;
+  subtitles?: Array<{
+    id?: string;
+    start?: number;
+    end?: number;
+    text?: string;
+    clipId?: string;
+  }>;
+  subtitleStyle?: {
+    enabled?: boolean;
+    fontSize?: number;
+    color?: string;
+    position?: string;
+    backgroundColor?: string;
+    backgroundOpacity?: number;
+  };
 }
 
 function validateTimelineExportSpec(
@@ -467,6 +483,46 @@ function validateTimelineExportSpec(
     }
     if (gap > 0.15) {
       return "Empty timeline gaps between clips on track V1 are not supported in FFmpeg MP4 export. Close gaps before exporting.";
+    }
+  }
+
+  if (spec.burnSubtitles) {
+    if (!Array.isArray(spec.subtitles) || spec.subtitles.length === 0) {
+      return "Subtitle burn-in is enabled, but there are no subtitle cues to burn.";
+    }
+    for (let i = 0; i < spec.subtitles.length; i++) {
+      const cue = spec.subtitles[i];
+      if (!cue || typeof cue !== "object") {
+        return `Subtitle cue #${i + 1} is invalid.`;
+      }
+      const start = Number(cue.start);
+      const end = Number(cue.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
+        return `Subtitle cue #${i + 1} has invalid start/end timestamps.`;
+      }
+      if (typeof cue.text !== "string" || cue.text.trim().length === 0) {
+        return `Subtitle cue #${i + 1} has empty text.`;
+      }
+    }
+    if (spec.subtitleStyle) {
+      const { fontSize, position, backgroundOpacity } = spec.subtitleStyle;
+      if (
+        fontSize !== undefined &&
+        (!Number.isFinite(Number(fontSize)) || Number(fontSize) < 12 || Number(fontSize) > 72)
+      ) {
+        return "Subtitle fontSize must be between 12 and 72.";
+      }
+      if (position !== undefined && !["bottom", "middle", "top"].includes(position)) {
+        return "Subtitle position must be 'bottom', 'middle', or 'top'.";
+      }
+      if (
+        backgroundOpacity !== undefined &&
+        (!Number.isFinite(Number(backgroundOpacity)) ||
+          Number(backgroundOpacity) < 0 ||
+          Number(backgroundOpacity) > 1)
+      ) {
+        return "Subtitle backgroundOpacity must be between 0 and 1.";
+      }
     }
   }
 

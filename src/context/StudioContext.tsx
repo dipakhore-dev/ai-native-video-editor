@@ -1,5 +1,14 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { fetchIntegrationStatus } from "../services/api";
+import {
+  createServerProject,
+  fetchCurrentAuthUser,
+  fetchIntegrationStatus,
+  fetchServerProjects,
+  mapServerProjectToStudioProject,
+  saveServerProjectSubtitles,
+  submitAuthLogout,
+  type AuthUserDto,
+} from "../services/api";
 import type {
   AppRoute,
   AspectRatioOption,
@@ -9,6 +18,9 @@ import type {
   Project,
   ResolutionOption,
   SessionUser,
+  SubtitleMetadata,
+  SubtitleSegment,
+  SubtitleStyle,
   TextOverlayStyle,
   TimelineClip,
 } from "../types/studio";
@@ -24,9 +36,18 @@ import {
   type AiEditOperation,
   type ApplyOperationsResult,
 } from "../utils/aiOperations";
+import {
+  DEFAULT_SUBTITLE_STYLE,
+  sortSubtitles,
+  syncSubtitlesForClipDelete,
+  syncSubtitlesForClipSplit,
+  syncSubtitlesForClipUpdate,
+  syncSubtitlesForProjectClips,
+} from "../utils/subtitles";
 
 const STORAGE_KEY = "ai_studio_saved_projects_v1";
 const MAX_HISTORY_ENTRIES = 50;
+const MONGO_OBJECT_ID_RE = /^[a-f\d]{24}$/i;
 
 interface CreateProjectInput {
   name: string;
@@ -58,7 +79,12 @@ interface StudioContextValue {
   totalMediaBytes: number;
   addClipToTimeline: (asset: MediaAsset, trackId?: string, startTime?: number) => TimelineClip | null;
   addTextOverlay: (text?: string, startTime?: number) => TimelineClip | null;
-  updateClip: (clipId: string, patch: Partial<TimelineClip>, recordHistory?: boolean) => void;
+  updateClip: (
+    clipId: string,
+    patch: Partial<TimelineClip>,
+    recordHistory?: boolean,
+    syncBase?: { clip: TimelineClip; subtitles?: SubtitleSegment[] }
+  ) => void;
   updateTextStyle: (
     clipId: string,
     patch: Partial<TextOverlayStyle>,
@@ -72,6 +98,30 @@ interface StudioContextValue {
   toggleTrackMute: (trackId: string) => void;
   toggleTrackLock: (trackId: string) => void;
   applyAiEditPlan: (operations: AiEditOperation[]) => ApplyOperationsResult;
+  replaceClipSubtitles: (
+    clipId: string,
+    segments: SubtitleSegment[],
+    meta?: SubtitleMetadata
+  ) => { subtitles: SubtitleSegment[]; style: SubtitleStyle };
+  updateSubtitleSegment: (
+    segmentId: string,
+    patch: Partial<SubtitleSegment>,
+    recordHistory?: boolean
+  ) => void;
+  addSubtitleSegment: (
+    startTime: number,
+    endTime?: number,
+    text?: string,
+    clipId?: string
+  ) => SubtitleSegment | null;
+  deleteSubtitleSegment: (segmentId: string) => void;
+  updateSubtitleStyle: (patch: Partial<SubtitleStyle>, recordHistory?: boolean) => void;
+  saveSubtitlesToMongo: (override?: {
+    projectId?: string;
+    subtitles?: SubtitleSegment[];
+    subtitleStyle?: SubtitleStyle;
+    subtitleMeta?: SubtitleMetadata;
+  }) => Promise<{ ok: boolean; error?: string; projectId?: string }>;
   canUndo: boolean;
   canRedo: boolean;
   undo: () => void;
@@ -85,7 +135,10 @@ interface StudioContextValue {
   integrationsError: string | null;
   refreshIntegrations: () => Promise<void>;
   sessionUser: SessionUser;
+  isAuthenticated: boolean;
   updateSessionUser: (patch: Partial<SessionUser>) => void;
+  hydrateAuthenticatedWorkspace: (user?: AuthUserDto) => Promise<void>;
+  logoutSession: () => Promise<void>;
   createProjectModalOpen: boolean;
   setCreateProjectModalOpen: (open: boolean) => void;
 }
@@ -100,6 +153,9 @@ function cloneProject(project: Project): Project {
       ...c,
       textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     })),
+    subtitles: project.subtitles ? project.subtitles.map((s) => ({ ...s })) : [],
+    subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
+    subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
   };
 }
 
@@ -118,6 +174,7 @@ function loadSavedProjects(): { projects: Project[]; savedAt: string | null } {
         // Blob object URLs expire across browser page reloads; mark non-text clips for local relinking
         needsRelink: c.kind !== "text" && c.objectUrl.startsWith("blob:"),
       })),
+      subtitles: Array.isArray(p.subtitles) ? p.subtitles : [],
     }));
 
     return {
@@ -160,6 +217,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     defaultResolution: "1080p",
   });
 
+  const isAuthenticated = sessionUser.mode === "authenticated";
+
   const setActiveProjectId = useCallback((id: string | null) => {
     setActiveProjectIdState(id);
     setUndoStack([]);
@@ -183,9 +242,81 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setIntegrationsLoading(false);
   }, []);
 
+  const hydrateAuthenticatedWorkspace = useCallback(
+    async (explicitUser?: AuthUserDto) => {
+      let user = explicitUser;
+      if (!user) {
+        const meRes = await fetchCurrentAuthUser();
+        if (!meRes.ok || !meRes.data?.user) return;
+        user = meRes.data.user;
+      }
+
+      setSessionUser({
+        id: user.id,
+        displayName: user.fullName,
+        email: user.email,
+        workspaceName: user.workspaceName,
+        mode: "authenticated",
+        defaultFps: user.defaultFps,
+        defaultResolution: user.defaultResolution,
+      });
+
+      const projRes = await fetchServerProjects();
+      if (projRes.ok && projRes.data?.projects) {
+        const serverProjects = projRes.data.projects.map(mapServerProjectToStudioProject);
+        setProjects((prev) => {
+          const prevById = new Map(prev.map((p) => [p.id, p]));
+          const mergedServer = serverProjects.map((sp) => {
+            const existing = prevById.get(sp.id);
+            if (!existing) return sp;
+            // Preserve live in-session blob URLs & thumbnails if same clips exist
+            return {
+              ...sp,
+              clips: sp.clips.map((sc) => {
+                const matchClip = existing.clips.find((ec) => ec.id === sc.id);
+                if (matchClip && !matchClip.needsRelink && matchClip.objectUrl) {
+                  return {
+                    ...sc,
+                    objectUrl: matchClip.objectUrl,
+                    thumbnailUrl: matchClip.thumbnailUrl,
+                    needsRelink: false,
+                  };
+                }
+                return sc;
+              }),
+            };
+          });
+          const serverIds = new Set(mergedServer.map((p) => p.id));
+          const localOnly = prev.filter((p) => !serverIds.has(p.id) && !MONGO_OBJECT_ID_RE.test(p.id));
+          const combined = [...localOnly, ...mergedServer];
+          return combined;
+        });
+
+        setActiveProjectIdState((curr) => {
+          if (curr) return curr;
+          return serverProjects[0]?.id ?? null;
+        });
+      }
+    },
+    []
+  );
+
+  const logoutSession = useCallback(async () => {
+    await submitAuthLogout();
+    setSessionUser({
+      displayName: "Elena Vance",
+      email: "editor@local.session",
+      workspaceName: "Local Studio Session",
+      mode: "local_session",
+      defaultFps: 24,
+      defaultResolution: "1080p",
+    });
+  }, []);
+
   useEffect(() => {
     void refreshIntegrations();
-  }, [refreshIntegrations]);
+    void hydrateAuthenticatedWorkspace();
+  }, [refreshIntegrations, hydrateAuthenticatedWorkspace]);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -197,10 +328,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [mediaAssets]
   );
 
-  const saveTimelineLocally = useCallback(() => {
+  const persistProjectsToLocalStorage = useCallback((list: Project[]) => {
     try {
       const savedAt = new Date().toISOString();
-      const serializableProjects = projects.map((p) => ({
+      const serializableProjects = list.map((p) => ({
         ...p,
         clips: p.clips.map((c) => ({
           ...c,
@@ -219,7 +350,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     } catch {
       setMediaError("Could not save timeline to browser localStorage (storage quota may be full).");
     }
-  }, [projects]);
+  }, []);
+
+  const saveTimelineLocally = useCallback(() => {
+    persistProjectsToLocalStorage(projects);
+  }, [persistProjectsToLocalStorage, projects]);
 
   const createProject = useCallback(
     (input: CreateProjectInput, openInEditor = true): Project => {
@@ -235,6 +370,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         updatedAt: now,
         tracks: createDefaultTracks(),
         clips: [],
+        subtitles: [],
+        subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
       };
       setProjects((prev) => [project, ...prev]);
       setActiveProjectId(project.id);
@@ -259,16 +396,27 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       const source = prev.find((p) => p.id === id);
       if (!source) return prev;
       const now = new Date().toISOString();
+      const clipIdMap = new Map<string, string>();
+      const clonedClips = source.clips.map((c) => {
+        const nextClipId = `clip_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        clipIdMap.set(c.id, nextClipId);
+        return {
+          ...c,
+          id: nextClipId,
+          textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+        };
+      });
       const copy: Project = {
         ...cloneProject(source),
         id: `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         name: `${source.name} (Copy)`,
         createdAt: now,
         updatedAt: now,
-        clips: source.clips.map((c) => ({
-          ...c,
-          id: `clip_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-          textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+        clips: clonedClips,
+        subtitles: (source.subtitles ?? []).map((s, idx) => ({
+          ...s,
+          id: `sub_${Date.now()}_${idx}`,
+          clipId: s.clipId ? clipIdMap.get(s.clipId) ?? s.clipId : undefined,
         })),
       };
       return [copy, ...prev];
@@ -345,10 +493,18 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       return prev.filter((a) => a.id !== assetId);
     });
     setProjects((prev) =>
-      prev.map((proj) => ({
-        ...proj,
-        clips: proj.clips.filter((c) => c.assetId !== assetId),
-      }))
+      prev.map((proj) => {
+        const removedClipIds = new Set(
+          proj.clips.filter((c) => c.assetId === assetId).map((c) => c.id)
+        );
+        return {
+          ...proj,
+          clips: proj.clips.filter((c) => c.assetId !== assetId),
+          subtitles: (proj.subtitles ?? []).filter(
+            (s) => !s.clipId || !removedClipIds.has(s.clipId)
+          ),
+        };
+      })
     );
   }, []);
 
@@ -431,6 +587,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             updatedAt: now,
             tracks: createDefaultTracks(),
             clips: [],
+            subtitles: [],
+            subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
           };
           targetId = autoProject.id;
           nextProjects = [autoProject, ...prev];
@@ -511,7 +669,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         );
 
         const startTime =
-          explicitStartTime !== undefined ? Math.max(0, Number(explicitStartTime.toFixed(2))) : Number(trackEnd.toFixed(2));
+          explicitStartTime !== undefined
+            ? Math.max(0, Number(explicitStartTime.toFixed(2)))
+            : Number(trackEnd.toFixed(2));
 
         const clip: TimelineClip = {
           id: `text_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -555,14 +715,28 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
 
   const updateClip = useCallback(
-    (clipId: string, patch: Partial<TimelineClip>, recordHistory = true) => {
-      mutateActiveProject(
-        (proj) => ({
+    (
+      clipId: string,
+      patch: Partial<TimelineClip>,
+      recordHistory = true,
+      syncBase?: { clip: TimelineClip; subtitles?: SubtitleSegment[] }
+    ) => {
+      mutateActiveProject((proj) => {
+        const beforeClip = proj.clips.find((c) => c.id === clipId);
+        if (!beforeClip) return proj;
+        const afterClip = { ...beforeClip, ...patch };
+        const nextClips = proj.clips.map((c) => (c.id === clipId ? afterClip : c));
+        const nextSubtitles = syncSubtitlesForClipUpdate(
+          syncBase ? syncBase.subtitles : proj.subtitles,
+          syncBase ? syncBase.clip : beforeClip,
+          afterClip
+        );
+        return {
           ...proj,
-          clips: proj.clips.map((c) => (c.id === clipId ? { ...c, ...patch } : c)),
-        }),
-        recordHistory
-      );
+          clips: nextClips,
+          subtitles: nextSubtitles,
+        };
+      }, recordHistory);
     },
     [mutateActiveProject]
   );
@@ -601,9 +775,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         didSplit = result.didSplit;
         if (!result.didSplit) return proj;
 
+        const targetIdx = result.clips.findIndex((c) => c.id === clipId);
+        const leftClip = targetIdx >= 0 ? result.clips[targetIdx] : null;
+        const rightClip = targetIdx >= 0 ? result.clips[targetIdx + 1] : null;
+
+        const nextSubtitles =
+          leftClip && rightClip
+            ? syncSubtitlesForClipSplit(proj.subtitles, target, leftClip, rightClip)
+            : proj.subtitles ?? [];
+
         return {
           ...proj,
           clips: result.clips,
+          subtitles: nextSubtitles,
         };
       }, true);
       return didSplit;
@@ -624,9 +808,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         didMove = result.moved;
         if (!result.moved) return proj;
 
-        return {
+        const nextProj = {
           ...proj,
           clips: result.clips,
+        };
+        return {
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(proj, nextProj),
         };
       }, true);
       return didMove;
@@ -660,6 +848,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         (proj) => ({
           ...proj,
           clips: proj.clips.filter((c) => c.id !== clipId),
+          subtitles: syncSubtitlesForClipDelete(proj.subtitles, clipId),
         }),
         true
       );
@@ -703,12 +892,212 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
       mutateActiveProject((proj) => {
         result = applyAiOperationsToProject(proj, operations);
+        const syncedSubs = syncSubtitlesForProjectClips(proj, result.project);
+        result = {
+          ...result,
+          project: {
+            ...result.project,
+            subtitles: syncedSubs,
+          },
+        };
         return result.project;
       }, true);
 
       return result;
     },
     [activeProject, mutateActiveProject]
+  );
+
+  const replaceClipSubtitles = useCallback(
+    (
+      clipId: string,
+      segments: SubtitleSegment[],
+      meta?: SubtitleMetadata
+    ): { subtitles: SubtitleSegment[]; style: SubtitleStyle } => {
+      let mergedSubtitles: SubtitleSegment[] = sortSubtitles(segments);
+      let nextStyle: SubtitleStyle = {
+        ...DEFAULT_SUBTITLE_STYLE,
+        ...(activeProject?.subtitleStyle ?? {}),
+        enabled: true,
+      };
+
+      mutateActiveProject((proj) => {
+        const otherClipSubs = (proj.subtitles ?? []).filter((s) => s.clipId !== clipId);
+        mergedSubtitles = sortSubtitles([...otherClipSubs, ...segments]);
+        nextStyle = {
+          ...DEFAULT_SUBTITLE_STYLE,
+          ...(proj.subtitleStyle ?? {}),
+          enabled: true,
+        };
+        return {
+          ...proj,
+          subtitles: mergedSubtitles,
+          subtitleStyle: nextStyle,
+          subtitleMeta: meta ?? proj.subtitleMeta,
+        };
+      }, true);
+
+      return { subtitles: mergedSubtitles, style: nextStyle };
+    },
+    [activeProject?.subtitleStyle, mutateActiveProject]
+  );
+
+  const updateSubtitleSegment = useCallback(
+    (segmentId: string, patch: Partial<SubtitleSegment>, recordHistory = true) => {
+      mutateActiveProject(
+        (proj) => ({
+          ...proj,
+          subtitles: sortSubtitles(
+            (proj.subtitles ?? []).map((s) => (s.id === segmentId ? { ...s, ...patch } : s))
+          ),
+        }),
+        recordHistory
+      );
+    },
+    [mutateActiveProject]
+  );
+
+  const addSubtitleSegment = useCallback(
+    (
+      startTime: number,
+      endTime?: number,
+      text = "New subtitle line",
+      clipId?: string
+    ): SubtitleSegment | null => {
+      if (!activeProjectId) return null;
+      const start = Math.max(0, Number(startTime.toFixed(2)));
+      const end = Math.max(
+        Number((start + 0.5).toFixed(2)),
+        Number((endTime ?? start + 2.5).toFixed(2))
+      );
+      const created: SubtitleSegment = {
+        id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        start,
+        end,
+        text,
+        ...(clipId ? { clipId } : {}),
+      };
+      mutateActiveProject(
+        (proj) => ({
+          ...proj,
+          subtitles: sortSubtitles([...(proj.subtitles ?? []), created]),
+          subtitleStyle: {
+            ...DEFAULT_SUBTITLE_STYLE,
+            ...(proj.subtitleStyle ?? {}),
+            enabled: true,
+          },
+        }),
+        true
+      );
+      return created;
+    },
+    [activeProjectId, mutateActiveProject]
+  );
+
+  const deleteSubtitleSegment = useCallback(
+    (segmentId: string) => {
+      mutateActiveProject(
+        (proj) => ({
+          ...proj,
+          subtitles: (proj.subtitles ?? []).filter((s) => s.id !== segmentId),
+        }),
+        true
+      );
+    },
+    [mutateActiveProject]
+  );
+
+  const updateSubtitleStyle = useCallback(
+    (patch: Partial<SubtitleStyle>, recordHistory = true) => {
+      mutateActiveProject(
+        (proj) => ({
+          ...proj,
+          subtitleStyle: {
+            ...DEFAULT_SUBTITLE_STYLE,
+            ...(proj.subtitleStyle ?? {}),
+            ...patch,
+          },
+        }),
+        recordHistory
+      );
+    },
+    [mutateActiveProject]
+  );
+
+  const saveSubtitlesToMongo = useCallback(
+    async (override?: {
+      projectId?: string;
+      subtitles?: SubtitleSegment[];
+      subtitleStyle?: SubtitleStyle;
+      subtitleMeta?: SubtitleMetadata;
+    }): Promise<{ ok: boolean; error?: string; projectId?: string }> => {
+      const targetId = override?.projectId ?? activeProjectId;
+      const targetProject = projects.find((p) => p.id === targetId) ?? activeProject;
+      if (!targetProject) {
+        return { ok: false, error: "No active project selected." };
+      }
+
+      if (!isAuthenticated) {
+        return {
+          ok: false,
+          error: "Sign in to save subtitles to your MongoDB project.",
+        };
+      }
+
+      const payloadSubtitles = override?.subtitles ?? targetProject.subtitles ?? [];
+      const payloadStyle = override?.subtitleStyle ?? {
+        ...DEFAULT_SUBTITLE_STYLE,
+        ...(targetProject.subtitleStyle ?? {}),
+      };
+      const payloadMeta = override?.subtitleMeta ?? targetProject.subtitleMeta;
+
+      const projectWithLatest: Project = {
+        ...targetProject,
+        subtitles: payloadSubtitles,
+        subtitleStyle: payloadStyle,
+        subtitleMeta: payloadMeta,
+      };
+
+      if (MONGO_OBJECT_ID_RE.test(targetProject.id)) {
+        const res = await saveServerProjectSubtitles(targetProject.id, {
+          subtitles: payloadSubtitles,
+          subtitleStyle: payloadStyle,
+          subtitleMeta: payloadMeta,
+        });
+        if (res.ok) {
+          return { ok: true, projectId: targetProject.id };
+        }
+        if (res.status !== 404) {
+          return { ok: false, error: res.error || "Failed to save subtitles to MongoDB." };
+        }
+      }
+
+      // Project is local-only or missing on server: create it in MongoDB and upgrade its ID
+      const createdRes = await createServerProject(projectWithLatest);
+      if (!createdRes.ok || !createdRes.data?.project) {
+        return {
+          ok: false,
+          error: createdRes.error || "Failed to create project in MongoDB.",
+        };
+      }
+
+      const mongoId = String(createdRes.data.project._id || createdRes.data.project.id || "");
+      if (!mongoId) {
+        return { ok: false, error: "Server returned a project without an ID." };
+      }
+
+      setProjects((prev) => {
+        const nextList = prev.map((p) =>
+          p.id === targetProject.id ? { ...p, id: mongoId, updatedAt: new Date().toISOString() } : p
+        );
+        persistProjectsToLocalStorage(nextList);
+        return nextList;
+      });
+      setActiveProjectIdState((curr) => (curr === targetProject.id ? mongoId : curr));
+
+      return { ok: true, projectId: mongoId };
+    },
+    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage, projects]
   );
 
   const recordExportAttempt = useCallback((attempt: ExportAttempt) => {
@@ -751,6 +1140,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     toggleTrackMute,
     toggleTrackLock,
     applyAiEditPlan,
+    replaceClipSubtitles,
+    updateSubtitleSegment,
+    addSubtitleSegment,
+    deleteSubtitleSegment,
+    updateSubtitleStyle,
+    saveSubtitlesToMongo,
     canUndo: undoStack.length > 0,
     canRedo: redoStack.length > 0,
     undo,
@@ -764,7 +1159,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     integrationsError,
     refreshIntegrations,
     sessionUser,
+    isAuthenticated,
     updateSessionUser,
+    hydrateAuthenticatedWorkspace,
+    logoutSession,
     createProjectModalOpen,
     setCreateProjectModalOpen,
   };

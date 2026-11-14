@@ -4,6 +4,7 @@ import {
   deleteProjectController,
   getProjectController,
   listProjectsController,
+  saveSubtitlesController,
   saveTimelineController,
   updateProjectController,
 } from "../controllers/project.controller.ts";
@@ -12,6 +13,7 @@ import { validateBody, validateObjectId } from "../middleware/validate.middlewar
 import {
   CreateProjectSchema,
   UpdateProjectSchema,
+  UpdateSubtitlesSchema,
   UpdateTimelineSchema,
 } from "../validators/project.validators.ts";
 
@@ -33,5 +35,11 @@ projectRouter.put(
   validateObjectId("id"),
   validateBody(UpdateTimelineSchema),
   saveTimelineController
+);
+projectRouter.put(
+  "/:id/subtitles",
+  validateObjectId("id"),
+  validateBody(UpdateSubtitlesSchema),
+  saveSubtitlesController
 );
 projectRouter.delete("/:id", validateObjectId("id"), deleteProjectController);

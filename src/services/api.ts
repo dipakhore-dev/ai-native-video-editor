@@ -1,5 +1,14 @@
-import type { IntegrationStatusMap, RenderTimelinePayload } from "../types/studio";
+import type {
+  IntegrationStatusMap,
+  Project,
+  RenderTimelinePayload,
+  SubtitleMetadata,
+  SubtitleSegment,
+  SubtitleStyle,
+  TimelineClip,
+} from "../types/studio";
 import { AiEditPlanSchema, type AiEditPlan } from "../utils/aiOperations";
+import { createDefaultTracks, ensureProjectTracks } from "../utils/timeline";
 
 export interface ApiResult<T> {
   ok: boolean;
@@ -222,6 +231,60 @@ export async function exportTimelineMp4(
   }
 }
 
+export interface GeneratedSubtitlesResponse {
+  status: string;
+  mode?: string;
+  jobId?: string;
+  model: string;
+  language: string;
+  language_probability: number;
+  duration_seconds: number;
+  segments: Array<{
+    id: number | string;
+    start: number;
+    end: number;
+    text: string;
+  }>;
+  srt?: string;
+  vtt?: string;
+}
+
+export async function generateVideoSubtitles(
+  formData: FormData
+): Promise<ApiResult<GeneratedSubtitlesResponse>> {
+  try {
+    const res = await fetch("/api/video/subtitles", {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
+    const body = (await res.json().catch(() => ({}))) as Partial<GeneratedSubtitlesResponse> & {
+      error?: string;
+      message?: string;
+      integrationPoint?: string;
+    };
+    if (!res.ok || !Array.isArray(body.segments)) {
+      return {
+        ok: false,
+        status: res.status,
+        error: body.error || body.message || `Subtitle generation failed (${res.status}).`,
+        integrationPoint: body.integrationPoint,
+      };
+    }
+    return {
+      ok: true,
+      status: res.status,
+      data: body as GeneratedSubtitlesResponse,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : "Network error generating subtitles.",
+    };
+  }
+}
+
 export interface AuthUserDto {
   id: string;
   fullName: string;
@@ -229,6 +292,12 @@ export interface AuthUserDto {
   workspaceName: string;
   defaultFps: 24 | 30 | 60;
   defaultResolution: "720p" | "1080p" | "4K";
+}
+
+export async function fetchCurrentAuthUser(): Promise<
+  ApiResult<{ status: string; user?: AuthUserDto }>
+> {
+  return requestJson("/api/auth/me");
 }
 
 export async function submitAuthLogin(payload: {
@@ -249,5 +318,157 @@ export async function submitAuthRegister(payload: {
   return requestJson("/api/auth/register", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function submitAuthLogout(): Promise<ApiResult<{ status: string }>> {
+  return requestJson("/api/auth/logout", {
+    method: "POST",
+  });
+}
+
+export interface ServerProjectDto {
+  _id?: string;
+  id?: string;
+  name: string;
+  description?: string;
+  aspectRatio: "16:9" | "9:16" | "1:1";
+  resolution: "720p" | "1080p" | "4K";
+  fps: 24 | 30 | 60;
+  tracks: Project["tracks"];
+  clips: Array<Omit<TimelineClip, "objectUrl" | "needsRelink" | "thumbnailUrl">>;
+  subtitles?: SubtitleSegment[];
+  subtitleStyle?: SubtitleStyle;
+  subtitleMeta?: SubtitleMetadata;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function mapServerProjectToStudioProject(dto: ServerProjectDto): Project {
+  const id = String(dto._id || dto.id || "");
+  return {
+    id,
+    name: dto.name,
+    description: dto.description ?? "",
+    aspectRatio: dto.aspectRatio ?? "16:9",
+    resolution: dto.resolution ?? "1080p",
+    fps: dto.fps ?? 24,
+    tracks: ensureProjectTracks(dto.tracks?.length ? dto.tracks : createDefaultTracks()),
+    clips: (dto.clips ?? []).map((c) => ({
+      ...c,
+      objectUrl: "",
+      needsRelink: c.kind !== "text",
+    })),
+    subtitles: dto.subtitles ?? [],
+    subtitleStyle: dto.subtitleStyle,
+    subtitleMeta: dto.subtitleMeta,
+    createdAt: dto.createdAt || new Date().toISOString(),
+    updatedAt: dto.updatedAt || new Date().toISOString(),
+  };
+}
+
+function serializeClipForServer(clip: TimelineClip) {
+  return {
+    id: clip.id,
+    assetId: clip.assetId,
+    trackId: clip.trackId,
+    name: clip.name,
+    kind: clip.kind,
+    startTime: clip.startTime,
+    duration: clip.duration,
+    inPoint: clip.inPoint,
+    sourceDuration: clip.sourceDuration,
+    volume: clip.volume,
+    speed: clip.speed,
+    opacity: clip.opacity,
+    ...(clip.sourceName ? { sourceName: clip.sourceName } : {}),
+    ...(clip.sourceSizeBytes !== undefined ? { sourceSizeBytes: clip.sourceSizeBytes } : {}),
+    ...(clip.sourceMimeType ? { sourceMimeType: clip.sourceMimeType } : {}),
+    ...(clip.textStyle ? { textStyle: clip.textStyle } : {}),
+  };
+}
+
+function sanitizeSubtitleForServer(cue: SubtitleSegment): SubtitleSegment | null {
+  const trimmed = cue.text.trim();
+  if (!trimmed || cue.end <= cue.start || cue.start < 0) return null;
+  return {
+    id: cue.id,
+    start: Number(cue.start.toFixed(2)),
+    end: Number(cue.end.toFixed(2)),
+    text: trimmed.slice(0, 500),
+    ...(cue.clipId ? { clipId: cue.clipId } : {}),
+  };
+}
+
+export async function fetchServerProjects(): Promise<
+  ApiResult<{ status: string; projects: ServerProjectDto[] }>
+> {
+  return requestJson("/api/projects");
+}
+
+export async function createServerProject(
+  project: Project
+): Promise<ApiResult<{ status: string; project: ServerProjectDto }>> {
+  const cleanSubtitles = (project.subtitles ?? [])
+    .map(sanitizeSubtitleForServer)
+    .filter((s): s is SubtitleSegment => s !== null);
+
+  return requestJson("/api/projects", {
+    method: "POST",
+    body: JSON.stringify({
+      name: project.name,
+      description: project.description || "",
+      aspectRatio: project.aspectRatio,
+      resolution: project.resolution,
+      fps: project.fps,
+      tracks: project.tracks,
+      clips: project.clips.map(serializeClipForServer),
+      subtitles: cleanSubtitles,
+      ...(project.subtitleStyle ? { subtitleStyle: project.subtitleStyle } : {}),
+      ...(project.subtitleMeta ? { subtitleMeta: project.subtitleMeta } : {}),
+    }),
+  });
+}
+
+export async function saveServerProjectTimeline(
+  projectId: string,
+  project: Project
+): Promise<ApiResult<{ status: string; project: ServerProjectDto }>> {
+  const cleanSubtitles = (project.subtitles ?? [])
+    .map(sanitizeSubtitleForServer)
+    .filter((s): s is SubtitleSegment => s !== null);
+
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/timeline`, {
+    method: "PUT",
+    body: JSON.stringify({
+      aspectRatio: project.aspectRatio,
+      tracks: project.tracks,
+      clips: project.clips.map(serializeClipForServer),
+      subtitles: cleanSubtitles,
+      ...(project.subtitleStyle ? { subtitleStyle: project.subtitleStyle } : {}),
+      ...(project.subtitleMeta ? { subtitleMeta: project.subtitleMeta } : {}),
+    }),
+  });
+}
+
+export async function saveServerProjectSubtitles(
+  projectId: string,
+  payload: {
+    subtitles: SubtitleSegment[];
+    subtitleStyle?: SubtitleStyle;
+    subtitleMeta?: SubtitleMetadata;
+  }
+): Promise<ApiResult<{ status: string; project: ServerProjectDto }>> {
+  const cleanSubtitles = payload.subtitles
+    .map(sanitizeSubtitleForServer)
+    .filter((s): s is SubtitleSegment => s !== null);
+
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/subtitles`, {
+    method: "PUT",
+    body: JSON.stringify({
+      subtitles: cleanSubtitles,
+      ...(payload.subtitleStyle ? { subtitleStyle: payload.subtitleStyle } : {}),
+      ...(payload.subtitleMeta ? { subtitleMeta: payload.subtitleMeta } : {}),
+    }),
   });
 }

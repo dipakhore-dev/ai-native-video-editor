@@ -21,6 +21,9 @@ export async function createUserProject(
     fps?: 24 | 30 | 60;
     tracks?: IProject["tracks"];
     clips?: IProject["clips"];
+    subtitles?: IProject["subtitles"];
+    subtitleStyle?: IProject["subtitleStyle"];
+    subtitleMeta?: IProject["subtitleMeta"];
   }
 ): Promise<IProject> {
   return ProjectModel.create({
@@ -54,11 +57,30 @@ export async function saveUserProjectTimeline(
     aspectRatio?: "16:9" | "9:16" | "1:1";
     tracks: IProject["tracks"];
     clips: IProject["clips"];
+    subtitles?: IProject["subtitles"];
+    subtitleStyle?: IProject["subtitleStyle"];
+    subtitleMeta?: IProject["subtitleMeta"];
   }
 ): Promise<IProject | null> {
   return ProjectModel.findOneAndUpdate(
     { _id: projectId, userId },
     { $set: timeline },
+    { new: true, runValidators: true }
+  );
+}
+
+export async function saveUserProjectSubtitles(
+  userId: string,
+  projectId: string,
+  payload: {
+    subtitles: NonNullable<IProject["subtitles"]>;
+    subtitleStyle?: IProject["subtitleStyle"];
+    subtitleMeta?: IProject["subtitleMeta"];
+  }
+): Promise<IProject | null> {
+  return ProjectModel.findOneAndUpdate(
+    { _id: projectId, userId },
+    { $set: payload },
     { new: true, runValidators: true }
   );
 }

@@ -11,6 +11,7 @@ import {
   Check,
   X,
   Code2,
+  Captions,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import { requestAiAssistant } from "../../services/api";
@@ -18,12 +19,18 @@ import type { Project, TimelineClip } from "../../types/studio";
 import { describeAiOperation, type AiEditPlan } from "../../utils/aiOperations";
 import { formatTimecode } from "../../utils/media";
 import { trimClipStart } from "../../utils/timeline";
+import { SubtitlesPanel } from "./SubtitlesPanel";
+
+export type EditorPanelTab = "inspector" | "assistant" | "subtitles";
 
 interface AiAssistantPanelProps {
   project: Project;
   selectedClip: TimelineClip | null;
   totalDuration: number;
   playheadTime: number;
+  onSeek: (time: number) => void;
+  activeTab?: EditorPanelTab;
+  onTabChange?: (tab: EditorPanelTab) => void;
 }
 
 type PlanStatus = "pending" | "applied" | "discarded";
@@ -49,6 +56,9 @@ export function AiAssistantPanel({
   selectedClip,
   totalDuration,
   playheadTime,
+  onSeek,
+  activeTab,
+  onTabChange,
 }: AiAssistantPanelProps) {
   const {
     updateClip,
@@ -59,7 +69,9 @@ export function AiAssistantPanel({
     applyAiEditPlan,
   } = useStudio();
 
-  const [tab, setTab] = useState<"inspector" | "assistant">("assistant");
+  const [internalTab, setInternalTab] = useState<EditorPanelTab>("assistant");
+  const tab = activeTab ?? internalTab;
+  const setTab = onTabChange ?? setInternalTab;
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<AssistantMessage[]>([]);
@@ -175,11 +187,11 @@ export function AiAssistantPanel({
   return (
     <aside className="w-full xl:w-84 shrink-0 border-t xl:border-t-0 xl:border-l border-zinc-800/80 bg-[#0D0D10] flex flex-col min-h-[360px] xl:min-h-0">
       {/* Panel Tabs */}
-      <div className="p-2.5 border-b border-zinc-800/80 grid grid-cols-2 gap-1 bg-[#09090B]">
+      <div className="p-2.5 border-b border-zinc-800/80 grid grid-cols-3 gap-1 bg-[#09090B]">
         <button
           type="button"
           onClick={() => setTab("inspector")}
-          className={`inline-flex items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium transition-colors ${
+          className={`inline-flex items-center justify-center gap-1 rounded-md py-1.5 text-xs font-medium transition-colors ${
             tab === "inspector" ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-zinc-200"
           }`}
         >
@@ -189,16 +201,38 @@ export function AiAssistantPanel({
         <button
           type="button"
           onClick={() => setTab("assistant")}
-          className={`inline-flex items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium transition-colors ${
+          className={`inline-flex items-center justify-center gap-1 rounded-md py-1.5 text-xs font-medium transition-colors ${
             tab === "assistant" ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-zinc-200"
           }`}
         >
           <Sparkles className="h-3.5 w-3.5 text-violet-400" />
-          <span>AI Assistant</span>
+          <span>AI Edit</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("subtitles")}
+          className={`inline-flex items-center justify-center gap-1 rounded-md py-1.5 text-xs font-medium transition-colors ${
+            tab === "subtitles" ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-zinc-200"
+          }`}
+        >
+          <Captions className="h-3.5 w-3.5 text-blue-400" />
+          <span>Subtitles</span>
+          {(project.subtitles?.length ?? 0) > 0 && (
+            <span className="ml-0.5 rounded bg-violet-500/20 px-1 text-[10px] font-mono text-violet-300">
+              {project.subtitles!.length}
+            </span>
+          )}
         </button>
       </div>
 
-      {tab === "inspector" ? (
+      {tab === "subtitles" ? (
+        <SubtitlesPanel
+          project={project}
+          selectedClip={selectedClip}
+          playheadTime={playheadTime}
+          onSeek={onSeek}
+        />
+      ) : tab === "inspector" ? (
         <div className="p-4 flex-1 overflow-y-auto space-y-5">
           {selectedClip ? (
             <>

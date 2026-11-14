@@ -287,6 +287,103 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
                 },
             )
 
+    def test_export_timeline_mp4_burn_subtitles_and_validation(self) -> None:
+        clip = self._make_clip("sub_burn_src.mp4", duration=2.0, size="640x360")
+        out_plain = self.test_root / "plain.mp4"
+        out_burned = self.test_root / "burned.mp4"
+
+        base_spec = {
+            "schemaVersion": "1.0",
+            "format": "mp4",
+            "project": {
+                "name": "Subtitle Burn Test",
+                "aspectRatio": "16:9",
+                "resolution": "720p",
+                "fps": 30,
+            },
+            "tracks": [
+                {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False}
+            ],
+            "clips": [
+                {
+                    "id": "c1",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "sub_burn_src.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 1.6,
+                    "durationSec": 1.6,
+                    "sourceInSec": 0.2,
+                    "sourceOutSec": 1.8,
+                    "speed": 1.0,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+
+        export_timeline_mp4([clip], out_plain, timeline_spec={**base_spec, "burnSubtitles": False})
+        burned_meta = export_timeline_mp4(
+            [clip],
+            out_burned,
+            timeline_spec={
+                **base_spec,
+                "burnSubtitles": True,
+                "subtitleStyle": {
+                    "enabled": True,
+                    "fontSize": 32,
+                    "color": "#FFFFFF",
+                    "position": "bottom",
+                    "backgroundColor": "#09090B",
+                    "backgroundOpacity": 0.85,
+                },
+                "subtitles": [
+                    {"id": "s1", "start": 0.1, "end": 1.4, "text": "Hello AI Studio"}
+                ],
+            },
+        )
+        self.assertTrue(out_burned.exists())
+        self.assertEqual(burned_meta["video"]["width"], 1280)
+        self.assertEqual(burned_meta["video"]["height"], 720)
+        self.assertAlmostEqual(burned_meta["duration_seconds"], 1.6, delta=0.35)
+
+        # Verify pixel output differs at t=0.6s when subtitle box/text is burned in
+        frame_plain = self.test_root / "frame_plain.rgb"
+        frame_burned = self.test_root / "frame_burned.rgb"
+        for src_mp4, raw_out in [(out_plain, frame_plain), (out_burned, frame_burned)]:
+            proc = subprocess.run(
+                [
+                    self.ffmpeg,
+                    "-y",
+                    "-ss",
+                    "0.6",
+                    "-i",
+                    str(src_mp4),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    str(raw_out),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(frame_plain.read_bytes(), frame_burned.read_bytes())
+
+        # Empty subtitles with burnSubtitles=True must fail cleanly
+        with self.assertRaises(VideoProcessingError) as ctx_empty:
+            export_timeline_mp4(
+                [clip],
+                self.test_root / "empty_sub.mp4",
+                timeline_spec={**base_spec, "burnSubtitles": True, "subtitles": []},
+            )
+        self.assertEqual(ctx_empty.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

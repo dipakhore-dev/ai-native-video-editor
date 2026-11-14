@@ -5,6 +5,7 @@ import {
   deleteUserProject,
   getUserProjectById,
   listUserProjects,
+  saveUserProjectSubtitles,
   saveUserProjectTimeline,
   updateUserProject,
 } from "../services/project.service.ts";
@@ -92,6 +93,24 @@ export async function saveTimelineController(
   } catch (err) {
     res.status(500).json({
       error: err instanceof Error ? err.message : "Failed to save timeline.",
+    });
+  }
+}
+
+export async function saveSubtitlesController(
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const project = await saveUserProjectSubtitles(req.userId!, getParamId(req), req.body);
+    if (!project) {
+      res.status(404).json({ error: "Project not found." });
+      return;
+    }
+    res.json({ status: "ok", project });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to save project subtitles.",
     });
   }
 }
