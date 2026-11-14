@@ -7,7 +7,8 @@ import { submitVideoGenerationRequest } from "../services/api";
 import type { AspectRatioOption } from "../types/studio";
 
 export function AiGeneratorPage() {
-  const { mediaAssets } = useStudio();
+  const { mediaAssets, integrations } = useStudio();
+  const isVideoGenConfigured = Boolean(integrations?.videoGeneration?.connected);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const [mode, setMode] = useState<"text-to-video" | "image-to-video">("text-to-video");
@@ -40,6 +41,16 @@ export function AiGeneratorPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isVideoGenConfigured) {
+      setServerResponse({
+        kind: "integration",
+        message:
+          "Paid text-to-video and image-to-video generation is disabled until an external provider (VIDEO_GEN_PROVIDER_URL) is configured.",
+        endpoint: "POST /api/ai/generate-video",
+      });
+      return;
+    }
+
     setSubmitting(true);
     setServerResponse(null);
 
@@ -57,7 +68,7 @@ export function AiGeneratorPage() {
 
     if (!res.ok) {
       setServerResponse({
-        kind: res.status === 501 ? "integration" : "error",
+        kind: res.status === 501 || res.status === 503 ? "integration" : "error",
         message: res.error || "Unable to dispatch generation request.",
         endpoint: res.integrationPoint,
         payload: res.data?.validatedRequest,
@@ -273,11 +284,17 @@ export function AiGeneratorPage() {
 
             <button
               type="submit"
-              disabled={submitting}
-              className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-2.5 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500 transition-colors disabled:opacity-50"
+              disabled={submitting || !isVideoGenConfigured}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-2.5 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Wand2 className="h-3.5 w-3.5" />
-              <span>{submitting ? "Dispatching to Backend..." : "Submit Generation Job"}</span>
+              <span>
+                {!isVideoGenConfigured
+                  ? "Generation Disabled (No Paid Provider)"
+                  : submitting
+                    ? "Dispatching to Backend..."
+                    : "Submit Generation Job"}
+              </span>
             </button>
           </form>
 
@@ -310,7 +327,7 @@ export function AiGeneratorPage() {
                       <div>
                         <p className="font-medium">
                           {serverResponse.kind === "integration"
-                            ? "Video Worker Integration Required"
+                            ? "Video Provider Disabled"
                             : "Validation Error"}
                         </p>
                         <p className="mt-1 leading-relaxed opacity-90">{serverResponse.message}</p>
@@ -343,10 +360,14 @@ export function AiGeneratorPage() {
                       )}
                     </div>
                     <p className="text-sm font-medium text-zinc-200">
-                      Ready for worker dispatch
+                      {isVideoGenConfigured
+                        ? "Ready for worker dispatch"
+                        : "Paid generation disabled (₹0 Local Mode)"}
                     </p>
                     <p className="mt-1.5 text-xs text-zinc-500 max-w-sm leading-relaxed">
-                      Submit a prompt to validate the generation contract against POST /api/ai/generate-video. Rendered clips are never faked.
+                      {isVideoGenConfigured
+                        ? "Submit a prompt to validate the generation contract against POST /api/ai/generate-video. Rendered clips are never faked."
+                        : "Paid text-to-video and image-to-video generation is disabled until VIDEO_GEN_PROVIDER_URL is configured. Local FFmpeg/FFprobe editing and faster-whisper subtitles run free without paid APIs."}
                     </p>
                   </>
                 )}
@@ -356,7 +377,7 @@ export function AiGeneratorPage() {
             <IntegrationNotice
               title="External Video Model Endpoint"
               endpoint="POST /api/ai/generate-video"
-              description="Connect Veo, Gemini Omni, or a dedicated GPU worker on the Express server to synthesize real MP4 outputs from this form."
+              description="Disabled until VIDEO_GEN_PROVIDER_URL is configured on the Express server. Connect a provider when ready to synthesize real MP4 outputs."
             />
           </div>
         </div>

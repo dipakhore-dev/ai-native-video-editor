@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { isVideoGenProviderConfigured } from "../config/env.ts";
 import type { AuthenticatedRequest } from "../middleware/auth.middleware.ts";
 import {
   generateAiEditPlan,
@@ -70,6 +71,16 @@ export async function updateAiRequestStatusController(
 }
 
 export function generateVideoStubController(req: Request, res: Response): void {
+  if (!isVideoGenProviderConfigured()) {
+    res.status(503).json({
+      status: "disabled",
+      integrationPoint: "POST /api/ai/generate-video",
+      error:
+        "Paid text-to-video and image-to-video generation is disabled until an external provider (VIDEO_GEN_PROVIDER_URL) is configured.",
+    });
+    return;
+  }
+
   const { mode, prompt, negativePrompt, aspectRatio, durationSeconds, cameraMotion, hasReferenceImage } =
     req.body ?? {};
 
@@ -91,7 +102,7 @@ export function generateVideoStubController(req: Request, res: Response): void {
     status: "integration_required",
     integrationPoint: "POST /api/ai/generate-video",
     message:
-      "Video synthesis worker is not connected. Wire this endpoint to an external video generation queue (such as Veo / Gemini Omni / GPU worker) to dispatch jobs and stream rendered clips.",
+      "Video generation provider URL is configured, but the provider adapter is not wired yet.",
     validatedRequest: {
       mode: mode === "image-to-video" ? "image-to-video" : "text-to-video",
       prompt: prompt.trim(),

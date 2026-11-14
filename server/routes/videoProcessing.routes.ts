@@ -5,9 +5,15 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import multer from "multer";
 import { getEnvConfig } from "../config/env.ts";
 import {
+  aspectRatioVideoController,
+  exportMp4VideoController,
   extractVideoMetadataController,
   getVideoJobController,
   listVideoJobsController,
+  mergeVideosController,
+  subtitlesVideoController,
+  thumbnailVideoController,
+  trimVideoController,
   videoProcessorStatusController,
 } from "../controllers/videoProcessing.controller.ts";
 import { requireAuth } from "../middleware/auth.middleware.ts";
@@ -28,13 +34,13 @@ const ALLOWED_VIDEO_EXTENSIONS = new Set([
   ".ogv",
 ]);
 
-function createVideoUploadMiddleware() {
+function createMulterInstance(maxFiles = 1) {
   const { videoUploadMaxMb } = getEnvConfig();
-  const upload = multer({
+  return multer({
     dest: uploadTempDir,
     limits: {
       fileSize: videoUploadMaxMb * 1024 * 1024,
-      files: 1,
+      files: maxFiles,
     },
     fileFilter: (_req, file, cb) => {
       const ext = path.extname(file.originalname || "").toLowerCase();
@@ -50,9 +56,14 @@ function createVideoUploadMiddleware() {
       cb(null, true);
     },
   });
+}
+
+function handleUploadMiddleware(fieldName: string, maxFiles = 1) {
+  const upload = createMulterInstance(maxFiles);
+  const runner = maxFiles === 1 ? upload.single(fieldName) : upload.array(fieldName, maxFiles);
 
   return (req: Request, res: Response, next: NextFunction): void => {
-    upload.single("video")(req, res, (err: unknown) => {
+    runner(req, res, (err: unknown) => {
       if (!err) {
         next();
         return;
@@ -76,8 +87,38 @@ videoProcessingRouter.use(requireAuth);
 videoProcessingRouter.get("/status", videoProcessorStatusController);
 videoProcessingRouter.post(
   "/metadata",
-  createVideoUploadMiddleware(),
+  handleUploadMiddleware("video", 1),
   extractVideoMetadataController
+);
+videoProcessingRouter.post(
+  "/thumbnail",
+  handleUploadMiddleware("video", 1),
+  thumbnailVideoController
+);
+videoProcessingRouter.post(
+  "/trim",
+  handleUploadMiddleware("video", 1),
+  trimVideoController
+);
+videoProcessingRouter.post(
+  "/aspect-ratio",
+  handleUploadMiddleware("video", 1),
+  aspectRatioVideoController
+);
+videoProcessingRouter.post(
+  "/merge",
+  handleUploadMiddleware("videos", 8),
+  mergeVideosController
+);
+videoProcessingRouter.post(
+  "/export-mp4",
+  handleUploadMiddleware("video", 1),
+  exportMp4VideoController
+);
+videoProcessingRouter.post(
+  "/subtitles",
+  handleUploadMiddleware("video", 1),
+  subtitlesVideoController
 );
 videoProcessingRouter.get("/jobs", listVideoJobsController);
 videoProcessingRouter.get("/jobs/:id", validateObjectId("id"), getVideoJobController);

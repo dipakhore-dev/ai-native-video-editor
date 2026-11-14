@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import { getEnvConfig } from "../config/env.ts";
 import { MediaAssetModel } from "../models/MediaAsset.ts";
 import { ProjectModel } from "../models/Project.ts";
-import { VideoJobModel, type IVideoJob } from "../models/VideoJob.ts";
+import { VideoJobModel, type IVideoJob, type VideoOperationType } from "../models/VideoJob.ts";
 import {
   enqueueVideoProcessingJob,
   getBullMqJobSnapshot,
@@ -50,6 +50,18 @@ export interface PythonVideoMetadataResult {
   };
 }
 
+export interface PythonSubtitleResult {
+  status: "completed";
+  job_id: string;
+  model: string;
+  language: string;
+  language_probability: number;
+  duration_seconds: number;
+  segments: Array<{ id: number; start: number; end: number; text: string }>;
+  srt: string;
+  vtt: string;
+}
+
 export interface ProcessorHealthStatus {
   configured: boolean;
   reachable: boolean;
@@ -57,7 +69,26 @@ export interface ProcessorHealthStatus {
   status: "ok" | "degraded" | "unreachable";
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
+  fasterWhisperAvailable: boolean;
   error: string | null;
+}
+
+function getProcessorHeaders(): Record<string, string> {
+  const { videoProcessorApiKey } = getEnvConfig();
+  return videoProcessorApiKey ? { "X-Processor-Key": videoProcessorApiKey } : {};
+}
+
+function requireConfiguredProcessorUrl(): string {
+  const { videoProcessorUrl } = getEnvConfig();
+  if (!videoProcessorUrl) {
+    throw Object.assign(
+      new Error(
+        "Python FastAPI service URL is not configured (VIDEO_PROCESSOR_URL is empty). Start video-processor locally on Windows (uvicorn app.main:app --host 127.0.0.1 --port 8001) and set VIDEO_PROCESSOR_URL."
+      ),
+      { statusCode: 503, integrationPoint: "Python FastAPI Video Processor" }
+    );
+  }
+  return videoProcessorUrl;
 }
 
 export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus> {
@@ -70,7 +101,9 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       status: "unreachable",
       ffmpegAvailable: false,
       ffprobeAvailable: false,
-      error: "VIDEO_PROCESSOR_URL is not configured.",
+      fasterWhisperAvailable: false,
+      error:
+        "VIDEO_PROCESSOR_URL is not configured. Start the local Python FastAPI service and set VIDEO_PROCESSOR_URL in .env.",
     };
   }
 
@@ -86,13 +119,15 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
         status: "degraded",
         ffmpegAvailable: false,
         ffprobeAvailable: false,
-        error: `Health endpoint returned HTTP ${res.status}`,
+        fasterWhisperAvailable: false,
+        error: `Python FastAPI /health returned HTTP ${res.status}`,
       };
     }
     const body = (await res.json()) as {
       status?: string;
       ffmpeg_available?: boolean;
       ffprobe_available?: boolean;
+      faster_whisper_available?: boolean;
     };
     return {
       configured: true,
@@ -101,6 +136,7 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       status: body.status === "ok" ? "ok" : "degraded",
       ffmpegAvailable: Boolean(body.ffmpeg_available),
       ffprobeAvailable: Boolean(body.ffprobe_available),
+      fasterWhisperAvailable: Boolean(body.faster_whisper_available),
       error: null,
     };
   } catch (err) {
@@ -111,9 +147,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       status: "unreachable",
       ffmpegAvailable: false,
       ffprobeAvailable: false,
+      fasterWhisperAvailable: false,
       error:
         err instanceof Error
-          ? err.message
+          ? `Python FastAPI service unreachable: ${err.message}`
           : "Unable to reach Python FastAPI video processor.",
     };
   }
@@ -124,13 +161,7 @@ export async function forwardMetadataFileToPython(params: {
   originalName: string;
   mimeType: string;
 }): Promise<PythonVideoMetadataResult> {
-  const { videoProcessorUrl, videoProcessorApiKey } = getEnvConfig();
-  if (!videoProcessorUrl) {
-    throw Object.assign(
-      new Error("VIDEO_PROCESSOR_URL is not configured on the Express server."),
-      { statusCode: 503, integrationPoint: "Python FastAPI Video Processor" }
-    );
-  }
+  const videoProcessorUrl = requireConfiguredProcessorUrl();
 
   const fileBlob = await openAsBlob(params.filePath, {
     type: params.mimeType || "application/octet-stream",
@@ -138,23 +169,18 @@ export async function forwardMetadataFileToPython(params: {
   const form = new FormData();
   form.append("file", fileBlob, params.originalName);
 
-  const headers: Record<string, string> = {};
-  if (videoProcessorApiKey) {
-    headers["X-Processor-Key"] = videoProcessorApiKey;
-  }
-
   let res: Response;
   try {
     res = await fetch(`${videoProcessorUrl}/api/v1/metadata`, {
       method: "POST",
-      headers,
+      headers: getProcessorHeaders(),
       body: form,
       signal: AbortSignal.timeout(60_000),
     });
   } catch (err) {
     throw Object.assign(
       new Error(
-        `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn (video-processor/app/main.py) to run FFprobe metadata extraction.`
+        `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
       ),
       {
         statusCode: 503,
@@ -168,7 +194,6 @@ export async function forwardMetadataFileToPython(params: {
     error?: string;
     detail?: string;
     job_id?: string;
-    status?: string;
     metadata?: PythonVideoMetadataResult["metadata"];
   };
 
@@ -237,7 +262,7 @@ export async function processVideoMetadataRequest(params: {
     if (!queueStatus.connected) {
       throw Object.assign(
         new Error(
-          "Redis/BullMQ background queue is not connected. Set REDIS_URL or omit async=true for synchronous metadata extraction."
+          "Redis/BullMQ queue is not connected. Omit async=true to run synchronous local video processing without Redis."
         ),
         { statusCode: 503, integrationPoint: "BullMQ / Redis" }
       );
@@ -319,6 +344,207 @@ export async function processVideoMetadataRequest(params: {
     jobDoc.status = statusCode === 503 ? "integration_required" : "failed";
     jobDoc.progress = 100;
     jobDoc.errorMessage = err instanceof Error ? err.message : "Metadata extraction failed.";
+    jobDoc.completedAt = new Date();
+    await jobDoc.save();
+    throw err;
+  }
+}
+
+export async function runSyncBinaryVideoOperation(params: {
+  userId: string;
+  operation: VideoOperationType;
+  endpointPath: string;
+  files: Array<{ fieldName: string; filePath: string; originalName: string; mimeType: string; sizeBytes: number }>;
+  fields?: Record<string, string | number | undefined>;
+  defaultOutputFilename: string;
+  defaultContentType: string;
+  projectId?: string | null;
+}): Promise<{
+  job: IVideoJob;
+  buffer: Buffer;
+  contentType: string;
+  filename: string;
+  processorJobId: string;
+}> {
+  await assertOwnedReferences(params.userId, params.projectId, null);
+
+  const primary = params.files[0];
+  const jobDoc = await VideoJobModel.create({
+    userId: params.userId,
+    projectId: params.projectId ? new mongoose.Types.ObjectId(params.projectId) : null,
+    operation: params.operation,
+    status: "processing",
+    progress: 15,
+    executionMode: "sync",
+    sourceFilename:
+      params.files.length > 1
+        ? `${primary.originalName} (+${params.files.length - 1} more)`
+        : primary.originalName,
+    sourceSizeBytes: params.files.reduce((sum, f) => sum + f.sizeBytes, 0),
+    inputParams: params.fields ?? {},
+    startedAt: new Date(),
+  });
+
+  try {
+    const videoProcessorUrl = requireConfiguredProcessorUrl();
+    const form = new FormData();
+    for (const f of params.files) {
+      const blob = await openAsBlob(f.filePath, {
+        type: f.mimeType || "application/octet-stream",
+      });
+      form.append(f.fieldName, blob, f.originalName);
+    }
+    for (const [k, v] of Object.entries(params.fields ?? {})) {
+      if (v !== undefined && v !== null && String(v).trim() !== "") {
+        form.append(k, String(v));
+      }
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`${videoProcessorUrl}${params.endpointPath}`, {
+        method: "POST",
+        headers: getProcessorHeaders(),
+        body: form,
+        signal: AbortSignal.timeout(240_000),
+      });
+    } catch (err) {
+      throw Object.assign(
+        new Error(
+          `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
+        ),
+        { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
+      );
+    }
+
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
+      const message = errBody.error || errBody.detail || `Video processing failed (${res.status}).`;
+      throw Object.assign(new Error(message), {
+        statusCode: res.status >= 400 && res.status < 600 ? res.status : 502,
+      });
+    }
+
+    const arrayBuf = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    const contentType = res.headers.get("content-type") || params.defaultContentType;
+    const processorJobId = res.headers.get("x-processor-job-id") || "";
+    const disposition = res.headers.get("content-disposition") || "";
+    const nameMatch = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename = nameMatch?.[1] || params.defaultOutputFilename;
+
+    jobDoc.status = "completed";
+    jobDoc.progress = 100;
+    jobDoc.processorJobId = processorJobId;
+    jobDoc.result = { outputFilename: filename, outputSizeBytes: buffer.length, contentType };
+    jobDoc.completedAt = new Date();
+    await jobDoc.save();
+
+    return { job: jobDoc, buffer, contentType, filename, processorJobId };
+  } catch (err) {
+    const statusCode = (err as { statusCode?: number }).statusCode;
+    jobDoc.status = statusCode === 503 ? "integration_required" : "failed";
+    jobDoc.progress = 100;
+    jobDoc.errorMessage = err instanceof Error ? err.message : "Video processing failed.";
+    jobDoc.completedAt = new Date();
+    await jobDoc.save();
+    throw err;
+  }
+}
+
+export async function runSyncSubtitlesGeneration(params: {
+  userId: string;
+  filePath: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  language?: string;
+  projectId?: string | null;
+}): Promise<{ job: IVideoJob; subtitles: PythonSubtitleResult }> {
+  await assertOwnedReferences(params.userId, params.projectId, null);
+
+  const jobDoc = await VideoJobModel.create({
+    userId: params.userId,
+    projectId: params.projectId ? new mongoose.Types.ObjectId(params.projectId) : null,
+    operation: "subtitles",
+    status: "processing",
+    progress: 15,
+    executionMode: "sync",
+    sourceFilename: params.originalName,
+    sourceSizeBytes: params.sizeBytes,
+    inputParams: { language: params.language || "auto" },
+    startedAt: new Date(),
+  });
+
+  try {
+    const videoProcessorUrl = requireConfiguredProcessorUrl();
+    const blob = await openAsBlob(params.filePath, {
+      type: params.mimeType || "application/octet-stream",
+    });
+    const form = new FormData();
+    form.append("file", blob, params.originalName);
+    if (params.language) {
+      form.append("language", params.language);
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`${videoProcessorUrl}/api/v1/subtitles`, {
+        method: "POST",
+        headers: getProcessorHeaders(),
+        body: form,
+        signal: AbortSignal.timeout(240_000),
+      });
+    } catch (err) {
+      throw Object.assign(
+        new Error(
+          `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
+        ),
+        { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
+      );
+    }
+
+    const body = (await res.json().catch(() => ({}))) as Partial<PythonSubtitleResult> & {
+      error?: string;
+      detail?: string;
+    };
+
+    if (!res.ok || !Array.isArray(body.segments)) {
+      const message = body.error || body.detail || `Subtitle generation failed (${res.status}).`;
+      throw Object.assign(new Error(message), {
+        statusCode: res.status >= 400 && res.status < 600 ? res.status : 502,
+      });
+    }
+
+    const subtitles: PythonSubtitleResult = {
+      status: "completed",
+      job_id: body.job_id || "",
+      model: body.model || "faster-whisper",
+      language: body.language || "unknown",
+      language_probability: Number(body.language_probability || 0),
+      duration_seconds: Number(body.duration_seconds || 0),
+      segments: body.segments,
+      srt: body.srt || "",
+      vtt: body.vtt || "",
+    };
+
+    jobDoc.status = "completed";
+    jobDoc.progress = 100;
+    jobDoc.processorJobId = subtitles.job_id;
+    jobDoc.result = {
+      model: subtitles.model,
+      language: subtitles.language,
+      segmentCount: subtitles.segments.length,
+    };
+    jobDoc.completedAt = new Date();
+    await jobDoc.save();
+
+    return { job: jobDoc, subtitles };
+  } catch (err) {
+    const statusCode = (err as { statusCode?: number }).statusCode;
+    jobDoc.status = statusCode === 503 ? "integration_required" : "failed";
+    jobDoc.progress = 100;
+    jobDoc.errorMessage = err instanceof Error ? err.message : "Subtitle generation failed.";
     jobDoc.completedAt = new Date();
     await jobDoc.save();
     throw err;

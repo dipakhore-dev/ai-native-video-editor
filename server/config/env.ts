@@ -12,6 +12,7 @@ export interface AppEnvConfig {
   videoProcessorApiKey: string;
   redisUrl: string;
   videoUploadMaxMb: number;
+  videoGenProviderUrl: string;
 }
 
 export function getEnvConfig(): AppEnvConfig {
@@ -32,6 +33,7 @@ export function getEnvConfig(): AppEnvConfig {
     videoProcessorApiKey: (process.env.VIDEO_PROCESSOR_API_KEY || "").trim(),
     redisUrl: (process.env.REDIS_URL || "").trim(),
     videoUploadMaxMb: Math.max(1, Number(process.env.VIDEO_UPLOAD_MAX_MB || 500)),
+    videoGenProviderUrl: (process.env.VIDEO_GEN_PROVIDER_URL || "").trim(),
   };
 }
 
@@ -80,4 +82,8 @@ export function isRedisConfigured(): boolean {
 
 export function isVideoProcessorUrlConfigured(): boolean {
   return Boolean(getEnvConfig().videoProcessorUrl);
+}
+
+export function isVideoGenProviderConfigured(): boolean {
+  return Boolean(getEnvConfig().videoGenProviderUrl);
 }

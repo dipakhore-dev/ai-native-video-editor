@@ -50,6 +50,25 @@ class VideoMetadataResponse(BaseModel):
     metadata: VideoMetadataPayload
 
 
+class SubtitleSegment(BaseModel):
+    id: int = Field(ge=1)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    text: str
+
+
+class SubtitleGenerationResponse(BaseModel):
+    status: Literal["completed"] = "completed"
+    job_id: str
+    model: str
+    language: str
+    language_probability: float = Field(ge=0, le=1)
+    duration_seconds: float = Field(ge=0)
+    segments: list[SubtitleSegment]
+    srt: str
+    vtt: str
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     operation: str
@@ -66,5 +85,6 @@ class HealthResponse(BaseModel):
     service: str = "ai-studio-video-processor"
     ffmpeg_available: bool
     ffprobe_available: bool
+    faster_whisper_available: bool
     ffmpeg_path: Optional[str] = None
     ffprobe_path: Optional[str] = None

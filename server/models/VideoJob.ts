@@ -7,7 +7,8 @@ export type VideoOperationType =
   | "merge"
   | "resize_crop"
   | "aspect_ratio"
-  | "export_mp4";
+  | "export_mp4"
+  | "subtitles";
 
 export type VideoJobStatus =
   | "queued"
@@ -59,7 +60,16 @@ const VideoJobSchema = new Schema<IVideoJob>(
     },
     operation: {
       type: String,
-      enum: ["metadata", "thumbnail", "trim", "merge", "resize_crop", "aspect_ratio", "export_mp4"],
+      enum: [
+        "metadata",
+        "thumbnail",
+        "trim",
+        "merge",
+        "resize_crop",
+        "aspect_ratio",
+        "export_mp4",
+        "subtitles",
+      ],
       required: true,
     },
     status: {

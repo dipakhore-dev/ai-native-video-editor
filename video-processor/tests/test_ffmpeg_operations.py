@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.services.ffmpeg_service import (
+    VideoProcessingError,
+    export_mp4,
+    generate_thumbnail,
+    merge_video_clips,
+    resize_crop_aspect_ratio,
+    trim_video,
+)
+from app.services.ffprobe_service import check_binary, extract_video_metadata
+from app.services.whisper_service import (
+    SubtitleGenerationError,
+    extract_mono_wav_for_whisper,
+    format_srt,
+    format_vtt,
+    is_faster_whisper_available,
+    transcribe_video_subtitles,
+)
+
+
+class TestFfmpegAndWhisperServices(unittest.TestCase):
+    def setUp(self) -> None:
+        self.test_root = Path(tempfile.mkdtemp(prefix="ai_studio_ffmpeg_test_"))
+        self.ffmpeg = check_binary("ffmpeg")
+        if not self.ffmpeg:
+            self.skipTest("ffmpeg is not installed")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.test_root, ignore_errors=True)
+
+    def _make_clip(self, name: str, duration: float = 2.0, size: str = "640x360", with_audio: bool = True) -> Path:
+        out = self.test_root / name
+        cmd = [
+            self.ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=duration={duration}:size={size}:rate=24",
+        ]
+        if with_audio:
+            cmd.extend(["-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}"])
+        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        if with_audio:
+            cmd.extend(["-c:a", "aac", "-shortest"])
+        cmd.append(str(out))
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return out
+
+    def test_generate_thumbnail(self) -> None:
+        src = self._make_clip("thumb_src.mp4")
+        thumb = self.test_root / "thumb.jpg"
+        info = generate_thumbnail(src, thumb, timestamp_sec=0.5, width=320)
+        self.assertTrue(thumb.exists())
+        self.assertGreater(info["size_bytes"], 500)
+        self.assertEqual(info["width"], 320)
+
+    def test_trim_video_and_validation(self) -> None:
+        src = self._make_clip("trim_src.mp4", duration=3.0)
+        out = self.test_root / "trimmed.mp4"
+        meta = trim_video(src, out, start_sec=0.5, end_sec=2.0)
+        self.assertTrue(out.exists())
+        self.assertAlmostEqual(meta["duration_seconds"], 1.5, delta=0.35)
+
+        with self.assertRaises(VideoProcessingError):
+            trim_video(src, self.test_root / "bad_trim.mp4", start_sec=2.0, end_sec=1.0)
+
+    def test_aspect_ratio_conversions(self) -> None:
+        src = self._make_clip("ar_src.mp4", duration=1.5, size="640x360")
+
+        out_9_16 = self.test_root / "vertical.mp4"
+        meta_9_16 = resize_crop_aspect_ratio(src, out_9_16, aspect_ratio="9:16", fit_mode="crop")
+        self.assertEqual(meta_9_16["video"]["width"], 720)
+        self.assertEqual(meta_9_16["video"]["height"], 1280)
+        self.assertEqual(meta_9_16["aspect_ratio_label"], "9:16")
+
+        out_1_1 = self.test_root / "square.mp4"
+        meta_1_1 = resize_crop_aspect_ratio(src, out_1_1, aspect_ratio="1:1", fit_mode="pad")
+        self.assertEqual(meta_1_1["video"]["width"], 720)
+        self.assertEqual(meta_1_1["video"]["height"], 720)
+        self.assertEqual(meta_1_1["aspect_ratio_label"], "1:1")
+
+    def test_merge_clips_and_export_mp4(self) -> None:
+        clip1 = self._make_clip("c1.mp4", duration=1.2)
+        clip2 = self._make_clip("c2.mp4", duration=1.2)
+        merged = self.test_root / "merged.mp4"
+        merged_meta = merge_video_clips([clip1, clip2], merged, target_width=640, target_height=360, fps=24)
+        self.assertTrue(merged.exists())
+        self.assertGreaterEqual(merged_meta["duration_seconds"], 2.0)
+        self.assertEqual(merged_meta["video"]["width"], 640)
+
+        exported = self.test_root / "exported.mp4"
+        export_meta = export_mp4(merged, exported, resolution="720p", fps=30, aspect_ratio="16:9")
+        self.assertTrue(exported.exists())
+        self.assertEqual(export_meta["video"]["width"], 1280)
+        self.assertEqual(export_meta["video"]["height"], 720)
+        self.assertAlmostEqual(export_meta["video"]["fps"], 30.0, delta=0.5)
+
+    def test_whisper_audio_extraction_and_subtitle_formatting(self) -> None:
+        src = self._make_clip("audio_src.mp4", duration=1.2, with_audio=True)
+        wav = self.test_root / "out.wav"
+        extract_mono_wav_for_whisper(src, wav)
+        self.assertTrue(wav.exists())
+        self.assertGreater(wav.stat().st_size, 1000)
+
+        silent = self._make_clip("silent.mp4", duration=1.0, with_audio=False)
+        with self.assertRaises(SubtitleGenerationError):
+            extract_mono_wav_for_whisper(silent, self.test_root / "silent.wav")
+
+        segs = [{"id": 1, "start": 0.0, "end": 1.25, "text": "Hello AI Studio"}]
+        self.assertIn("00:00:00,000 --> 00:00:01,250", format_srt(segs))
+        self.assertIn("WEBVTT", format_vtt(segs))
+
+        if not is_faster_whisper_available():
+            with self.assertRaises(SubtitleGenerationError) as ctx:
+                transcribe_video_subtitles(src, self.test_root)
+            self.assertEqual(ctx.exception.status_code, 503)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,6 +1,10 @@
 import { Router } from "express";
 import { getDatabaseStatus } from "../config/database.ts";
-import { isGeminiConfigured, isJwtConfigured } from "../config/env.ts";
+import {
+  isGeminiConfigured,
+  isJwtConfigured,
+  isVideoGenProviderConfigured,
+} from "../config/env.ts";
 import { getVideoQueueStatus } from "../queues/videoQueue.ts";
 import { checkVideoProcessorHealth } from "../services/videoProcessor.service.ts";
 import { authRouter } from "./auth.routes.ts";
@@ -29,6 +33,7 @@ apiRouter.get("/integrations/status", async (_req, res) => {
   const db = getDatabaseStatus();
   const geminiReady = isGeminiConfigured();
   const jwtReady = isJwtConfigured();
+  const videoGenReady = isVideoGenProviderConfigured();
   const queueStatus = getVideoQueueStatus();
   const processorHealth = await checkVideoProcessorHealth();
 
@@ -48,16 +53,16 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         id: "objectStorage",
         label: "Media Object Storage",
         connected: false,
-        provider: "S3 / Cloud Storage (Unconnected)",
+        provider: "Local Browser Object URLs (₹0 Free Mode)",
         endpoint: "/api/media",
         summary:
-          "Media metadata schemas are ready in MongoDB; binary video files remain local via browser Object URLs until S3/GCS is attached.",
+          "Media metadata is stored in MongoDB while video binaries remain local on your machine (no paid cloud storage bucket required).",
       },
       aiAssistant: {
         id: "aiAssistant",
         label: "Editorial AI Assistant",
         connected: geminiReady,
-        provider: geminiReady ? "Gemini 4 Hydrogen (@google/genai)" : "Server LLM Endpoint (Unconnected)",
+        provider: geminiReady ? "Gemini 4 Hydrogen (@google/genai)" : "Server LLM Endpoint (Set GEMINI_API_KEY)",
         endpoint: "POST /api/ai/assistant",
         summary: geminiReady
           ? "Connected to Gemini API on the Node.js server with Zod-validated timeline editing operations."
@@ -65,40 +70,60 @@ apiRouter.get("/integrations/status", async (_req, res) => {
       },
       videoGeneration: {
         id: "videoGeneration",
-        label: "AI Video Generation Worker",
-        connected: false,
-        provider: "Text-to-Video / Image-to-Video Queue (Unconnected)",
+        label: "Paid Text-to-Video Generation",
+        connected: videoGenReady,
+        provider: videoGenReady
+          ? "External Provider Configured"
+          : "Disabled (No Paid Provider Configured)",
         endpoint: "POST /api/ai/generate-video",
-        summary:
-          "Request validation is active. Connect an external video synthesis worker to dispatch and stream generated clips.",
+        summary: videoGenReady
+          ? "VIDEO_GEN_PROVIDER_URL is configured; wire your provider adapter to dispatch requests."
+          : "Disabled in ₹0 local mode until an external video generation provider (VIDEO_GEN_PROVIDER_URL) is configured.",
       },
       renderWorker: {
         id: "renderWorker",
-        label: "Python FFmpeg/FFprobe Processor",
-        connected: processorHealth.reachable && processorHealth.ffprobeAvailable,
+        label: "Local Python FFmpeg/FFprobe Service",
+        connected:
+          processorHealth.reachable &&
+          processorHealth.ffprobeAvailable &&
+          processorHealth.ffmpegAvailable,
         provider: !processorHealth.configured
-          ? "FastAPI Microservice (Set VIDEO_PROCESSOR_URL)"
+          ? "Unavailable (Set VIDEO_PROCESSOR_URL)"
           : processorHealth.reachable && processorHealth.ffprobeAvailable
             ? "FastAPI + FFmpeg/FFprobe (Active)"
-            : "FastAPI Microservice (Unreachable)",
+            : "Unavailable (Start Local Uvicorn Service)",
         endpoint: "POST /api/video/metadata",
         summary: !processorHealth.configured
-          ? "Deploy video-processor/ externally (e.g. Cloud Run) and set VIDEO_PROCESSOR_URL to enable FFprobe/FFmpeg endpoints."
+          ? "Python FastAPI service is not configured. Start video-processor locally on Windows PowerShell and set VIDEO_PROCESSOR_URL (see docs/WINDOWS_LOCAL_SETUP.md)."
           : processorHealth.reachable && processorHealth.ffprobeAvailable
-            ? "Python FastAPI microservice is reachable with FFprobe metadata extraction active."
-            : "VIDEO_PROCESSOR_URL is configured, but the FastAPI service /health endpoint could not be reached.",
+            ? "Local Python FastAPI service is active for synchronous metadata, thumbnails, trimming, aspect-ratio conversion, clip merging, and MP4 export."
+            : "VIDEO_PROCESSOR_URL is set, but the Python FastAPI service is not reachable. Start uvicorn in video-processor/.",
+      },
+      localSubtitles: {
+        id: "localSubtitles",
+        label: "Local Subtitles (faster-whisper)",
+        connected: processorHealth.reachable && processorHealth.fasterWhisperAvailable,
+        provider:
+          processorHealth.reachable && processorHealth.fasterWhisperAvailable
+            ? "faster-whisper CPU (Active)"
+            : "Unavailable (Start Local video-processor)",
+        endpoint: "POST /api/video/subtitles",
+        summary:
+          processorHealth.reachable && processorHealth.fasterWhisperAvailable
+            ? "Local faster-whisper speech-to-subtitle transcription is active on CPU at ₹0 cost."
+            : "Runs locally via faster-whisper inside the Python FastAPI service (no paid transcription API required).",
       },
       jobQueue: {
         id: "jobQueue",
-        label: "Redis & BullMQ Queue",
+        label: "Redis & BullMQ Queue (Optional)",
         connected: queueStatus.connected,
         provider: queueStatus.connected
           ? "Redis + BullMQ Worker (Active)"
-          : "Redis + BullMQ (Set REDIS_URL)",
+          : "Optional (Sync Processing Active Without Redis)",
         endpoint: "GET /api/video/jobs",
         summary: queueStatus.connected
-          ? "Connected to Redis for background video processing jobs."
-          : "BullMQ queue & worker are wired; set REDIS_URL to enable asynchronous background processing.",
+          ? "Connected to Redis for asynchronous background video processing."
+          : "Redis is optional. Basic synchronous metadata and short-video FFmpeg operations run without Redis.",
       },
       authProvider: {
         id: "authProvider",
