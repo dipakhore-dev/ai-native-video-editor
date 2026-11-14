@@ -395,3 +395,323 @@ def export_mp4(
 
     _run_ffmpeg(cmd, timeout_sec)
     return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
+
+
+def _resolve_export_dimensions(
+    resolution: ResolutionTarget,
+    aspect_ratio: AspectRatioTarget | None,
+) -> tuple[int, int]:
+    if aspect_ratio == "9:16":
+        return (1080, 1920) if resolution == "1080p" else (720, 1280)
+    if aspect_ratio == "1:1":
+        return (1080, 1080) if resolution == "1080p" else (720, 720)
+    return (1920, 1080) if resolution == "1080p" else (1280, 720)
+
+
+def export_timeline_mp4(
+    uploaded_files: Sequence[Path],
+    output_path: Path,
+    *,
+    timeline_spec: dict | None = None,
+    resolution: ResolutionTarget = "720p",
+    fps: int = 30,
+    aspect_ratio: AspectRatioTarget | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    timeout_sec: int = 240,
+    max_duration_sec: float = 300.0,
+) -> dict:
+    if not uploaded_files:
+        raise VideoProcessingError("Upload at least one video file to export.", status_code=400)
+
+    if timeline_spec is None:
+        return export_mp4(
+            uploaded_files[0],
+            output_path,
+            resolution=resolution,
+            fps=fps,
+            aspect_ratio=aspect_ratio,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            timeout_sec=timeout_sec,
+            max_duration_sec=max_duration_sec,
+        )
+
+    project_meta = timeline_spec.get("project") if isinstance(timeline_spec.get("project"), dict) else {}
+    fmt = str(timeline_spec.get("format") or project_meta.get("format") or "mp4").lower()
+    if fmt != "mp4":
+        raise VideoProcessingError(
+            f"Format '{fmt}' is not supported. Synchronous FFmpeg export supports MP4 (H.264) only.",
+            status_code=400,
+        )
+
+    proj_res = str(project_meta.get("resolution") or resolution)
+    proj_w = project_meta.get("width")
+    proj_h = project_meta.get("height")
+    if (
+        proj_res.upper() == "4K"
+        or (isinstance(proj_w, (int, float)) and proj_w > 1920)
+        or (isinstance(proj_h, (int, float)) and proj_h > 1920)
+    ):
+        raise VideoProcessingError(
+            "4K export is not supported in synchronous local MP4 export. Select 720p or 1080p.",
+            status_code=400,
+        )
+
+    eff_resolution: ResolutionTarget = (
+        "1080p" if (resolution == "1080p" or proj_res == "1080p") else "720p"
+    )
+
+    raw_fps = project_meta.get("fps") or fps
+    try:
+        eff_fps = int(raw_fps)
+    except (TypeError, ValueError) as exc:
+        raise VideoProcessingError("Invalid export frame rate.", status_code=400) from exc
+    if eff_fps not in (24, 30, 60):
+        raise VideoProcessingError(
+            f"Frame rate {eff_fps} fps is not supported. Use 24, 30, or 60 fps.",
+            status_code=400,
+        )
+
+    raw_ar = aspect_ratio or project_meta.get("aspectRatio")
+    if raw_ar is not None and raw_ar not in ("16:9", "9:16", "1:1"):
+        raise VideoProcessingError(
+            f"Aspect ratio '{raw_ar}' is not supported. Use 16:9, 9:16, or 1:1.",
+            status_code=400,
+        )
+    eff_aspect: AspectRatioTarget | None = raw_ar
+
+    tracks = timeline_spec.get("tracks") or []
+    muted_tracks = {
+        str(t.get("id"))
+        for t in tracks
+        if isinstance(t, dict) and bool(t.get("muted"))
+    }
+
+    clips = timeline_spec.get("clips")
+    if not isinstance(clips, list) or len(clips) == 0:
+        raise VideoProcessingError("Timeline contains no clips to export.", status_code=400)
+    if len(clips) > 8:
+        raise VideoProcessingError(
+            "Synchronous local MP4 export supports up to 8 timeline clips.",
+            status_code=400,
+        )
+
+    for clip in clips:
+        if not isinstance(clip, dict):
+            raise VideoProcessingError("Invalid clip entry in timelineSpec.", status_code=400)
+        name = str(clip.get("sourceName") or clip.get("name") or clip.get("id") or "clip")
+        track_id = str(clip.get("trackId") or "")
+        kind = str(clip.get("kind") or "")
+
+        if track_id in muted_tracks:
+            raise VideoProcessingError(
+                f"Track '{track_id}' is muted but contains '{name}'. Unmute the track or remove its clips before exporting.",
+                status_code=400,
+            )
+        if kind != "video":
+            raise VideoProcessingError(
+                f"Timeline clip '{name}' (type '{kind}') is not supported in FFmpeg MP4 export yet. Only video clips on track V1 are supported (text overlays, images, and standalone audio tracks are not burned into MP4).",
+                status_code=400,
+            )
+        if track_id != "track_v1":
+            raise VideoProcessingError(
+                f"Clip '{name}' is on track '{track_id}'. FFmpeg MP4 export currently supports primary video track V1 ('track_v1') only.",
+                status_code=400,
+            )
+
+        speed = float(clip.get("speed", 1.0))
+        if abs(speed - 1.0) > 0.01:
+            raise VideoProcessingError(
+                f"Clip '{name}' uses {speed}x speed. Variable playback speed is not supported in FFmpeg MP4 export yet; set speed to 1.0x.",
+                status_code=400,
+            )
+
+        volume = float(clip.get("volume", 1.0))
+        if abs(volume - 1.0) > 0.05:
+            raise VideoProcessingError(
+                f"Clip '{name}' uses {int(round(volume * 100))}% volume. Per-clip volume mixing is not supported in FFmpeg MP4 export yet; set volume to 100%.",
+                status_code=400,
+            )
+
+        opacity = float(clip.get("opacity", 1.0))
+        if abs(opacity - 1.0) > 0.01:
+            raise VideoProcessingError(
+                f"Clip '{name}' uses {int(round(opacity * 100))}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.",
+                status_code=400,
+            )
+
+    sorted_clips = sorted(
+        clips,
+        key=lambda c: (float(c.get("timelineStartSec", 0.0)), str(c.get("id", ""))),
+    )
+
+    first_start = float(sorted_clips[0].get("timelineStartSec", 0.0))
+    if first_start > 0.15:
+        raise VideoProcessingError(
+            "Timeline starts with an empty gap before the first clip. Move the first clip to 00:00 before exporting.",
+            status_code=400,
+        )
+
+    for idx in range(len(sorted_clips) - 1):
+        cur = sorted_clips[idx]
+        nxt = sorted_clips[idx + 1]
+        cur_start = float(cur.get("timelineStartSec", 0.0))
+        cur_end = float(cur.get("timelineEndSec", cur_start + float(cur.get("durationSec", 0.0))))
+        nxt_start = float(nxt.get("timelineStartSec", 0.0))
+        gap = nxt_start - cur_end
+        if gap < -0.05:
+            raise VideoProcessingError(
+                "Overlapping clips on track V1 are not supported in FFmpeg MP4 export. Arrange clips sequentially without overlap.",
+                status_code=400,
+            )
+        if gap > 0.15:
+            raise VideoProcessingError(
+                "Empty timeline gaps between clips on track V1 are not supported in FFmpeg MP4 export. Close gaps before exporting.",
+                status_code=400,
+            )
+
+    file_indices: list[int] = []
+    for clip in sorted_clips:
+        raw_idx = clip.get("fileIndex")
+        if raw_idx is None:
+            if len(uploaded_files) == 1:
+                file_idx = 0
+            else:
+                raise VideoProcessingError(
+                    "Each clip in timelineSpec must specify 'fileIndex' when uploading multiple video files.",
+                    status_code=400,
+                )
+        else:
+            try:
+                file_idx = int(raw_idx)
+            except (TypeError, ValueError) as exc:
+                raise VideoProcessingError("Invalid fileIndex in timelineSpec clip.", status_code=400) from exc
+        if file_idx < 0 or file_idx >= len(uploaded_files):
+            raise VideoProcessingError(
+                f"Clip references missing uploaded video file index {file_idx}.",
+                status_code=400,
+            )
+        file_indices.append(file_idx)
+
+    source_metas: dict[int, dict] = {}
+    for file_idx in set(file_indices):
+        source_metas[file_idx] = _assert_short_video_limit(
+            uploaded_files[file_idx],
+            ffprobe_bin=ffprobe_bin,
+            max_duration_sec=max_duration_sec,
+        )
+
+    total_export_duration = sum(
+        max(0.0, float(c.get("sourceOutSec", 0.0)) - float(c.get("sourceInSec", 0.0)))
+        if "sourceOutSec" in c
+        else float(c.get("durationSec", 0.0))
+        for c in sorted_clips
+    )
+    if total_export_duration > max_duration_sec:
+        raise VideoProcessingError(
+            f"Combined timeline duration ({total_export_duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+            status_code=400,
+        )
+
+    work_dir = output_path.parent / "_timeline_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    segments: list[Path] = []
+
+    for idx, clip in enumerate(sorted_clips):
+        file_idx = file_indices[idx]
+        src_path = uploaded_files[file_idx]
+        src_meta = source_metas[file_idx]
+        src_duration = float(src_meta["duration_seconds"])
+
+        src_in = float(clip.get("sourceInSec", 0.0))
+        default_out = (
+            src_in + float(clip["durationSec"])
+            if "durationSec" in clip
+            else src_duration
+        )
+        src_out = float(clip.get("sourceOutSec", default_out))
+
+        if src_in < 0 or src_out <= src_in:
+            raise VideoProcessingError(
+                f"Invalid trim range ({src_in:.2f}s to {src_out:.2f}s) on clip '{clip.get('sourceName') or idx}'.",
+                status_code=400,
+            )
+        if src_duration > 0 and src_in >= src_duration:
+            raise VideoProcessingError(
+                f"Clip start offset ({src_in:.2f}s) exceeds source video duration ({src_duration:.2f}s).",
+                status_code=400,
+            )
+
+        effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
+        if effective_out - src_in < 0.1:
+            raise VideoProcessingError("Clip duration must be at least 0.1 seconds.", status_code=400)
+
+        needs_trim = src_in > 0.05 or (src_duration > 0 and effective_out < src_duration - 0.05)
+        if needs_trim:
+            trimmed_path = work_dir / f"seg_{idx}_trim.mp4"
+            trim_video(
+                src_path,
+                trimmed_path,
+                start_sec=src_in,
+                end_sec=effective_out,
+                ffmpeg_bin=ffmpeg_bin,
+                ffprobe_bin=ffprobe_bin,
+                timeout_sec=timeout_sec,
+                max_duration_sec=max_duration_sec,
+            )
+            segments.append(trimmed_path)
+        else:
+            segments.append(src_path)
+
+    if len(segments) == 1:
+        return export_mp4(
+            segments[0],
+            output_path,
+            resolution=eff_resolution,
+            fps=eff_fps,
+            aspect_ratio=eff_aspect,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            timeout_sec=timeout_sec,
+            max_duration_sec=max_duration_sec,
+        )
+
+    target_w, target_h = _resolve_export_dimensions(eff_resolution, eff_aspect)
+    target_ratio = target_w / target_h
+    prepared_segments: list[Path] = []
+    for idx, seg_path in enumerate(segments):
+        if eff_aspect is not None:
+            seg_meta = extract_video_metadata(seg_path, ffprobe_bin=ffprobe_bin)
+            seg_w = int(seg_meta["video"]["width"])
+            seg_h = int(seg_meta["video"]["height"])
+            seg_ratio = seg_w / seg_h if seg_h > 0 else target_ratio
+            if abs(seg_ratio - target_ratio) > 0.03:
+                cropped_path = work_dir / f"seg_{idx}_aspect.mp4"
+                resize_crop_aspect_ratio(
+                    seg_path,
+                    cropped_path,
+                    target_width=target_w,
+                    target_height=target_h,
+                    fit_mode="crop",
+                    ffmpeg_bin=ffmpeg_bin,
+                    ffprobe_bin=ffprobe_bin,
+                    timeout_sec=timeout_sec,
+                    max_duration_sec=max_duration_sec,
+                )
+                prepared_segments.append(cropped_path)
+                continue
+        prepared_segments.append(seg_path)
+
+    return merge_video_clips(
+        prepared_segments,
+        output_path,
+        target_width=target_w,
+        target_height=target_h,
+        fps=eff_fps,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+        timeout_sec=timeout_sec,
+        max_total_duration_sec=max_duration_sec,
+    )
+

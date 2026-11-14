@@ -67,6 +67,7 @@ export async function extractMediaAsset(file: File): Promise<MediaAsset> {
       height: dimensions.height,
       objectUrl,
       thumbnailUrl: objectUrl,
+      sourceFile: file,
       addedAt: new Date().toISOString(),
     };
   }
@@ -90,6 +91,7 @@ export async function extractMediaAsset(file: File): Promise<MediaAsset> {
       sizeBytes: file.size,
       duration,
       objectUrl,
+      sourceFile: file,
       addedAt: new Date().toISOString(),
     };
   }
@@ -162,6 +164,7 @@ export async function extractMediaAsset(file: File): Promise<MediaAsset> {
     height: videoInfo.height,
     objectUrl,
     thumbnailUrl: videoInfo.thumbnailUrl,
+    sourceFile: file,
     addedAt: new Date().toISOString(),
   };
 }

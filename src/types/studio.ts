@@ -22,6 +22,7 @@ export interface MediaAsset {
   height?: number;
   objectUrl: string;
   thumbnailUrl?: string;
+  sourceFile?: File;
   addedAt: string;
 }
 
@@ -98,6 +99,7 @@ export interface RenderTimelineClipSpec {
   speed: number;
   volume: number;
   opacity: number;
+  fileIndex?: number;
   textStyle?: TextOverlayStyle;
 }
 
@@ -127,10 +129,12 @@ export interface ExportAttempt {
   fps: number;
   clipCount: number;
   totalDuration: number;
-  status: "integration_required";
+  status: "completed" | "failed" | "integration_required";
   message: string;
   requestedAt: string;
   timelineSnapshotJson: string;
+  outputFilename?: string;
+  outputSizeBytes?: number;
 }
 
 export interface IntegrationStatusItem {

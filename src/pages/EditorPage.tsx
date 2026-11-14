@@ -477,7 +477,7 @@ export function EditorPage() {
             className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-3.5 py-1.5 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
           >
             <Download className="h-3.5 w-3.5" />
-            <span>Export Spec</span>
+            <span>Export Video</span>
           </button>
         </div>
       }

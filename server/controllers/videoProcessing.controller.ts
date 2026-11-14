@@ -335,41 +335,248 @@ export async function mergeVideosController(
   }
 }
 
+interface ParsedTimelineExportSpec {
+  format?: string;
+  project?: {
+    name?: string;
+    aspectRatio?: string;
+    resolution?: string;
+    width?: number;
+    height?: number;
+    fps?: number;
+  };
+  tracks?: Array<{ id?: string; muted?: boolean }>;
+  clips?: Array<{
+    id?: string;
+    trackId?: string;
+    kind?: string;
+    sourceName?: string;
+    timelineStartSec?: number;
+    timelineEndSec?: number;
+    durationSec?: number;
+    sourceInSec?: number;
+    sourceOutSec?: number;
+    speed?: number;
+    volume?: number;
+    opacity?: number;
+    fileIndex?: number;
+  }>;
+}
+
+function validateTimelineExportSpec(
+  spec: ParsedTimelineExportSpec,
+  uploadedFileCount: number,
+  requestedResolution: string,
+  requestedFps: number
+): string | null {
+  const fmt = (spec.format || "mp4").toLowerCase();
+  if (fmt !== "mp4") {
+    return `Format '${fmt}' is not supported. Synchronous FFmpeg export supports MP4 (H.264) only.`;
+  }
+
+  const projRes = spec.project?.resolution || requestedResolution;
+  if (
+    projRes.toUpperCase() === "4K" ||
+    (typeof spec.project?.width === "number" && spec.project.width > 1920) ||
+    (typeof spec.project?.height === "number" && spec.project.height > 1920)
+  ) {
+    return "4K export is not supported in synchronous local MP4 export. Select 720p or 1080p.";
+  }
+
+  const effFps = Number(spec.project?.fps ?? requestedFps);
+  if (![24, 30, 60].includes(effFps)) {
+    return `Frame rate ${effFps} fps is not supported. Use 24, 30, or 60 fps.`;
+  }
+
+  const ar = spec.project?.aspectRatio;
+  if (ar && !["16:9", "9:16", "1:1"].includes(ar)) {
+    return `Aspect ratio '${ar}' is not supported. Use 16:9, 9:16, or 1:1.`;
+  }
+
+  const clips = spec.clips;
+  if (!Array.isArray(clips) || clips.length === 0) {
+    return "Timeline contains no clips to export.";
+  }
+  if (clips.length > 8) {
+    return "Synchronous local MP4 export supports up to 8 timeline clips.";
+  }
+
+  const mutedTrackIds = new Set(
+    (spec.tracks ?? [])
+      .filter((t) => Boolean(t?.muted) && t?.id)
+      .map((t) => String(t.id))
+  );
+
+  for (const clip of clips) {
+    const name = clip.sourceName || clip.id || "clip";
+    const trackId = String(clip.trackId || "");
+    const kind = String(clip.kind || "");
+
+    if (mutedTrackIds.has(trackId)) {
+      return `Track '${trackId}' is muted but contains '${name}'. Unmute the track or remove its clips before exporting.`;
+    }
+    if (kind !== "video") {
+      return `Timeline clip '${name}' (type '${kind}') is not supported in FFmpeg MP4 export yet. Only video clips on track V1 are supported (text overlays, images, and standalone audio tracks cannot be exported yet).`;
+    }
+    if (trackId !== "track_v1") {
+      return `Clip '${name}' is on track '${trackId}'. FFmpeg MP4 export currently supports primary video track V1 ('track_v1') only.`;
+    }
+
+    const speed = Number(clip.speed ?? 1);
+    if (Math.abs(speed - 1) > 0.01) {
+      return `Clip '${name}' uses ${speed}x speed. Variable playback speed is not supported in FFmpeg MP4 export yet; set speed to 1.0x.`;
+    }
+    const volume = Number(clip.volume ?? 1);
+    if (Math.abs(volume - 1) > 0.05) {
+      return `Clip '${name}' uses ${Math.round(volume * 100)}% volume. Per-clip volume mixing is not supported in FFmpeg MP4 export yet; set volume to 100%.`;
+    }
+    const opacity = Number(clip.opacity ?? 1);
+    if (Math.abs(opacity - 1) > 0.01) {
+      return `Clip '${name}' uses ${Math.round(opacity * 100)}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
+    }
+
+    if (clip.fileIndex === undefined) {
+      if (uploadedFileCount > 1) {
+        return `Clip '${name}' must specify fileIndex when multiple source files are uploaded.`;
+      }
+    } else if (
+      !Number.isInteger(clip.fileIndex) ||
+      clip.fileIndex < 0 ||
+      clip.fileIndex >= uploadedFileCount
+    ) {
+      return `Clip '${name}' references missing uploaded file index ${clip.fileIndex}.`;
+    }
+  }
+
+  const sorted = [...clips].sort(
+    (a, b) => Number(a.timelineStartSec ?? 0) - Number(b.timelineStartSec ?? 0)
+  );
+  if (Number(sorted[0].timelineStartSec ?? 0) > 0.15) {
+    return "Timeline starts with an empty gap before the first clip. Move the first clip to 00:00 before exporting.";
+  }
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const curStart = Number(sorted[i].timelineStartSec ?? 0);
+    const curEnd = Number(
+      sorted[i].timelineEndSec ?? curStart + Number(sorted[i].durationSec ?? 0)
+    );
+    const nextStart = Number(sorted[i + 1].timelineStartSec ?? 0);
+    const gap = nextStart - curEnd;
+    if (gap < -0.05) {
+      return "Overlapping clips on track V1 are not supported in FFmpeg MP4 export. Arrange clips sequentially without overlap.";
+    }
+    if (gap > 0.15) {
+      return "Empty timeline gaps between clips on track V1 are not supported in FFmpeg MP4 export. Close gaps before exporting.";
+    }
+  }
+
+  return null;
+}
+
 export async function exportMp4VideoController(
   req: AuthenticatedRequest,
   res: Response
 ): Promise<void> {
-  const file = req.file;
-  if (!file) {
-    res.status(400).json({ error: 'Upload a video file using form field "video".' });
+  const uploadedFields = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
+  const files: Express.Multer.File[] = [
+    ...(req.file ? [req.file] : []),
+    ...(uploadedFields.video ?? []),
+    ...(uploadedFields.videos ?? []),
+  ];
+
+  if (files.length === 0) {
+    res
+      .status(400)
+      .json({ error: 'Upload at least one video file using form field "videos" or "video".' });
     return;
   }
 
   try {
-    const resolution = req.body?.resolution === "1080p" ? "1080p" : "720p";
+    const rawFormat = typeof req.body?.format === "string" ? req.body.format.trim().toLowerCase() : "mp4";
+    if (rawFormat !== "mp4") {
+      res.status(400).json({
+        error: `Format '${rawFormat}' is not supported. Synchronous FFmpeg export supports MP4 (H.264) only.`,
+      });
+      return;
+    }
+
+    const rawRes = typeof req.body?.resolution === "string" ? req.body.resolution.trim() : "720p";
+    if (rawRes.toUpperCase() === "4K" || rawRes === "3840x2160") {
+      res.status(400).json({
+        error: "4K export is not supported in synchronous local MP4 export. Select 720p or 1080p.",
+      });
+      return;
+    }
+    const resolution =
+      rawRes === "1080p" || rawRes === "1920x1080" || rawRes === "1080x1920" || rawRes === "1080x1080"
+        ? "1080p"
+        : "720p";
+
     const fps = Number(req.body?.fps ?? 30);
+    if (!Number.isFinite(fps) || ![24, 30, 60].includes(fps)) {
+      res.status(400).json({ error: "Frame rate must be 24, 30, or 60 fps." });
+      return;
+    }
+
     const aspectRatio =
       typeof req.body?.aspectRatio === "string" && req.body.aspectRatio.trim()
         ? req.body.aspectRatio.trim()
         : undefined;
+    if (aspectRatio && !["16:9", "9:16", "1:1"].includes(aspectRatio)) {
+      res.status(400).json({ error: "Aspect ratio must be '16:9', '9:16', or '1:1'." });
+      return;
+    }
+
+    const rawSpec =
+      typeof req.body?.timelineSpec === "string"
+        ? req.body.timelineSpec
+        : typeof req.body?.timeline_spec === "string"
+          ? req.body.timeline_spec
+          : "";
+
+    let normalizedSpecString: string | undefined;
+    if (rawSpec.trim()) {
+      let parsedSpec: ParsedTimelineExportSpec;
+      try {
+        parsedSpec = JSON.parse(rawSpec) as ParsedTimelineExportSpec;
+      } catch {
+        res.status(400).json({ error: "Invalid timelineSpec JSON payload." });
+        return;
+      }
+      if (!parsedSpec || typeof parsedSpec !== "object" || Array.isArray(parsedSpec)) {
+        res.status(400).json({ error: "timelineSpec must be a JSON object." });
+        return;
+      }
+
+      const validationError = validateTimelineExportSpec(
+        parsedSpec,
+        files.length,
+        resolution,
+        fps
+      );
+      if (validationError) {
+        res.status(400).json({ error: validationError });
+        return;
+      }
+      normalizedSpecString = JSON.stringify(parsedSpec);
+    }
 
     const result = await runSyncBinaryVideoOperation({
       userId: req.userId!,
       operation: "export_mp4",
       endpointPath: "/api/v1/export-mp4",
-      files: [
-        {
-          fieldName: "file",
-          filePath: file.path,
-          originalName: file.originalname || "video.mp4",
-          mimeType: file.mimetype || "application/octet-stream",
-          sizeBytes: file.size,
-        },
-      ],
+      files: files.map((f) => ({
+        fieldName: "files",
+        filePath: f.path,
+        originalName: f.originalname || "video.mp4",
+        mimeType: f.mimetype || "application/octet-stream",
+        sizeBytes: f.size,
+      })),
       fields: {
         resolution,
-        fps: Number.isFinite(fps) ? fps : 30,
+        fps,
         aspect_ratio: aspectRatio,
+        ...(normalizedSpecString ? { timeline_spec: normalizedSpecString } : {}),
       },
       defaultOutputFilename: "export.mp4",
       defaultContentType: "video/mp4",
@@ -383,7 +590,7 @@ export async function exportMp4VideoController(
   } catch (err) {
     sendProcessorError(res, err, "Failed to export MP4 video.");
   } finally {
-    await fs.unlink(file.path).catch(() => undefined);
+    await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => undefined)));
   }
 }
 

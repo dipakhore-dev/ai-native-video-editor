@@ -1,8 +1,8 @@
-import { Download, FileJson, Film, AlertTriangle } from "lucide-react";
+import { Download, FileJson, Film, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
 import { IntegrationNotice } from "../components/common/IntegrationNotice";
 import { useStudio } from "../context/StudioContext";
-import { formatTimecode } from "../utils/media";
+import { formatBytes, formatTimecode } from "../utils/media";
 
 export function ExportsPage() {
   const { exportAttempts, navigate } = useStudio();
@@ -34,7 +34,7 @@ export function ExportsPage() {
         <div>
           <h1 className="font-display text-2xl font-semibold text-white">Export History</h1>
           <p className="mt-1 text-sm text-zinc-400">
-            Track render job submissions and download local timeline edit specifications (.json).
+            Track MP4 exports rendered by the FFmpeg worker and download local timeline specifications (.json).
           </p>
         </div>
 
@@ -45,7 +45,7 @@ export function ExportsPage() {
             </div>
             <h2 className="text-base font-medium text-white">No export jobs submitted yet</h2>
             <p className="mt-1.5 text-xs text-zinc-400 max-w-md mx-auto leading-relaxed">
-              Open a sequence in the Video Editor and click Export Sequence to test the render job payload or download a timeline specification.
+              Open a sequence in the Video Editor and click Export Video to render an MP4 or download a timeline specification.
             </p>
             <div className="mt-5">
               <button
@@ -66,7 +66,7 @@ export function ExportsPage() {
                   <th className="py-3.5 px-5 font-medium">Sequence</th>
                   <th className="py-3.5 px-4 font-medium">Output Spec</th>
                   <th className="py-3.5 px-4 font-medium text-right">Duration</th>
-                  <th className="py-3.5 px-4 font-medium">Render Worker Status</th>
+                  <th className="py-3.5 px-4 font-medium">Render Status</th>
                   <th className="py-3.5 px-5 font-medium text-right">Timeline Spec</th>
                 </tr>
               </thead>
@@ -81,15 +81,28 @@ export function ExportsPage() {
                     </td>
                     <td className="py-3.5 px-4 font-mono text-zinc-300 tabular-nums">
                       {item.format.toUpperCase()} · {item.resolution} · {item.fps}fps
+                      {item.outputSizeBytes ? ` · ${formatBytes(item.outputSizeBytes)}` : ""}
                     </td>
                     <td className="py-3.5 px-4 font-mono text-zinc-300 text-right tabular-nums">
                       {formatTimecode(item.totalDuration)}
                     </td>
                     <td className="py-3.5 px-4">
-                      <div className="inline-flex items-center gap-1.5 text-amber-400 font-medium">
-                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                        <span>Integration Required</span>
-                      </div>
+                      {item.status === "completed" ? (
+                        <div className="inline-flex items-center gap-1.5 text-emerald-400 font-medium">
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                          <span>Completed</span>
+                        </div>
+                      ) : item.status === "failed" ? (
+                        <div className="inline-flex items-center gap-1.5 text-rose-400 font-medium">
+                          <XCircle className="h-3.5 w-3.5 shrink-0" />
+                          <span>Failed</span>
+                        </div>
+                      ) : (
+                        <div className="inline-flex items-center gap-1.5 text-amber-400 font-medium">
+                          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                          <span>Worker Unavailable</span>
+                        </div>
+                      )}
                       <p className="text-[11px] text-zinc-500 mt-0.5 max-w-xs">{item.message}</p>
                     </td>
                     <td className="py-3.5 px-5 text-right">
@@ -115,9 +128,9 @@ export function ExportsPage() {
         )}
 
         <IntegrationNotice
-          title="FFmpeg / Cloud Render Queue Integration Point"
-          endpoint="POST /api/exports"
-          description="Completed MP4/WebM/MOV files are never faked. Wire a server-side FFmpeg worker or cloud transcoding service to /api/exports to render downloadable video files."
+          title="Local FFmpeg MP4 Export Endpoint"
+          endpoint="POST /api/video/export-mp4"
+          description="Synchronous MP4 exports stream local track V1 video files to the authenticated Express route and Python FFmpeg service. Unsupported edits or offline workers return explicit errors without faking outputs."
         />
       </div>
     </StudioShell>

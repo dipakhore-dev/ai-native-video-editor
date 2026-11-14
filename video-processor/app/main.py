@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
@@ -18,6 +19,7 @@ from .schemas import (
 from .services.ffmpeg_service import (
     VideoProcessingError,
     export_mp4,
+    export_timeline_mp4,
     generate_thumbnail,
     merge_video_clips,
     resize_crop_aspect_ratio,
@@ -362,25 +364,71 @@ async def merge_endpoint(
     dependencies=[Depends(verify_processor_key)],
 )
 async def export_mp4_endpoint(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(default=None),
+    files: Optional[list[UploadFile]] = File(default=None),
     resolution: Literal["720p", "1080p"] = Form(default="720p"),
     fps: int = Form(default=30),
     aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None),
+    timeline_spec: Optional[str] = Form(default=None),
     settings: ProcessorSettings = Depends(get_settings),
 ) -> FileResponse:
     job_id = uuid.uuid4().hex
     job_store.create(job_id, operation="export_mp4")
     job_dir = _prepare_job_dir(settings, job_id)
+    uploads = [*(files or []), *([file] if file is not None else [])]
 
     try:
+        if not uploads:
+            raise FileValidationError(
+                'Upload at least one video file using form field "files" or "file".',
+                status_code=400,
+            )
+
+        parsed_spec: dict | None = None
+        if timeline_spec and timeline_spec.strip():
+            try:
+                loaded = json.loads(timeline_spec)
+            except json.JSONDecodeError as exc:
+                raise VideoProcessingError(
+                    "Invalid timeline_spec JSON payload.",
+                    status_code=400,
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise VideoProcessingError(
+                    "timeline_spec must be a JSON object.",
+                    status_code=400,
+                )
+            parsed_spec = loaded
+
         job_store.update(job_id, status="processing", progress=20)
-        safe_name, input_path = await _save_single_upload(
-            file, job_dir, settings.max_upload_bytes
+        saved_paths: list[Path] = []
+        first_stem = "sequence"
+        for idx, upload in enumerate(uploads):
+            safe_name, saved_path = await _save_single_upload(
+                upload,
+                job_dir,
+                settings.max_upload_bytes,
+                prefix=f"clip_{idx}_",
+            )
+            if idx == 0:
+                first_stem = Path(safe_name).stem or "sequence"
+            saved_paths.append(saved_path)
+
+        project_name = (
+            str((parsed_spec or {}).get("project", {}).get("name") or "").strip()
+            if isinstance((parsed_spec or {}).get("project"), dict)
+            else ""
         )
-        output_path = job_dir / f"{Path(safe_name).stem}_export.mp4"
-        out_meta = export_mp4(
-            input_path,
+        safe_project_stem = (
+            "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in project_name).strip("_")
+            or first_stem
+        )
+        output_path = job_dir / f"{safe_project_stem}_export.mp4"
+
+        out_meta = export_timeline_mp4(
+            saved_paths,
             output_path,
+            timeline_spec=parsed_spec,
             resolution=resolution,
             fps=fps,
             aspect_ratio=aspect_ratio,
@@ -402,7 +450,8 @@ async def export_mp4_endpoint(
         job_store.update(job_id, status="failed", progress=100, error=str(exc))
         raise
     finally:
-        await file.close()
+        for upload in uploads:
+            await upload.close()
 
 
 @app.post(

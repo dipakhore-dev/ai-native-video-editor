@@ -158,6 +158,70 @@ export async function submitExportJob(payload: {
   });
 }
 
+export interface ExportMp4BinaryResult {
+  blob: Blob;
+  filename: string;
+  sizeBytes: number;
+  jobId: string;
+}
+
+export async function exportTimelineMp4(
+  formData: FormData
+): Promise<ApiResult<ExportMp4BinaryResult>> {
+  try {
+    const res = await fetch("/api/video/export-mp4", {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+        integrationPoint?: string;
+      };
+      return {
+        ok: false,
+        status: res.status,
+        error: errBody.error || errBody.message || `MP4 export failed (${res.status}).`,
+        integrationPoint: errBody.integrationPoint,
+      };
+    }
+
+    const blob = await res.blob();
+    if (blob.size === 0) {
+      return {
+        ok: false,
+        status: 502,
+        error: "Server returned an empty MP4 file.",
+      };
+    }
+
+    const disposition = res.headers.get("content-disposition") || "";
+    const match = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename = match?.[1] || "export.mp4";
+    const jobId = res.headers.get("x-video-job-id") || "";
+
+    return {
+      ok: true,
+      status: res.status,
+      data: {
+        blob,
+        filename,
+        sizeBytes: blob.size,
+        jobId,
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : "Network error during MP4 export.",
+    };
+  }
+}
+
 export interface AuthUserDto {
   id: string;
   fullName: string;

@@ -80,6 +80,31 @@ function handleUploadMiddleware(fieldName: string, maxFiles = 1) {
   };
 }
 
+function handleExportUploadMiddleware() {
+  const upload = createMulterInstance(8);
+  const runner = upload.fields([
+    { name: "video", maxCount: 1 },
+    { name: "videos", maxCount: 8 },
+  ]);
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    runner(req, res, (err: unknown) => {
+      if (!err) {
+        next();
+        return;
+      }
+      if (err instanceof multer.MulterError) {
+        const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+        res.status(status).json({ error: err.message });
+        return;
+      }
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "Invalid video upload.",
+      });
+    });
+  };
+}
+
 export const videoProcessingRouter = Router();
 
 videoProcessingRouter.use(requireAuth);
@@ -112,7 +137,7 @@ videoProcessingRouter.post(
 );
 videoProcessingRouter.post(
   "/export-mp4",
-  handleUploadMiddleware("video", 1),
+  handleExportUploadMiddleware(),
   exportMp4VideoController
 );
 videoProcessingRouter.post(

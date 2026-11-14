@@ -9,6 +9,7 @@ from pathlib import Path
 from app.services.ffmpeg_service import (
     VideoProcessingError,
     export_mp4,
+    export_timeline_mp4,
     generate_thumbnail,
     merge_video_clips,
     resize_crop_aspect_ratio,
@@ -124,6 +125,167 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             with self.assertRaises(SubtitleGenerationError) as ctx:
                 transcribe_video_subtitles(src, self.test_root)
             self.assertEqual(ctx.exception.status_code, 503)
+
+    def test_export_timeline_mp4_trim_merge_and_aspect_ratio(self) -> None:
+        clip_a = self._make_clip("tl_a.mp4", duration=3.0, size="640x360")
+        clip_b = self._make_clip("tl_b.mp4", duration=3.0, size="640x360")
+        out = self.test_root / "timeline_export.mp4"
+
+        timeline_spec = {
+            "schemaVersion": "1.0",
+            "format": "mp4",
+            "project": {
+                "name": "Timeline Cut",
+                "aspectRatio": "9:16",
+                "resolution": "720p",
+                "fps": 30,
+            },
+            "tracks": [
+                {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False}
+            ],
+            "clips": [
+                {
+                    "id": "c_first",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "tl_b.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 1.5,
+                    "durationSec": 1.5,
+                    "sourceInSec": 0.5,
+                    "sourceOutSec": 2.0,
+                    "speed": 1.0,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 1,
+                },
+                {
+                    "id": "c_second",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "tl_a.mp4",
+                    "timelineStartSec": 1.5,
+                    "timelineEndSec": 3.0,
+                    "durationSec": 1.5,
+                    "sourceInSec": 1.0,
+                    "sourceOutSec": 2.5,
+                    "speed": 1.0,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                },
+            ],
+        }
+
+        meta = export_timeline_mp4(
+            [clip_a, clip_b],
+            out,
+            timeline_spec=timeline_spec,
+            resolution="720p",
+            fps=30,
+            aspect_ratio="9:16",
+        )
+        self.assertTrue(out.exists())
+        self.assertAlmostEqual(meta["duration_seconds"], 3.0, delta=0.4)
+        self.assertEqual(meta["video"]["width"], 720)
+        self.assertEqual(meta["video"]["height"], 1280)
+        self.assertEqual(meta["aspect_ratio_label"], "9:16")
+        self.assertAlmostEqual(meta["video"]["fps"], 30.0, delta=0.5)
+
+    def test_export_timeline_mp4_rejects_unsupported_operations(self) -> None:
+        clip = self._make_clip("tl_unsupported.mp4", duration=2.0)
+        out = self.test_root / "should_fail.mp4"
+
+        base_clip = {
+            "id": "v1",
+            "trackId": "track_v1",
+            "kind": "video",
+            "sourceName": "tl_unsupported.mp4",
+            "timelineStartSec": 0.0,
+            "timelineEndSec": 2.0,
+            "durationSec": 2.0,
+            "sourceInSec": 0.0,
+            "sourceOutSec": 2.0,
+            "speed": 1.0,
+            "volume": 1.0,
+            "opacity": 1.0,
+            "fileIndex": 0,
+        }
+
+        # Text overlay unsupported
+        with self.assertRaises(VideoProcessingError) as ctx_text:
+            export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+                    "tracks": [],
+                    "clips": [
+                        base_clip,
+                        {
+                            **base_clip,
+                            "id": "t1",
+                            "trackId": "track_t1",
+                            "kind": "text",
+                            "sourceName": "Title",
+                        },
+                    ],
+                },
+            )
+        self.assertEqual(ctx_text.exception.status_code, 400)
+
+        # Speed != 1.0 unsupported
+        with self.assertRaises(VideoProcessingError):
+            export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+                    "tracks": [],
+                    "clips": [{**base_clip, "speed": 1.5}],
+                },
+            )
+
+        # Gap on V1 unsupported
+        with self.assertRaises(VideoProcessingError):
+            export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+                    "tracks": [],
+                    "clips": [{**base_clip, "timelineStartSec": 1.0, "timelineEndSec": 3.0}],
+                },
+            )
+
+        # WebM unsupported
+        with self.assertRaises(VideoProcessingError):
+            export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "webm",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+                    "tracks": [],
+                    "clips": [base_clip],
+                },
+            )
+
+        # 4K unsupported
+        with self.assertRaises(VideoProcessingError):
+            export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "4K", "width": 3840, "height": 2160, "fps": 30},
+                    "tracks": [],
+                    "clips": [base_clip],
+                },
+            )
 
 
 if __name__ == "__main__":

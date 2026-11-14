@@ -92,7 +92,7 @@ apiRouter.get("/integrations/status", async (_req, res) => {
           : processorHealth.reachable && processorHealth.ffprobeAvailable
             ? "FastAPI + FFmpeg/FFprobe (Active)"
             : "Unavailable (Start Local Uvicorn Service)",
-        endpoint: "POST /api/video/metadata",
+        endpoint: "POST /api/video/export-mp4",
         summary: !processorHealth.configured
           ? "Python FastAPI service is not configured. Start video-processor locally on Windows PowerShell and set VIDEO_PROCESSOR_URL (see docs/WINDOWS_LOCAL_SETUP.md)."
           : processorHealth.reachable && processorHealth.ffprobeAvailable
