@@ -31,6 +31,7 @@ from .services.whisper_service import (
     SubtitleGenerationError,
     is_faster_whisper_available,
     transcribe_video_subtitles,
+    validate_subtitle_language,
 )
 from .utils.file_cleanup import (
     FileValidationError,
@@ -468,6 +469,7 @@ async def subtitles_endpoint(
     job_store.create(job_id, operation="subtitles")
 
     try:
+        normalized_language = validate_subtitle_language(language)
         safe_name = validate_upload_headers(file.filename, file.content_type)
         job_store.update(job_id, status="processing", progress=20)
 
@@ -480,7 +482,7 @@ async def subtitles_endpoint(
             result = transcribe_video_subtitles(
                 input_path,
                 temp_dir,
-                language=language.strip() if language else None,
+                language=normalized_language,
                 model_size=settings.whisper_model_size,
                 device=settings.whisper_device,
                 compute_type=settings.whisper_compute_type,

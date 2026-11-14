@@ -16,6 +16,40 @@ function getParamId(req: AuthenticatedRequest): string {
   return Array.isArray(raw) ? raw[0] : raw;
 }
 
+const SUPPORTED_SUBTITLE_LANGUAGES = new Set([
+  "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
+  "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+  "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy",
+  "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la", "lb",
+  "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+  "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru",
+  "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+  "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi",
+  "yi", "yo", "yue", "zh",
+]);
+
+export function parseValidatedSubtitleLanguage(raw: unknown): {
+  value?: string;
+  error?: string;
+} {
+  if (raw === undefined || raw === null) {
+    return { value: undefined };
+  }
+  if (typeof raw !== "string") {
+    return { error: "Subtitle language must be a string ISO-639-1 code (e.g. 'en', 'hi', 'bn') or empty for auto-detect." };
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized || normalized === "auto") {
+    return { value: undefined };
+  }
+  if (!SUPPORTED_SUBTITLE_LANGUAGES.has(normalized)) {
+    return {
+      error: `Unsupported subtitle language '${raw.trim()}'. Use Auto-Detect or a valid Whisper language code such as 'en', 'hi', 'bn', 'es', 'fr', 'de', or 'ja'.`,
+    };
+  }
+  return { value: normalized };
+}
+
 function getOptionalProjectId(req: AuthenticatedRequest): string | null {
   return typeof req.body?.projectId === "string" && req.body.projectId.trim()
     ? req.body.projectId.trim()
@@ -661,10 +695,11 @@ export async function subtitlesVideoController(
   }
 
   try {
-    const language =
-      typeof req.body?.language === "string" && req.body.language.trim()
-        ? req.body.language.trim()
-        : undefined;
+    const parsedLanguage = parseValidatedSubtitleLanguage(req.body?.language);
+    if (parsedLanguage.error) {
+      res.status(400).json({ error: parsedLanguage.error });
+      return;
+    }
 
     const result = await runSyncSubtitlesGeneration({
       userId: req.userId!,
@@ -672,7 +707,7 @@ export async function subtitlesVideoController(
       originalName: file.originalname || "video.mp4",
       mimeType: file.mimetype || "application/octet-stream",
       sizeBytes: file.size,
-      language,
+      language: parsedLanguage.value,
       projectId: getOptionalProjectId(req),
     });
 

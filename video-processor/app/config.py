@@ -39,7 +39,7 @@ def get_settings() -> ProcessorSettings:
         ffprobe_timeout_sec=probe_timeout,
         ffmpeg_timeout_sec=ffmpeg_timeout,
         max_short_video_sec=max_short_sec,
-        whisper_model_size=os.getenv("WHISPER_MODEL_SIZE", "base").strip() or "base",
+        whisper_model_size=os.getenv("WHISPER_MODEL_SIZE", "small").strip() or "small",
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu").strip() or "cpu",
         whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8",
     )

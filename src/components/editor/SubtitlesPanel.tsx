@@ -25,11 +25,13 @@ import type {
 } from "../../types/studio";
 import { formatTimecode } from "../../utils/media";
 import {
+  buildSubtitleFilenameSlug,
   exportSubtitlesToSrt,
   exportSubtitlesToVtt,
   getSubtitleStyle,
   hexToRgba,
   mapWhisperSegmentsToClip,
+  SUBTITLE_LANGUAGE_OPTIONS,
 } from "../../utils/subtitles";
 
 interface SubtitlesPanelProps {
@@ -38,16 +40,6 @@ interface SubtitlesPanelProps {
   playheadTime: number;
   onSeek: (time: number) => void;
 }
-
-const LANGUAGE_OPTIONS = [
-  { value: "", label: "Auto-Detect" },
-  { value: "en", label: "English (en)" },
-  { value: "hi", label: "Hindi (hi)" },
-  { value: "es", label: "Spanish (es)" },
-  { value: "fr", label: "French (fr)" },
-  { value: "de", label: "German (de)" },
-  { value: "ja", label: "Japanese (ja)" },
-];
 
 const COLOR_PRESETS = ["#FFFFFF", "#F4F4F5", "#FBBF24", "#60A5FA", "#A78BFA"];
 const BG_COLOR_PRESETS = ["#09090B", "#000000", "#1E1B4B", "#18181B"];
@@ -298,7 +290,7 @@ export function SubtitlesPanel({
       setFeedback({ kind: "error", message: "No valid subtitle cues to export as SRT." });
       return;
     }
-    const base = project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "subtitles";
+    const base = buildSubtitleFilenameSlug(project.name);
     triggerTextDownload(content, `${base}.srt`, "application/x-subrip;charset=utf-8");
   };
 
@@ -308,7 +300,7 @@ export function SubtitlesPanel({
       setFeedback({ kind: "error", message: "No valid subtitle cues to export as VTT." });
       return;
     }
-    const base = project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "subtitles";
+    const base = buildSubtitleFilenameSlug(project.name);
     triggerTextDownload(content, `${base}.vtt`, "text/vtt;charset=utf-8");
   };
 
@@ -360,7 +352,7 @@ export function SubtitlesPanel({
                 disabled={generating}
                 className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs text-zinc-100 focus:border-violet-500 focus:outline-none disabled:opacity-50"
               >
-                {LANGUAGE_OPTIONS.map((opt) => (
+                {SUBTITLE_LANGUAGE_OPTIONS.map((opt) => (
                   <option key={opt.value || "auto"} value={opt.value}>
                     {opt.label}
                   </option>
@@ -663,11 +655,12 @@ export function SubtitlesPanel({
 
                     <textarea
                       rows={2}
+                      dir="auto"
                       value={cue.text}
                       onChange={(e) =>
                         updateSubtitleSegment(cue.id, { text: e.target.value })
                       }
-                      className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs text-zinc-100 focus:border-violet-500 focus:outline-none resize-none"
+                      className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs text-zinc-100 leading-relaxed focus:border-violet-500 focus:outline-none resize-none"
                     />
                   </div>
                 );

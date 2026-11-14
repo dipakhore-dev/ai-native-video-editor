@@ -8,6 +8,30 @@ from typing import Any, Optional
 from .ffprobe_service import check_binary, extract_video_metadata
 
 
+SUPPORTED_SUBTITLE_LANGUAGES: frozenset[str] = frozenset({
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
+    "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+    "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy",
+    "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la", "lb",
+    "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru",
+    "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi",
+    "yi", "yo", "yue", "zh",
+})
+
+_ENGLISH_ONLY_MULTILINGUAL_MAP: dict[str, str] = {
+    "tiny.en": "tiny",
+    "base.en": "base",
+    "small.en": "small",
+    "medium.en": "medium",
+    "distil-small.en": "small",
+    "distil-medium.en": "medium",
+    "distil-large-v2": "small",
+    "distil-large-v3": "small",
+}
+
+
 class SubtitleGenerationError(Exception):
     """Raised when local faster-whisper subtitle generation cannot proceed."""
 
@@ -18,6 +42,37 @@ class SubtitleGenerationError(Exception):
 
 def is_faster_whisper_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
+
+
+def validate_subtitle_language(language: Optional[str]) -> Optional[str]:
+    if language is None:
+        return None
+    normalized = language.strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    if normalized not in SUPPORTED_SUBTITLE_LANGUAGES:
+        raise SubtitleGenerationError(
+            f"Unsupported subtitle language '{language.strip()}'. Supported codes include 'en', 'hi', 'bn', 'es', 'fr', 'de', 'ja', or empty for Auto-Detect.",
+            status_code=400,
+        )
+    return normalized
+
+
+def resolve_multilingual_model_size(
+    model_size: Optional[str],
+    language: Optional[str] = None,
+) -> str:
+    raw = (model_size or "").strip() or "small"
+    lowered = raw.lower()
+    # Always require a multilingual model when language is non-English (e.g. 'bn') or Auto-Detect (None)
+    if lowered in _ENGLISH_ONLY_MULTILINGUAL_MAP:
+        return _ENGLISH_ONLY_MULTILINGUAL_MAP[lowered]
+    if lowered.endswith(".en"):
+        stripped = raw[:-3].strip()
+        return stripped or "small"
+    if language is not None and language.strip().lower() != "en" and ".en" in lowered:
+        return "small"
+    return raw
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -144,13 +199,16 @@ def transcribe_video_subtitles(
     work_dir: Path,
     *,
     language: Optional[str] = None,
-    model_size: str = "base",
+    model_size: str = "small",
     device: str = "cpu",
     compute_type: str = "int8",
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     max_duration_sec: float = 300.0,
 ) -> dict[str, Any]:
+    normalized_language = validate_subtitle_language(language)
+    resolved_model_size = resolve_multilingual_model_size(model_size, normalized_language)
+
     if not is_faster_whisper_available():
         raise SubtitleGenerationError(
             "faster-whisper is not installed in the Python environment. Run `pip install faster-whisper` inside video-processor/.venv.",
@@ -166,11 +224,11 @@ def transcribe_video_subtitles(
         max_duration_sec=max_duration_sec,
     )
 
-    model = _get_whisper_model(model_size, device, compute_type)
+    model = _get_whisper_model(resolved_model_size, device, compute_type)
     try:
         raw_segments, info = model.transcribe(
             str(wav_path),
-            language=language or None,
+            language=normalized_language,
             vad_filter=True,
         )
 
@@ -198,8 +256,8 @@ def transcribe_video_subtitles(
         ) from exc
 
     return {
-        "model": f"faster-whisper-{model_size}",
-        "language": str(getattr(info, "language", language or "unknown")),
+        "model": f"faster-whisper-{resolved_model_size}",
+        "language": str(getattr(info, "language", normalized_language or "unknown")),
         "language_probability": round(float(getattr(info, "language_probability", 0.0)), 4),
         "duration_seconds": float(meta["duration_seconds"]),
         "segments": segments,

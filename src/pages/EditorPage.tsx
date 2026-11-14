@@ -789,6 +789,7 @@ export function EditorPage() {
                       {activeSubtitles.map((cue) => (
                         <div
                           key={cue.id}
+                          dir="auto"
                           style={{
                             fontSize: `${Math.max(12, Math.round(subtitleStyle.fontSize * 0.58))}px`,
                             color: subtitleStyle.color,
@@ -801,7 +802,7 @@ export function EditorPage() {
                                 ? "0 1px 3px rgba(0,0,0,0.95)"
                                 : undefined,
                           }}
-                          className="px-3 py-1 rounded-md font-medium text-center leading-snug whitespace-pre-wrap max-w-full"
+                          className="px-3 py-1 rounded-md font-medium text-center leading-relaxed whitespace-pre-wrap max-w-full"
                         >
                           {cue.text}
                         </div>

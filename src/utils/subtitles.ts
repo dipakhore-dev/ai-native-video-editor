@@ -5,6 +5,30 @@ import type {
   TimelineClip,
 } from "../types/studio";
 
+export interface SubtitleLanguageOption {
+  value: string;
+  label: string;
+}
+
+export const SUBTITLE_LANGUAGE_OPTIONS: SubtitleLanguageOption[] = [
+  { value: "", label: "Auto-Detect" },
+  { value: "en", label: "English (en)" },
+  { value: "hi", label: "Hindi (hi)" },
+  { value: "bn", label: "Bengali (বাংলা) (bn)" },
+  { value: "es", label: "Spanish (es)" },
+  { value: "fr", label: "French (fr)" },
+  { value: "de", label: "German (de)" },
+  { value: "ja", label: "Japanese (ja)" },
+];
+
+export function buildSubtitleFilenameSlug(projectName: string): string {
+  const ascii = (projectName || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return ascii || "subtitles";
+}
+
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   enabled: true,
   fontSize: 28,

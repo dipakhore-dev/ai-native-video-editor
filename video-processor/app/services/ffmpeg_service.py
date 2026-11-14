@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -781,6 +784,78 @@ def _escape_ass_text(text: str) -> str:
     return cleaned.replace("\n", r"\N").strip()
 
 
+def _contains_bengali_unicode(subtitles: Sequence[dict]) -> bool:
+    for cue in subtitles:
+        if not isinstance(cue, dict):
+            continue
+        text = str(cue.get("text", ""))
+        if any("\u0980" <= ch <= "\u09ff" for ch in text):
+            return True
+    return False
+
+
+def _detect_bengali_font_name() -> str:
+    env_font = os.getenv("SUBTITLE_BENGALI_FONT", "").strip()
+    if env_font:
+        return env_font.replace(",", " ").strip()
+
+    if os.name == "nt" or sys.platform.startswith("win"):
+        windir = Path(os.getenv("WINDIR", r"C:\Windows"))
+        local_appdata = os.getenv("LOCALAPPDATA", "")
+        font_dirs = [windir / "Fonts"]
+        if local_appdata:
+            font_dirs.insert(0, Path(local_appdata) / "Microsoft" / "Windows" / "Fonts")
+
+        windows_candidates = [
+            ("Noto Sans Bengali", ("NotoSansBengali-Regular.ttf", "NotoSansBengali-Medium.ttf", "NotoSansBengali.ttf")),
+            ("Nirmala UI", ("Nirmala.ttf", "Nirmala.ttc", "NirmalaUI.ttf")),
+            ("Vrinda", ("vrinda.ttf", "vrindab.ttf")),
+        ]
+        for family_name, filenames in windows_candidates:
+            for directory in font_dirs:
+                for fname in filenames:
+                    if (directory / fname).exists():
+                        return family_name
+        return "Nirmala UI"
+
+    fc_list = shutil.which("fc-list")
+    if fc_list:
+        try:
+            proc = subprocess.run(
+                [fc_list, ":lang=bn", "--format=%{family}\n"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                families = [
+                    line.split(",")[0].strip()
+                    for line in proc.stdout.splitlines()
+                    if line.strip()
+                ]
+                for preferred in ("Noto Sans Bengali", "Noto Serif Bengali", "Kalpurush", "Nirmala UI", "Vrinda"):
+                    if preferred in families:
+                        return preferred
+                if families:
+                    return families[0]
+        except Exception:
+            pass
+
+    return "Noto Sans Bengali"
+
+
+def _resolve_ass_font_name(subtitles: Sequence[dict], style: dict) -> str:
+    explicit = str(style.get("fontFamily", "") or "").strip()
+    if explicit:
+        cleaned = explicit.replace(",", " ").replace("\n", " ").replace("\r", " ").strip()
+        if cleaned:
+            return cleaned
+    if _contains_bengali_unicode(subtitles):
+        return _detect_bengali_font_name()
+    return "Arial"
+
+
 def _write_ass_subtitles(
     subtitles: Sequence[dict],
     style: dict,
@@ -792,6 +867,7 @@ def _write_ass_subtitles(
     font_size_ui = float(style.get("fontSize", 28))
     font_size_ui = max(12.0, min(72.0, font_size_ui))
     ass_font_size = max(18, int(round(font_size_ui * (height / 540.0))))
+    ass_font_name = _resolve_ass_font_name(subtitles, style)
 
     text_color = _hex_to_ass_color(str(style.get("color", "#FFFFFF")), 1.0)
     bg_opacity = float(style.get("backgroundOpacity", 0.75))
@@ -834,7 +910,7 @@ def _write_ass_subtitles(
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,Arial,{ass_font_size},{text_color},&H000000FF,{outline_colour},{back_colour},1,0,0,0,100,100,0,0,{border_style},{outline_width},{shadow_depth},{alignment},{margin_h},{margin_h},{margin_v},1",
+        f"Style: Default,{ass_font_name},{ass_font_size},{text_color},&H000000FF,{outline_colour},{back_colour},1,0,0,0,100,100,0,0,{border_style},{outline_width},{shadow_depth},{alignment},{margin_h},{margin_h},{margin_v},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",

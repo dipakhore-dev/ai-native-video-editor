@@ -123,7 +123,7 @@ PORT="8001"
 VIDEO_PROCESSOR_API_KEY="local-dev-processor-key"
 FFMPEG_BIN="ffmpeg"
 FFPROBE_BIN="ffprobe"
-WHISPER_MODEL_SIZE="base"
+WHISPER_MODEL_SIZE="small"
 WHISPER_DEVICE="cpu"
 WHISPER_COMPUTE_TYPE="int8"
 ```
@@ -157,4 +157,12 @@ $env:PYTHONPATH = "video-processor"
 python -m unittest discover -s video-processor/tests -t video-processor -v
 ```
 
-*(First time you call `/api/video/subtitles`, `faster-whisper` downloads the open-source Whisper `base` model weights once to your local Hugging Face cache and runs completely offline/free afterward.)*
+*(First time you call `/api/video/subtitles`, `faster-whisper` downloads the open-source multilingual Whisper `small` model weights once to your local Hugging Face cache and runs completely offline/free afterward. English-only models such as `base.en` or `small.en` are not used for Bengali or auto-detect.)*
+
+---
+
+## Bengali (বাংলা) Subtitles & Windows Font Setup
+
+- **Multilingual Model**: Bengali (`bn`) requires a multilingual `faster-whisper` model (`small`, `medium`, or `base`—never `*.en`). The default `WHISPER_MODEL_SIZE="small"` runs on CPU (`int8`) at ₹0 cost.
+- **Built-in Windows Font (`Nirmala UI`)**: Windows 10 and Windows 11 include **Nirmala UI** (`C:\Windows\Fonts\Nirmala.ttf`), which supports Bengali Unicode (`বাংলা`) glyphs. When Bengali text is present during MP4 subtitle burn-in, the Python processor automatically selects `Nirmala UI` (or `Noto Sans Bengali` if installed) instead of `Arial`.
+- **Optional `Noto Sans Bengali` Font on Windows**: If you prefer Google's **Noto Sans Bengali** for both MP4 burn-in and local preview fallback, download the free TTF from Google Fonts (`Noto Sans Bengali`), right-click `NotoSansBengali-Regular.ttf` -> **Install for all users** (or copy it to `C:\Windows\Fonts`), or override via `SUBTITLE_BENGALI_FONT` in `video-processor\.env`.

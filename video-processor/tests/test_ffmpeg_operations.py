@@ -6,8 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.config import get_settings
 from app.services.ffmpeg_service import (
     VideoProcessingError,
+    _resolve_ass_font_name,
+    _write_ass_subtitles,
     export_mp4,
     export_timeline_mp4,
     generate_thumbnail,
@@ -22,7 +25,9 @@ from app.services.whisper_service import (
     format_srt,
     format_vtt,
     is_faster_whisper_available,
+    resolve_multilingual_model_size,
     transcribe_video_subtitles,
+    validate_subtitle_language,
 )
 
 
@@ -383,6 +388,135 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
                 timeline_spec={**base_spec, "burnSubtitles": True, "subtitles": []},
             )
         self.assertEqual(ctx_empty.exception.status_code, 400)
+
+    def test_bengali_language_validation_multilingual_model_and_utf8_exports(self) -> None:
+        self.assertEqual(validate_subtitle_language("bn"), "bn")
+        self.assertEqual(validate_subtitle_language("BN"), "bn")
+        self.assertEqual(validate_subtitle_language("en"), "en")
+        self.assertEqual(validate_subtitle_language("hi"), "hi")
+        self.assertEqual(validate_subtitle_language("es"), "es")
+        self.assertEqual(validate_subtitle_language("fr"), "fr")
+        self.assertEqual(validate_subtitle_language("de"), "de")
+        self.assertEqual(validate_subtitle_language("ja"), "ja")
+        self.assertIsNone(validate_subtitle_language(""))
+        self.assertIsNone(validate_subtitle_language("auto"))
+        self.assertIsNone(validate_subtitle_language(None))
+
+        with self.assertRaises(SubtitleGenerationError) as ctx_bad_lang:
+            validate_subtitle_language("bengali-invalid")
+        self.assertEqual(ctx_bad_lang.exception.status_code, 400)
+
+        self.assertEqual(get_settings().whisper_model_size, "small")
+        self.assertEqual(resolve_multilingual_model_size("small", "bn"), "small")
+        self.assertEqual(resolve_multilingual_model_size("base.en", "bn"), "base")
+        self.assertEqual(resolve_multilingual_model_size("small.en", "bn"), "small")
+        self.assertEqual(resolve_multilingual_model_size("distil-small.en", "bn"), "small")
+        self.assertFalse(resolve_multilingual_model_size("medium.en", "bn").endswith(".en"))
+
+        bn_text = "নমস্কার, এআই স্টুডিওতে স্বাগতম।"
+        segs = [{"id": 1, "start": 0.0, "end": 1.5, "text": bn_text}]
+        srt_text = format_srt(segs)
+        vtt_text = format_vtt(segs)
+        self.assertIn(bn_text, srt_text)
+        self.assertIn(bn_text, vtt_text)
+        self.assertIn("WEBVTT", vtt_text)
+
+    def test_export_timeline_mp4_burn_bengali_subtitles(self) -> None:
+        bn_cues = [{"id": "bn_1", "start": 0.1, "end": 1.4, "text": "আমি বাংলায় কথা বলছি"}]
+        en_cues = [{"id": "en_1", "start": 0.1, "end": 1.4, "text": "Hello AI Studio"}]
+
+        bn_font = _resolve_ass_font_name(bn_cues, {})
+        self.assertNotEqual(bn_font, "Arial")
+        self.assertEqual(_resolve_ass_font_name(en_cues, {}), "Arial")
+
+        ass_file = self.test_root / "bn_check.ass"
+        _write_ass_subtitles(bn_cues, {}, ass_file, width=1280, height=720)
+        ass_content = ass_file.read_text(encoding="utf-8")
+        self.assertIn(f"Style: Default,{bn_font},", ass_content)
+        self.assertIn("আমি বাংলায় কথা বলছি", ass_content)
+
+        clip = self._make_clip("bn_burn_src.mp4", duration=2.0, size="640x360")
+        out_plain = self.test_root / "bn_plain.mp4"
+        out_burned = self.test_root / "bn_burned.mp4"
+
+        base_spec = {
+            "schemaVersion": "1.0",
+            "format": "mp4",
+            "project": {
+                "name": "বাংলা সাবটাইটেল",
+                "aspectRatio": "16:9",
+                "resolution": "720p",
+                "fps": 30,
+            },
+            "tracks": [
+                {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False}
+            ],
+            "clips": [
+                {
+                    "id": "c1",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "bn_burn_src.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 1.6,
+                    "durationSec": 1.6,
+                    "sourceInSec": 0.2,
+                    "sourceOutSec": 1.8,
+                    "speed": 1.0,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+
+        export_timeline_mp4([clip], out_plain, timeline_spec={**base_spec, "burnSubtitles": False})
+        burned_meta = export_timeline_mp4(
+            [clip],
+            out_burned,
+            timeline_spec={
+                **base_spec,
+                "burnSubtitles": True,
+                "subtitleStyle": {
+                    "enabled": True,
+                    "fontSize": 32,
+                    "color": "#FFFFFF",
+                    "position": "bottom",
+                    "backgroundColor": "#09090B",
+                    "backgroundOpacity": 0.85,
+                },
+                "subtitles": bn_cues,
+            },
+        )
+        self.assertTrue(out_burned.exists())
+        self.assertEqual(burned_meta["video"]["width"], 1280)
+        self.assertEqual(burned_meta["video"]["height"], 720)
+
+        frame_plain = self.test_root / "bn_plain.rgb"
+        frame_burned = self.test_root / "bn_burned.rgb"
+        for src_mp4, raw_out in [(out_plain, frame_plain), (out_burned, frame_burned)]:
+            proc = subprocess.run(
+                [
+                    self.ffmpeg,
+                    "-y",
+                    "-ss",
+                    "0.6",
+                    "-i",
+                    str(src_mp4),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    str(raw_out),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotEqual(frame_plain.read_bytes(), frame_burned.read_bytes())
 
 
 if __name__ == "__main__":
