@@ -1,0 +1,6 @@
+{
+  "name": "AI Studio",
+  "description": "AI-native video creation, multitrack timeline editing, and studio workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
