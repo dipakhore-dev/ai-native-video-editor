@@ -392,9 +392,15 @@ interface ParsedTimelineExportSpec {
     sourceOutSec?: number;
     speed?: number;
     volume?: number;
+    muted?: boolean;
+    fadeInSec?: number;
+    fadeOutSec?: number;
+    duckingEnabled?: boolean;
+    duckingAmount?: number;
     opacity?: number;
     fileIndex?: number;
   }>;
+  speechIntervals?: Array<{ start?: number; end?: number }>;
   burnSubtitles?: boolean;
   subtitles?: Array<{
     id?: string;
@@ -447,42 +453,54 @@ function validateTimelineExportSpec(
   if (!Array.isArray(clips) || clips.length === 0) {
     return "Timeline contains no clips to export.";
   }
-  if (clips.length > 8) {
-    return "Synchronous local MP4 export supports up to 8 timeline clips.";
+  if (clips.length > 16) {
+    return "Synchronous local MP4 export supports up to 16 clips (up to 8 V1 video + 8 A1 audio clips).";
   }
 
-  const mutedTrackIds = new Set(
-    (spec.tracks ?? [])
-      .filter((t) => Boolean(t?.muted) && t?.id)
-      .map((t) => String(t.id))
-  );
+  const videoClips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
+  const audioClips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
 
   for (const clip of clips) {
     const name = clip.sourceName || clip.id || "clip";
     const trackId = String(clip.trackId || "");
     const kind = String(clip.kind || "");
 
-    if (mutedTrackIds.has(trackId)) {
-      return `Track '${trackId}' is muted but contains '${name}'. Unmute the track or remove its clips before exporting.`;
-    }
-    if (kind !== "video") {
-      return `Timeline clip '${name}' (type '${kind}') is not supported in FFmpeg MP4 export yet. Only video clips on track V1 are supported (text overlays, images, and standalone audio tracks cannot be exported yet).`;
-    }
-    if (trackId !== "track_v1") {
-      return `Clip '${name}' is on track '${trackId}'. FFmpeg MP4 export currently supports primary video track V1 ('track_v1') only.`;
+    if (kind === "video" && trackId === "track_v1") {
+      videoClips.push(clip);
+    } else if (kind === "audio" && trackId === "track_a1") {
+      audioClips.push(clip);
+    } else {
+      return `Timeline clip '${name}' (${kind} on '${trackId}') is not supported in MP4 export yet. Only V1 video clips and A1 audio clips are supported in Phase 2.`;
     }
 
     const speed = Number(clip.speed ?? 1);
     if (Math.abs(speed - 1) > 0.01) {
       return `Clip '${name}' uses ${speed}x speed. Variable playback speed is not supported in FFmpeg MP4 export yet; set speed to 1.0x.`;
     }
+
     const volume = Number(clip.volume ?? 1);
-    if (Math.abs(volume - 1) > 0.05) {
-      return `Clip '${name}' uses ${Math.round(volume * 100)}% volume. Per-clip volume mixing is not supported in FFmpeg MP4 export yet; set volume to 100%.`;
+    if (!Number.isFinite(volume) || volume < 0 || volume > 2) {
+      return `Clip '${name}' volume (${Math.round(volume * 100)}%) must be between 0% and 200%.`;
     }
-    const opacity = Number(clip.opacity ?? 1);
-    if (Math.abs(opacity - 1) > 0.01) {
-      return `Clip '${name}' uses ${Math.round(opacity * 100)}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
+
+    const fadeIn = Number(clip.fadeInSec ?? 0);
+    const fadeOut = Number(clip.fadeOutSec ?? 0);
+    if (!Number.isFinite(fadeIn) || fadeIn < 0 || fadeIn > 30 || !Number.isFinite(fadeOut) || fadeOut < 0 || fadeOut > 30) {
+      return `Clip '${name}' fade durations must be between 0s and 30s.`;
+    }
+
+    if (clip.duckingAmount !== undefined) {
+      const duckAmt = Number(clip.duckingAmount);
+      if (!Number.isFinite(duckAmt) || duckAmt < 0 || duckAmt > 0.95) {
+        return `Clip '${name}' ducking amount must be between 0% and 95%.`;
+      }
+    }
+
+    if (kind === "video") {
+      const opacity = Number(clip.opacity ?? 1);
+      if (Math.abs(opacity - 1) > 0.01) {
+        return `Clip '${name}' uses ${Math.round(opacity * 100)}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
+      }
     }
 
     if (clip.fileIndex === undefined) {
@@ -498,25 +516,43 @@ function validateTimelineExportSpec(
     }
   }
 
-  const sorted = [...clips].sort(
-    (a, b) => Number(a.timelineStartSec ?? 0) - Number(b.timelineStartSec ?? 0)
-  );
-  if (Number(sorted[0].timelineStartSec ?? 0) > 0.15) {
-    return "Timeline starts with an empty gap before the first clip. Move the first clip to 00:00 before exporting.";
+  if (videoClips.length === 0) {
+    return "Timeline must include at least one video clip on track V1 before exporting MP4.";
+  }
+  if (videoClips.length > 8 || audioClips.length > 8) {
+    return "Synchronous local MP4 export supports up to 8 V1 video clips and 8 A1 audio clips.";
   }
 
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const curStart = Number(sorted[i].timelineStartSec ?? 0);
+  const sortedV1 = [...videoClips].sort(
+    (a, b) => Number(a.timelineStartSec ?? 0) - Number(b.timelineStartSec ?? 0)
+  );
+  if (Number(sortedV1[0].timelineStartSec ?? 0) > 0.15) {
+    return "Timeline starts with an empty gap before the first V1 clip. Move the first clip to 00:00 before exporting.";
+  }
+
+  for (let i = 0; i < sortedV1.length - 1; i++) {
+    const curStart = Number(sortedV1[i].timelineStartSec ?? 0);
     const curEnd = Number(
-      sorted[i].timelineEndSec ?? curStart + Number(sorted[i].durationSec ?? 0)
+      sortedV1[i].timelineEndSec ?? curStart + Number(sortedV1[i].durationSec ?? 0)
     );
-    const nextStart = Number(sorted[i + 1].timelineStartSec ?? 0);
+    const nextStart = Number(sortedV1[i + 1].timelineStartSec ?? 0);
     const gap = nextStart - curEnd;
     if (gap < -0.05) {
       return "Overlapping clips on track V1 are not supported in FFmpeg MP4 export. Arrange clips sequentially without overlap.";
     }
     if (gap > 0.15) {
       return "Empty timeline gaps between clips on track V1 are not supported in FFmpeg MP4 export. Close gaps before exporting.";
+    }
+  }
+
+  if (Array.isArray(spec.speechIntervals)) {
+    for (let i = 0; i < spec.speechIntervals.length; i++) {
+      const iv = spec.speechIntervals[i];
+      const s = Number(iv?.start);
+      const e = Number(iv?.end);
+      if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || e <= s) {
+        return `Speech ducking interval #${i + 1} has invalid start/end timestamps.`;
+      }
     }
   }
 

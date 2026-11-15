@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import type { MediaKind, Project, TimelineClip, TrackType } from "../../types/studio";
+import { computeEffectiveFadeDurations, sliceWaveformPeaksForClip } from "../../utils/audio";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 
@@ -166,6 +167,7 @@ export function MultitrackTimeline({
       tracks: project.tracks.map((t) => ({ ...t })),
       clips: initialClips.map((c) => ({
         ...c,
+        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
       })),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
@@ -226,6 +228,7 @@ export function MultitrackTimeline({
       tracks: project.tracks.map((t) => ({ ...t })),
       clips: project.clips.map((c) => ({
         ...c,
+        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
       })),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
@@ -277,6 +280,7 @@ export function MultitrackTimeline({
       tracks: project.tracks.map((t) => ({ ...t })),
       clips: project.clips.map((c) => ({
         ...c,
+        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
       })),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
@@ -686,16 +690,40 @@ export function MultitrackTimeline({
                     />
                   )}
 
+                  {track.type === "audio" && trackClips.length === 0 && (
+                    <div className="absolute inset-0 flex items-center pl-4 pointer-events-none">
+                      <span className="text-[11px] text-zinc-600">
+                        Drop MP3, WAV, or M4A audio clips onto A1
+                      </span>
+                    </div>
+                  )}
+
                   {trackClips.map((clip) => {
                     const isSelected = clip.id === selectedClipId;
                     const isDragging = clip.id === draggingClipId;
                     const leftPx = clip.startTime * zoomPxPerSec;
                     const widthPx = Math.max(28, clip.duration * zoomPxPerSec);
+                    const isClipMuted = Boolean(clip.muted || track.muted || clip.volume <= 0.001);
+                    const targetBars = Math.max(14, Math.min(140, Math.round(widthPx / 3.5)));
+                    const waveformBars = clip.waveformPeaks?.length
+                      ? sliceWaveformPeaksForClip(clip.waveformPeaks, clip, targetBars)
+                      : [];
+                    const { fadeIn, fadeOut } = computeEffectiveFadeDurations(
+                      clip.duration,
+                      clip.fadeInSec,
+                      clip.fadeOutSec
+                    );
+                    const fadeInPct = clip.duration > 0 ? Math.min(100, (fadeIn / clip.duration) * 100) : 0;
+                    const fadeOutPct = clip.duration > 0 ? Math.min(100, (fadeOut / clip.duration) * 100) : 0;
+                    const gainScale = isClipMuted ? 0.14 : Math.max(0.18, Math.min(1.65, clip.volume));
+
                     const colorClasses =
                       clip.kind === "text"
                         ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-100"
                         : clip.kind === "audio"
-                        ? "bg-blue-600/25 border-blue-500/50 text-blue-100"
+                        ? isClipMuted
+                          ? "bg-zinc-800/50 border-zinc-600/60 text-zinc-400"
+                          : "bg-blue-600/25 border-blue-500/50 text-blue-100"
                         : track.type === "overlay"
                         ? "bg-indigo-600/25 border-indigo-400/50 text-indigo-100"
                         : "bg-violet-600/25 border-violet-500/50 text-violet-100";
@@ -717,6 +745,78 @@ export function MultitrackTimeline({
                               : "hover:brightness-110"
                         }`}
                       >
+                        {/* Real Audio PCM Waveform Backdrop */}
+                        {waveformBars.length > 0 && (
+                          <div
+                            aria-hidden="true"
+                            className={`absolute inset-0 flex pointer-events-none px-0.5 ${
+                              clip.kind === "audio"
+                                ? "items-center gap-[1px]"
+                                : "items-end pb-0.5 gap-[1px] opacity-40"
+                            }`}
+                          >
+                            {waveformBars.map((amp, idx) => {
+                              const barHeightPct = Math.max(
+                                8,
+                                Math.min(92, Math.round(amp * 88 * gainScale))
+                              );
+                              return (
+                                <span
+                                  key={idx}
+                                  style={{ height: `${clip.kind === "audio" ? barHeightPct : Math.round(barHeightPct * 0.48)}%` }}
+                                  className={`flex-1 rounded-[1px] ${
+                                    clip.kind === "audio"
+                                      ? isClipMuted
+                                        ? "bg-zinc-500/45"
+                                        : "bg-sky-300/45"
+                                      : "bg-violet-200/45"
+                                  }`}
+                                />
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* Visual Fade-In / Fade-Out Envelopes */}
+                        {fadeInPct > 0.5 && (
+                          <svg
+                            viewBox="0 0 100 100"
+                            preserveAspectRatio="none"
+                            style={{ width: `${fadeInPct}%` }}
+                            className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
+                            aria-hidden="true"
+                          >
+                            <polygon points="0,0 100,0 0,100" fill="rgba(9,9,11,0.58)" />
+                            <line
+                              x1="0"
+                              y1="100"
+                              x2="100"
+                              y2="0"
+                              stroke="rgba(125,211,252,0.75)"
+                              strokeWidth="2"
+                            />
+                          </svg>
+                        )}
+                        {fadeOutPct > 0.5 && (
+                          <svg
+                            viewBox="0 0 100 100"
+                            preserveAspectRatio="none"
+                            style={{ width: `${fadeOutPct}%` }}
+                            className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
+                            aria-hidden="true"
+                          >
+                            <polygon points="0,0 100,0 100,100" fill="rgba(9,9,11,0.58)" />
+                            <line
+                              x1="0"
+                              y1="0"
+                              x2="100"
+                              y2="100"
+                              stroke="rgba(125,211,252,0.75)"
+                              strokeWidth="2"
+                            />
+                          </svg>
+                        )}
+
                         {/* Left Trim Handle */}
                         {!track.locked && (
                           <div
@@ -730,21 +830,36 @@ export function MultitrackTimeline({
                           <img
                             src={clip.thumbnailUrl}
                             alt=""
-                            className="h-7 w-10 rounded object-cover shrink-0 pointer-events-none"
+                            className="relative z-[1] h-7 w-10 rounded object-cover shrink-0 pointer-events-none"
                           />
                         )}
-                        <div className="min-w-0 flex-1 pointer-events-none">
+                        <div className="relative z-[1] min-w-0 flex-1 pointer-events-none">
                           <div className="flex items-center gap-1">
                             {clip.needsRelink && (
                               <AlertTriangle className="h-3 w-3 text-amber-400 shrink-0" />
                             )}
-                            <p className="text-[11px] font-medium truncate">
+                            {isClipMuted && (clip.kind === "audio" || clip.kind === "video") && (
+                              <VolumeX className="h-3 w-3 text-rose-300 shrink-0" />
+                            )}
+                            <p className="text-[11px] font-medium truncate drop-shadow-sm">
                               {clip.kind === "text" ? clip.textStyle?.text || clip.name : clip.name}
                             </p>
                           </div>
-                          <p className="text-[10px] font-mono opacity-75 tabular-nums">
-                            {formatTimecode(clip.duration)}
-                          </p>
+                          <div className="flex items-center gap-1.5 text-[10px] font-mono opacity-85 tabular-nums">
+                            <span>{formatTimecode(clip.duration)}</span>
+                            {(clip.kind === "audio" || clip.kind === "video") &&
+                              !isClipMuted &&
+                              Math.abs(clip.volume - 1) > 0.02 && (
+                                <span className="rounded bg-black/40 px-1 text-[9px] text-sky-200">
+                                  {Math.round(clip.volume * 100)}%
+                                </span>
+                              )}
+                            {clip.kind === "audio" && clip.duckingEnabled && widthPx > 96 && (
+                              <span className="rounded bg-amber-500/25 px-1 text-[9px] text-amber-200">
+                                Duck
+                              </span>
+                            )}
+                          </div>
                         </div>
 
                         {/* Right Trim Handle */}

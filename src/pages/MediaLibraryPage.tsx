@@ -114,7 +114,7 @@ export function MediaLibraryPage() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept="video/*,image/*,audio/*"
+        accept="video/*,image/*,audio/*,.mp3,.wav,.m4a,.mp4,.mov,.webm,.mkv"
         onChange={(e) => {
           void handleFiles(e.target.files);
           e.target.value = "";

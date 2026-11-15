@@ -356,6 +356,18 @@ export function mapServerProjectToStudioProject(dto: ServerProjectDto): Project 
     tracks: ensureProjectTracks(dto.tracks?.length ? dto.tracks : createDefaultTracks()),
     clips: (dto.clips ?? []).map((c) => ({
       ...c,
+      volume: Number.isFinite(Number(c.volume)) ? Math.min(2, Math.max(0, Number(c.volume))) : 1,
+      muted: Boolean(c.muted),
+      fadeInSec: Number.isFinite(Number(c.fadeInSec)) ? Math.max(0, Number(c.fadeInSec)) : 0,
+      fadeOutSec: Number.isFinite(Number(c.fadeOutSec)) ? Math.max(0, Number(c.fadeOutSec)) : 0,
+      ...(c.kind === "audio"
+        ? {
+            duckingEnabled: Boolean(c.duckingEnabled),
+            duckingAmount: Number.isFinite(Number(c.duckingAmount))
+              ? Math.min(0.95, Math.max(0, Number(c.duckingAmount)))
+              : 0.6,
+          }
+        : {}),
       objectUrl: "",
       needsRelink: c.kind !== "text",
     })),
@@ -378,7 +390,16 @@ function serializeClipForServer(clip: TimelineClip) {
     duration: Math.max(0.1, Number(clip.duration.toFixed(2))),
     inPoint: Math.max(0, Number(clip.inPoint.toFixed(2))),
     sourceDuration: Math.max(0, Number(clip.sourceDuration.toFixed(2))),
-    volume: Math.min(1, Math.max(0, Number(clip.volume.toFixed(3)))),
+    volume: Math.min(2, Math.max(0, Number(clip.volume.toFixed(3)))),
+    muted: Boolean(clip.muted),
+    fadeInSec: Math.min(30, Math.max(0, Number((clip.fadeInSec ?? 0).toFixed(2)))),
+    fadeOutSec: Math.min(30, Math.max(0, Number((clip.fadeOutSec ?? 0).toFixed(2)))),
+    ...(clip.kind === "audio"
+      ? {
+          duckingEnabled: Boolean(clip.duckingEnabled),
+          duckingAmount: Math.min(0.95, Math.max(0, Number((clip.duckingAmount ?? 0.6).toFixed(2)))),
+        }
+      : {}),
     speed: Math.min(4, Math.max(0.25, Number(clip.speed.toFixed(2)))),
     opacity: Math.min(1, Math.max(0, Number(clip.opacity.toFixed(3)))),
     ...(clip.sourceName ? { sourceName: clip.sourceName } : {}),

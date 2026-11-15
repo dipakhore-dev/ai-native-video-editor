@@ -20,7 +20,17 @@ ALLOWED_VIDEO_EXTENSIONS = {
     ".ogv",
 }
 
+ALLOWED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".flac",
+}
+
 ALLOWED_VIDEO_MIME_PREFIXES = ("video/",)
+ALLOWED_AUDIO_MIME_PREFIXES = ("audio/",)
 ALLOWED_EXACT_MIMES = {"application/octet-stream", "application/mp4"}
 
 
@@ -38,23 +48,44 @@ def sanitize_filename(filename: str | None) -> str:
     return cleaned[:180] or "upload.mp4"
 
 
-def validate_upload_headers(filename: str | None, content_type: str | None) -> str:
+def validate_upload_headers(
+    filename: str | None,
+    content_type: str | None,
+    *,
+    allow_audio: bool = False,
+) -> str:
     safe_name = sanitize_filename(filename)
     ext = Path(safe_name).suffix.lower()
-    if ext and ext not in ALLOWED_VIDEO_EXTENSIONS:
+    allowed_exts = (
+        ALLOWED_VIDEO_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS
+        if allow_audio
+        else ALLOWED_VIDEO_EXTENSIONS
+    )
+    if ext and ext not in allowed_exts:
         raise FileValidationError(
-            f"Unsupported video file extension '{ext}'. Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}.",
+            f"Unsupported media file extension '{ext}'. Allowed: {', '.join(sorted(allowed_exts))}.",
             status_code=400,
         )
 
     if content_type:
         mime = content_type.split(";")[0].strip().lower()
-        is_allowed = mime in ALLOWED_EXACT_MIMES or any(
-            mime.startswith(prefix) for prefix in ALLOWED_VIDEO_MIME_PREFIXES
+        allowed_prefixes = (
+            ALLOWED_VIDEO_MIME_PREFIXES + ALLOWED_AUDIO_MIME_PREFIXES
+            if allow_audio
+            else ALLOWED_VIDEO_MIME_PREFIXES
+        )
+        allowed_exact = (
+            ALLOWED_EXACT_MIMES | {"application/x-m4a"}
+            if allow_audio
+            else ALLOWED_EXACT_MIMES
+        )
+        is_allowed = mime in allowed_exact or any(
+            mime.startswith(prefix) for prefix in allowed_prefixes
         )
         if not is_allowed:
+            expected_label = "video/* or audio/*" if allow_audio else "video/*"
             raise FileValidationError(
-                f"Unsupported MIME type '{mime}'. Expected a video/* upload.",
+                f"Unsupported MIME type '{mime}'. Expected a {expected_label} upload.",
                 status_code=400,
             )
 

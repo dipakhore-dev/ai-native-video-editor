@@ -53,44 +53,56 @@ function validateTimelineForLocalMp4(
     return "Timeline is empty. Add at least one video clip to track V1 before exporting.";
   }
 
-  if (project.clips.length > 8) {
-    return "Synchronous local MP4 export supports up to 8 clips per timeline.";
+  if (project.clips.length > 16) {
+    return "Synchronous local MP4 export supports up to 16 clips (up to 8 V1 video + 8 A1 audio clips).";
   }
 
-  const mutedTrackIds = new Set(project.tracks.filter((t) => t.muted).map((t) => t.id));
+  const videoClips = [];
+  const audioClips = [];
 
   for (const clip of project.clips) {
-    if (mutedTrackIds.has(clip.trackId)) {
-      return `Track '${clip.trackId}' is muted while containing '${clip.name}'. Unmute the track or remove its clips before exporting.`;
+    if (clip.kind === "video" && clip.trackId === "track_v1") {
+      videoClips.push(clip);
+    } else if (clip.kind === "audio" && clip.trackId === "track_a1") {
+      audioClips.push(clip);
+    } else {
+      return `Clip '${clip.name}' (${clip.kind} on '${clip.trackId}') is not supported in FFmpeg MP4 export yet. Phase 2 supports V1 video clips and A1 audio clips (text overlays and V2 overlays are planned for Phase 3).`;
     }
-    if (clip.kind !== "video") {
-      return `Clip '${clip.name}' (${clip.kind}) is not supported in FFmpeg MP4 export yet. Only video clips on track V1 are supported (text overlays, images, and standalone audio clips are not burned into MP4).`;
-    }
-    if (clip.trackId !== "track_v1") {
-      return `Clip '${clip.name}' is on track '${clip.trackId}'. FFmpeg MP4 export currently supports primary video track V1 only.`;
-    }
+
     if (clip.needsRelink) {
       return `Clip '${clip.name}' is missing from local IndexedDB storage. Use "Re-link File" before exporting.`;
     }
     if (Math.abs(clip.speed - 1) > 0.01) {
       return `Clip '${clip.name}' uses ${clip.speed}x speed. Variable clip speed is not supported in FFmpeg MP4 export yet; reset speed to 1.0x.`;
     }
-    if (Math.abs(clip.volume - 1) > 0.05) {
-      return `Clip '${clip.name}' uses ${Math.round(clip.volume * 100)}% volume. Per-clip volume changes are not supported in FFmpeg MP4 export yet; set volume to 100%.`;
+    if (!Number.isFinite(clip.volume) || clip.volume < 0 || clip.volume > 2) {
+      return `Clip '${clip.name}' volume (${Math.round(clip.volume * 100)}%) must be between 0% and 200%.`;
     }
-    if (Math.abs(clip.opacity - 1) > 0.01) {
+    const fadeIn = clip.fadeInSec ?? 0;
+    const fadeOut = clip.fadeOutSec ?? 0;
+    if (fadeIn < 0 || fadeIn > 30 || fadeOut < 0 || fadeOut > 30) {
+      return `Clip '${clip.name}' fade-in/fade-out durations must be between 0s and 30s.`;
+    }
+    if (clip.kind === "video" && Math.abs(clip.opacity - 1) > 0.01) {
       return `Clip '${clip.name}' uses ${Math.round(clip.opacity * 100)}% opacity. Clip opacity changes are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
     }
   }
 
-  const sorted = [...project.clips].sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
-  if (sorted[0].startTime > 0.15) {
-    return "Timeline starts with an empty gap before the first clip. Move the first clip to 00:00 before exporting.";
+  if (videoClips.length === 0) {
+    return "Timeline must include at least one video clip on track V1 before exporting MP4.";
+  }
+  if (videoClips.length > 8 || audioClips.length > 8) {
+    return "Synchronous local MP4 export supports up to 8 V1 video clips and 8 A1 audio clips.";
   }
 
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const curEnd = sorted[i].startTime + sorted[i].duration;
-    const gap = sorted[i + 1].startTime - curEnd;
+  const sortedV1 = [...videoClips].sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+  if (sortedV1[0].startTime > 0.15) {
+    return "Timeline starts with an empty gap before the first V1 clip. Move the first clip to 00:00 before exporting.";
+  }
+
+  for (let i = 0; i < sortedV1.length - 1; i++) {
+    const curEnd = sortedV1[i].startTime + sortedV1[i].duration;
+    const gap = sortedV1[i + 1].startTime - curEnd;
     if (gap < -0.05) {
       return "Overlapping clips on track V1 are not supported in FFmpeg MP4 export. Arrange clips sequentially without overlap.";
     }
@@ -446,7 +458,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           </label>
 
           <p className="text-[11px] text-zinc-500 leading-relaxed">
-            Uploads local track V1 video clips directly to the authenticated FFmpeg processor for clip trimming, merging, and {project.aspectRatio} MP4 rendering.
+            Uploads local V1 video and A1 audio clips to the local FFmpeg processor for clip trimming, audio mixing (0–200% volume, fades, mute, speech ducking), and {project.aspectRatio} MP4 rendering.
           </p>
 
           {feedback && (

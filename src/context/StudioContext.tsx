@@ -31,6 +31,7 @@ import type {
   TextOverlayStyle,
   TimelineClip,
 } from "../types/studio";
+import { DEFAULT_DUCKING_AMOUNT, extractAudioWaveformPeaks } from "../utils/audio";
 import { extractMediaAsset } from "../utils/media";
 import {
   checkStorageQuotaForBytes,
@@ -205,6 +206,7 @@ function cloneProject(project: Project): Project {
     tracks: project.tracks.map((t) => ({ ...t })),
     clips: project.clips.map((c) => ({
       ...c,
+      waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
       textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     })),
     subtitles: project.subtitles ? project.subtitles.map((s) => ({ ...s })) : [],
@@ -393,6 +395,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
                     ...sc,
                     objectUrl: matchClip.objectUrl,
                     thumbnailUrl: matchClip.thumbnailUrl,
+                    waveformPeaks: matchClip.waveformPeaks,
                     needsRelink: false,
                   };
                 }
@@ -459,6 +462,40 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         idbHydratedRef.current = true;
         setMediaAssets(hydrated);
         setProjects((prev) => reconcileProjectsWithMediaAssets(prev, hydrated, true));
+
+        // Lazily backfill real PCM waveform peaks for legacy audio files saved before Phase 2
+        const audioNeedingPeaks = records.filter(
+          (rec) => rec.kind === "audio" && (!rec.waveformPeaks || rec.waveformPeaks.length === 0)
+        );
+        if (audioNeedingPeaks.length > 0) {
+          void (async () => {
+            const backfilledById = new Map<string, number[]>();
+            for (const rec of audioNeedingPeaks) {
+              if (cancelled) return;
+              const peaks = await extractAudioWaveformPeaks(rec.blob);
+              if (peaks && peaks.length > 0) {
+                backfilledById.set(rec.id, peaks);
+                try {
+                  await saveMediaToIndexedDB({
+                    ...rec,
+                    waveformPeaks: peaks,
+                    updatedAt: new Date().toISOString(),
+                  });
+                } catch {
+                  // Best-effort backfill only
+                }
+              }
+            }
+            if (cancelled || backfilledById.size === 0) return;
+            const nextAssets = mediaAssetsRef.current.map((asset) => {
+              const peaks = backfilledById.get(asset.id);
+              return peaks ? { ...asset, waveformPeaks: peaks } : asset;
+            });
+            mediaAssetsRef.current = nextAssets;
+            setMediaAssets(nextAssets);
+            setProjects((prev) => reconcileProjectsWithMediaAssets(prev, nextAssets, true));
+          })();
+        }
       } catch (err) {
         idbHydratedRef.current = true;
         if (!cancelled) {
@@ -514,8 +551,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         ...p,
         clips: p.clips.map((c) => ({
           ...c,
-          // Never store temporary blob URLs in persistent localStorage; store stable assetId & metadata
+          // Never store temporary blob URLs or large waveform arrays in localStorage; IndexedDB restores both
           objectUrl: "",
+          waveformPeaks: undefined,
           thumbnailUrl: c.thumbnailUrl?.startsWith("data:") ? c.thumbnailUrl : undefined,
         })),
       }));
@@ -737,6 +775,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             thumbnailDataUrl: extractedAsset.thumbnailUrl?.startsWith("data:")
               ? extractedAsset.thumbnailUrl
               : undefined,
+            waveformPeaks: extractedAsset.waveformPeaks,
             blob: file,
             addedAt: extractedAsset.addedAt,
             updatedAt: now,
@@ -777,6 +816,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
                 assetId: match.id,
                 objectUrl: match.objectUrl,
                 thumbnailUrl: match.thumbnailUrl ?? clip.thumbnailUrl,
+                waveformPeaks: match.waveformPeaks ?? clip.waveformPeaks,
                 sourceName: match.name,
                 sourceSizeBytes: match.sizeBytes,
                 sourceMimeType: match.mimeType,
@@ -830,6 +870,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           thumbnailDataUrl: extracted.thumbnailUrl?.startsWith("data:")
             ? extracted.thumbnailUrl
             : undefined,
+          waveformPeaks: extracted.waveformPeaks,
           blob: file,
           addedAt: extracted.addedAt,
           updatedAt: now,
@@ -852,6 +893,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
                 ...clip,
                 objectUrl: extracted!.objectUrl,
                 thumbnailUrl: extracted!.thumbnailUrl ?? clip.thumbnailUrl,
+                waveformPeaks: extracted!.waveformPeaks ?? clip.waveformPeaks,
                 sourceName: extracted!.name,
                 sourceSizeBytes: extracted!.sizeBytes,
                 sourceMimeType: extracted!.mimeType,
@@ -1070,13 +1112,23 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
               explicitStartTime !== undefined
                 ? Math.max(0, Number(explicitStartTime.toFixed(2)))
                 : Number(trackEnd.toFixed(2)),
-            duration: Math.max(1, Number(asset.duration.toFixed(2))),
+            duration: Math.max(0.5, Number(asset.duration.toFixed(2))),
             inPoint: 0,
             sourceDuration: asset.duration,
             volume: 1,
+            muted: false,
+            fadeInSec: 0,
+            fadeOutSec: 0,
+            ...(asset.kind === "audio"
+              ? {
+                  duckingEnabled: false,
+                  duckingAmount: DEFAULT_DUCKING_AMOUNT,
+                }
+              : {}),
             speed: 1,
             opacity: 1,
             thumbnailUrl: asset.thumbnailUrl,
+            waveformPeaks: asset.waveformPeaks,
             objectUrl: asset.objectUrl,
             sourceName: asset.name,
             sourceSizeBytes: asset.sizeBytes,

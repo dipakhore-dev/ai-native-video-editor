@@ -30,6 +30,7 @@ import { AiAssistantPanel, type EditorPanelTab } from "../components/editor/AiAs
 import { ExportModal } from "../components/editor/ExportModal";
 import { useStudio } from "../context/StudioContext";
 import type { MediaAsset, MediaKind, Project, TimelineClip } from "../types/studio";
+import { buildSpeechIntervals, computeEffectiveClipGain } from "../utils/audio";
 import { formatBytes, formatTimecode } from "../utils/media";
 import { getSubtitleStyle, hexToRgba } from "../utils/subtitles";
 
@@ -69,10 +70,14 @@ export function EditorPage() {
   const relinkInputRef = useRef<HTMLInputElement | null>(null);
   const relinkTargetAssetIdRef = useRef<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaGainMapRef = useRef<
+    WeakMap<HTMLMediaElement, { source: MediaElementAudioSourceNode; gain: GainNode }>
+  >(new WeakMap());
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
   const lastSyncedVideoClipIdRef = useRef<string | null>(null);
-  const lastSyncedAudioClipIdRef = useRef<string | null>(null);
+  const lastSyncedAudioMapRef = useRef<Map<string, boolean>>(new Map());
 
   const [playheadTime, setPlayheadTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -164,17 +169,80 @@ export function EditorPage() {
     );
   }, [activeProject, playheadTime, t1Track?.muted]);
 
-  const activeAudioClip = useMemo<TimelineClip | null>(() => {
-    if (!activeProject) return null;
-    return (
-      activeProject.clips.find(
-        (c) =>
-          c.trackId === "track_a1" &&
-          playheadTime >= c.startTime &&
-          playheadTime < c.startTime + c.duration
-      ) ?? null
+  const a1AudioClips = useMemo<TimelineClip[]>(() => {
+    if (!activeProject) return [];
+    return activeProject.clips.filter(
+      (c) =>
+        c.trackId === "track_a1" &&
+        c.kind === "audio" &&
+        !c.needsRelink &&
+        Boolean(c.objectUrl)
     );
-  }, [activeProject, playheadTime]);
+  }, [activeProject]);
+
+  const speechIntervals = useMemo(
+    () => buildSpeechIntervals(activeProject?.subtitles),
+    [activeProject?.subtitles]
+  );
+
+  const v1AudibleAtTime = Boolean(
+    activeV1Clip &&
+      activeV1Clip.kind === "video" &&
+      !v1Track?.muted &&
+      !activeV1Clip.muted &&
+      activeV1Clip.volume > 0.01
+  );
+
+  const ensureMediaGainNode = useCallback((el: HTMLMediaElement): GainNode | null => {
+    const existing = mediaGainMapRef.current.get(el);
+    if (existing) {
+      return existing.gain;
+    }
+    if (typeof window === "undefined") return null;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return null;
+
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      const source = ctx.createMediaElementSource(el);
+      const gain = ctx.createGain();
+      source.connect(gain);
+      gain.connect(ctx.destination);
+      mediaGainMapRef.current.set(el, { source, gain });
+      return gain;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const applyClipAudioGain = useCallback(
+    (el: HTMLMediaElement, effectiveGain: number, isMuted: boolean) => {
+      const gainNode = ensureMediaGainNode(el);
+      el.muted = isMuted;
+      if (gainNode && audioCtxRef.current) {
+        el.volume = 1;
+        const targetVal = isMuted ? 0 : Math.max(0, Math.min(2, effectiveGain));
+        gainNode.gain.setTargetAtTime(targetVal, audioCtxRef.current.currentTime, 0.015);
+      } else {
+        el.volume = isMuted ? 0 : Math.min(1, Math.max(0, effectiveGain));
+      }
+    },
+    [ensureMediaGainNode]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        void audioCtxRef.current.close().catch(() => undefined);
+      }
+      audioCtxRef.current = null;
+    };
+  }, []);
 
   const subtitleStyle = useMemo(() => getSubtitleStyle(activeProject), [activeProject]);
 
@@ -205,8 +273,14 @@ export function EditorPage() {
       (playheadTime - primaryVisualClip.startTime) * primaryVisualClip.speed;
 
     vid.playbackRate = playbackRate * primaryVisualClip.speed;
-    vid.muted = masterMuted || primaryTrackMuted;
-    vid.volume = Math.min(1, Math.max(0, masterVolume * primaryVisualClip.volume));
+    const { effectiveGain, isMuted } = computeEffectiveClipGain({
+      clip: primaryVisualClip,
+      timelineTimeSec: playheadTime,
+      trackMuted: primaryTrackMuted,
+      masterVolume,
+      masterMuted,
+    });
+    applyClipAudioGain(vid, effectiveGain, isMuted);
 
     const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
     if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
@@ -221,6 +295,9 @@ export function EditorPage() {
     }
 
     if (isPlaying && vid.paused) {
+      if (audioCtxRef.current?.state === "suspended") {
+        void audioCtxRef.current.resume().catch(() => {});
+      }
       void vid.play().catch(() => {});
     } else if (!isPlaying && !vid.paused) {
       vid.pause();
@@ -233,6 +310,7 @@ export function EditorPage() {
     masterMuted,
     masterVolume,
     primaryTrackMuted,
+    applyClipAudioGain,
   ]);
 
   // Playback animation loop
@@ -241,6 +319,10 @@ export function EditorPage() {
     if (totalDuration <= 0) {
       setIsPlaying(false);
       return;
+    }
+
+    if (audioCtxRef.current?.state === "suspended") {
+      void audioCtxRef.current.resume().catch(() => {});
     }
 
     let frameId = 0;
@@ -270,42 +352,79 @@ export function EditorPage() {
     syncVideoElement();
   }, [syncVideoElement]);
 
-  // Synchronize HTML5 <audio> track element
+  // Synchronize all A1 Audio track elements via Web Audio GainNodes (volume 0-200%, fades, ducking, mute)
   useEffect(() => {
-    const aud = audioRef.current;
-    if (!aud) return;
-
-    if (!activeAudioClip || activeAudioClip.needsRelink) {
-      lastSyncedAudioClipIdRef.current = null;
-      aud.pause();
-      return;
-    }
-
-    const clipChanged = lastSyncedAudioClipIdRef.current !== activeAudioClip.id;
-    const targetSourceTime =
-      activeAudioClip.inPoint + (playheadTime - activeAudioClip.startTime) * activeAudioClip.speed;
-    aud.playbackRate = playbackRate * activeAudioClip.speed;
-    aud.muted = masterMuted || Boolean(a1Track?.muted);
-    aud.volume = Math.min(1, Math.max(0, masterVolume * activeAudioClip.volume));
-
-    const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
-    if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > tolerance) {
-      try {
-        aud.currentTime = Math.max(0, targetSourceTime);
-        lastSyncedAudioClipIdRef.current = activeAudioClip.id;
-      } catch {
-        // Ignore seek before metadata loaded
+    const activeIds = new Set(a1AudioClips.map((c) => c.id));
+    for (const prevId of Array.from(lastSyncedAudioMapRef.current.keys())) {
+      if (!activeIds.has(prevId)) {
+        lastSyncedAudioMapRef.current.delete(prevId);
       }
-    } else if (aud.readyState >= 1 && clipChanged) {
-      lastSyncedAudioClipIdRef.current = activeAudioClip.id;
     }
 
-    if (isPlaying && aud.paused) {
-      void aud.play().catch(() => {});
-    } else if (!isPlaying && !aud.paused) {
-      aud.pause();
+    for (const audioClip of a1AudioClips) {
+      const aud = audioElsRef.current.get(audioClip.id);
+      if (!aud) continue;
+
+      const isActiveAtPlayhead =
+        playheadTime >= audioClip.startTime &&
+        playheadTime < audioClip.startTime + audioClip.duration;
+      const wasActive = lastSyncedAudioMapRef.current.get(audioClip.id) ?? false;
+
+      if (!isActiveAtPlayhead) {
+        lastSyncedAudioMapRef.current.set(audioClip.id, false);
+        if (!aud.paused) {
+          aud.pause();
+        }
+        applyClipAudioGain(aud, 0, true);
+        continue;
+      }
+
+      const targetSourceTime =
+        audioClip.inPoint + (playheadTime - audioClip.startTime) * audioClip.speed;
+      aud.playbackRate = playbackRate * audioClip.speed;
+
+      const { effectiveGain, isMuted } = computeEffectiveClipGain({
+        clip: audioClip,
+        timelineTimeSec: playheadTime,
+        trackMuted: Boolean(a1Track?.muted),
+        masterVolume,
+        masterMuted,
+        speechIntervals,
+        v1AudibleAtTime,
+      });
+      applyClipAudioGain(aud, effectiveGain, isMuted);
+
+      const tolerance = !wasActive || !isPlaying ? 0.04 : 0.32;
+      if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > tolerance) {
+        try {
+          aud.currentTime = Math.max(0, Math.min(aud.duration || targetSourceTime, targetSourceTime));
+        } catch {
+          // Ignore seek before metadata loaded
+        }
+      }
+      lastSyncedAudioMapRef.current.set(audioClip.id, true);
+
+      if (isPlaying && aud.paused) {
+        if (audioCtxRef.current?.state === "suspended") {
+          void audioCtxRef.current.resume().catch(() => {});
+        }
+        void aud.play().catch(() => {});
+      } else if (!isPlaying && !aud.paused) {
+        aud.pause();
+      }
     }
-  }, [activeAudioClip, playheadTime, isPlaying, playbackRate, masterMuted, masterVolume, a1Track?.muted]);
+  }, [
+    a1AudioClips,
+    playheadTime,
+    isPlaying,
+    playbackRate,
+    masterMuted,
+    masterVolume,
+    a1Track?.muted,
+    speechIntervals,
+    v1AudibleAtTime,
+    applyClipAudioGain,
+  ]);
 
   const handleSeek = useCallback(
     (time: number) => {
@@ -317,6 +436,9 @@ export function EditorPage() {
 
   const togglePlay = useCallback(() => {
     if (totalDuration <= 0) return;
+    if (audioCtxRef.current?.state === "suspended") {
+      void audioCtxRef.current.resume().catch(() => {});
+    }
     if (!isPlaying && playheadTime >= totalDuration) {
       setPlayheadTime(0);
     }
@@ -591,14 +713,14 @@ export function EditorPage() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept="video/*,image/*,audio/*"
+        accept="video/*,image/*,audio/*,.mp3,.wav,.m4a,.mp4,.mov,.webm,.mkv"
         onChange={(e) => void handleUploadInEditor(e)}
         className="hidden"
       />
       <input
         ref={relinkInputRef}
         type="file"
-        accept="video/*,image/*,audio/*"
+        accept="video/*,image/*,audio/*,.mp3,.wav,.m4a,.mp4,.mov,.webm,.mkv"
         onChange={(e) => void handleRelinkFileSelected(e)}
         className="hidden"
       />
@@ -796,7 +918,7 @@ export function EditorPage() {
                       className="rounded-lg border border-zinc-800/80 bg-[#111114] p-2 flex items-center gap-2.5 group hover:border-zinc-700 cursor-grab active:cursor-grabbing transition-colors"
                       title="Drag onto a timeline track or click + to append"
                     >
-                      <div className="h-10 w-14 rounded bg-zinc-950 overflow-hidden shrink-0 flex items-center justify-center">
+                      <div className="relative h-10 w-14 rounded bg-zinc-950 overflow-hidden shrink-0 flex items-center justify-center">
                         {asset.thumbnailUrl ? (
                           <img
                             src={asset.thumbnailUrl}
@@ -804,7 +926,26 @@ export function EditorPage() {
                             className="h-full w-full object-cover pointer-events-none"
                           />
                         ) : asset.kind === "audio" ? (
-                          <Music className="h-4 w-4 text-blue-400" />
+                          <>
+                            {asset.waveformPeaks && asset.waveformPeaks.length > 0 && (
+                              <div
+                                aria-hidden="true"
+                                className="absolute inset-x-1 inset-y-1.5 flex items-center gap-[1px] opacity-45 pointer-events-none"
+                              >
+                                {asset.waveformPeaks
+                                  .filter((_, idx) => idx % 8 === 0)
+                                  .slice(0, 16)
+                                  .map((amp, idx) => (
+                                    <span
+                                      key={idx}
+                                      style={{ height: `${Math.max(15, Math.round(amp * 90))}%` }}
+                                      className="flex-1 rounded-[1px] bg-sky-400"
+                                    />
+                                  ))}
+                              </div>
+                            )}
+                            <Music className="relative z-[1] h-4 w-4 text-blue-400" />
+                          </>
                         ) : (
                           <ImageIcon className="h-4 w-4 text-zinc-500" />
                         )}
@@ -983,12 +1124,22 @@ export function EditorPage() {
                     </div>
                   )}
 
-                  {/* Hidden synchronized audio element for A1 Audio track */}
-                  <audio
-                    ref={audioRef}
-                    src={activeAudioClip && !activeAudioClip.needsRelink ? activeAudioClip.objectUrl : undefined}
-                    className="hidden"
-                  />
+                  {/* Synchronized Web Audio elements for A1 Audio track clips */}
+                  {a1AudioClips.map((audioClip) => (
+                    <audio
+                      key={audioClip.id}
+                      ref={(el) => {
+                        if (el) {
+                          audioElsRef.current.set(audioClip.id, el);
+                        } else {
+                          audioElsRef.current.delete(audioClip.id);
+                        }
+                      }}
+                      src={audioClip.objectUrl}
+                      preload="auto"
+                      className="hidden"
+                    />
+                  ))}
 
                   <div className="absolute top-3 left-3 rounded bg-black/70 px-2 py-1 text-[11px] font-mono text-zinc-300 tabular-nums pointer-events-none">
                     {activeProject.resolution} · {activeProject.fps}fps

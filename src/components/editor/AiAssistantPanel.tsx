@@ -12,11 +12,19 @@ import {
   X,
   Code2,
   Captions,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import { requestAiAssistant } from "../../services/api";
 import type { Project, TimelineClip } from "../../types/studio";
 import { describeAiOperation, type AiEditPlan } from "../../utils/aiOperations";
+import {
+  buildSpeechIntervals,
+  clampDuckingAmount,
+  clampFadeSeconds,
+  clampVolume,
+} from "../../utils/audio";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import { SubtitlesPanel } from "./SubtitlesPanel";
@@ -467,24 +475,187 @@ export function AiAssistantPanel({
               )}
 
               {(selectedClip.kind === "video" || selectedClip.kind === "audio") && (
-                <div>
-                  <div className="flex items-center justify-between text-[11px] mb-1">
-                    <span className="text-zinc-400">Clip Volume</span>
-                    <span className="font-mono text-zinc-200 tabular-nums">
-                      {Math.round(selectedClip.volume * 100)}%
-                    </span>
+                <div className="space-y-3.5 pt-2 border-t border-zinc-800/80">
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] mb-1.5">
+                      <span className="text-zinc-300 font-medium">
+                        {selectedClip.kind === "video" ? "Video Audio Volume" : "Clip Volume"}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono text-zinc-200 tabular-nums">
+                          {selectedClip.muted ? "Muted" : `${Math.round(selectedClip.volume * 100)}%`}
+                        </span>
+                        {Math.abs(selectedClip.volume - 1) > 0.02 && !selectedClip.muted && (
+                          <button
+                            type="button"
+                            onClick={() => updateClip(selectedClip.id, { volume: 1 })}
+                            className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[10px] font-mono text-zinc-400 hover:text-white"
+                            title="Reset volume to 100%"
+                          >
+                            100%
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateClip(selectedClip.id, { muted: !selectedClip.muted })
+                          }
+                          className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                            selectedClip.muted
+                              ? "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                              : "border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white"
+                          }`}
+                          title={selectedClip.muted ? "Unmute clip audio" : "Mute clip audio"}
+                        >
+                          {selectedClip.muted ? (
+                            <VolumeX className="h-3 w-3" />
+                          ) : (
+                            <Volume2 className="h-3 w-3" />
+                          )}
+                          <span>{selectedClip.muted ? "Unmute" : "Mute"}</span>
+                        </button>
+                      </div>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={selectedClip.volume}
+                      onChange={(e) =>
+                        updateClip(selectedClip.id, {
+                          volume: clampVolume(Number(e.target.value)),
+                          ...(selectedClip.muted && Number(e.target.value) > 0 ? { muted: false } : {}),
+                        })
+                      }
+                      className="w-full accent-violet-500"
+                      aria-label="Clip volume"
+                    />
+                    <div className="flex justify-between text-[10px] font-mono text-zinc-500 mt-0.5">
+                      <span>0%</span>
+                      <span>100%</span>
+                      <span>200%</span>
+                    </div>
                   </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={selectedClip.volume}
-                    onChange={(e) =>
-                      updateClip(selectedClip.id, { volume: Number(e.target.value) })
-                    }
-                    className="w-full accent-violet-500"
-                  />
+
+                  {/* Fade In / Fade Out */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <div className="flex items-center justify-between text-[11px] mb-1">
+                        <span className="text-zinc-400">Fade In (s)</span>
+                        <span className="font-mono text-zinc-300 tabular-nums">
+                          {(selectedClip.fadeInSec ?? 0).toFixed(1)}s
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={Math.min(10, Number(selectedClip.duration.toFixed(1)))}
+                        step={0.1}
+                        value={Math.min(selectedClip.duration, selectedClip.fadeInSec ?? 0)}
+                        onChange={(e) =>
+                          updateClip(selectedClip.id, {
+                            fadeInSec: clampFadeSeconds(
+                              Number(e.target.value),
+                              selectedClip.duration
+                            ),
+                          })
+                        }
+                        className="w-full accent-sky-400"
+                        aria-label="Fade in duration"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between text-[11px] mb-1">
+                        <span className="text-zinc-400">Fade Out (s)</span>
+                        <span className="font-mono text-zinc-300 tabular-nums">
+                          {(selectedClip.fadeOutSec ?? 0).toFixed(1)}s
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={Math.min(10, Number(selectedClip.duration.toFixed(1)))}
+                        step={0.1}
+                        value={Math.min(selectedClip.duration, selectedClip.fadeOutSec ?? 0)}
+                        onChange={(e) =>
+                          updateClip(selectedClip.id, {
+                            fadeOutSec: clampFadeSeconds(
+                              Number(e.target.value),
+                              selectedClip.duration
+                            ),
+                          })
+                        }
+                        className="w-full accent-sky-400"
+                        aria-label="Fade out duration"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Optional Speech-Aware Audio Ducking (A1 Audio Clips) */}
+                  {selectedClip.kind === "audio" && (
+                    <div className="rounded-lg border border-zinc-800/80 bg-[#09090B] p-2.5 space-y-2.5">
+                      <label className="flex items-center justify-between gap-2 cursor-pointer">
+                        <div>
+                          <p className="text-xs font-medium text-zinc-200">
+                            Speech-Aware Ducking
+                          </p>
+                          <p className="text-[10px] text-zinc-500">
+                            Automatically lower music when dialogue plays
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selectedClip.duckingEnabled)}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              duckingEnabled: e.target.checked,
+                              ...(selectedClip.duckingAmount === undefined
+                                ? { duckingAmount: 0.6 }
+                                : {}),
+                            })
+                          }
+                          className="accent-amber-400 h-4 w-4 rounded"
+                        />
+                      </label>
+
+                      {selectedClip.duckingEnabled && (
+                        <>
+                          <div>
+                            <div className="flex items-center justify-between text-[11px] mb-1">
+                              <span className="text-zinc-400">Ducking Reduction</span>
+                              <span className="font-mono text-amber-300 tabular-nums">
+                                -{Math.round(clampDuckingAmount(selectedClip.duckingAmount) * 100)}%
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0.1}
+                              max={0.9}
+                              step={0.05}
+                              value={clampDuckingAmount(selectedClip.duckingAmount)}
+                              onChange={(e) =>
+                                updateClip(selectedClip.id, {
+                                  duckingAmount: clampDuckingAmount(Number(e.target.value)),
+                                })
+                              }
+                              className="w-full accent-amber-400"
+                              aria-label="Ducking reduction amount"
+                            />
+                          </div>
+                          <p className="text-[10px] text-zinc-400 leading-snug">
+                            {(() => {
+                              const ivCount = buildSpeechIntervals(project.subtitles).length;
+                              if (ivCount > 0) {
+                                return `Synced to ${ivCount} subtitle speech ${ivCount === 1 ? "window" : "windows"} during preview & MP4 export.`;
+                              }
+                              return "No subtitle cues yet: ducks automatically against V1 dialogue audio (sidechain compression in MP4 export).";
+                            })()}
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

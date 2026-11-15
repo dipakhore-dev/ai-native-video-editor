@@ -30,6 +30,11 @@ export interface ITimelineClipSubdoc {
   inPoint: number;
   sourceDuration: number;
   volume: number;
+  muted?: boolean;
+  fadeInSec?: number;
+  fadeOutSec?: number;
+  duckingEnabled?: boolean;
+  duckingAmount?: number;
   speed: number;
   opacity: number;
   sourceName?: string;
@@ -113,7 +118,12 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
     duration: { type: Number, required: true, min: 0.1 },
     inPoint: { type: Number, default: 0, min: 0 },
     sourceDuration: { type: Number, required: true, min: 0 },
-    volume: { type: Number, default: 1, min: 0, max: 1 },
+    volume: { type: Number, default: 1, min: 0, max: 2 },
+    muted: { type: Boolean, default: false },
+    fadeInSec: { type: Number, default: 0, min: 0, max: 30 },
+    fadeOutSec: { type: Number, default: 0, min: 0, max: 30 },
+    duckingEnabled: { type: Boolean, default: false },
+    duckingAmount: { type: Number, default: 0.6, min: 0, max: 0.95 },
     speed: { type: Number, default: 1, min: 0.25, max: 4 },
     opacity: { type: Number, default: 1, min: 0, max: 1 },
     sourceName: { type: String },

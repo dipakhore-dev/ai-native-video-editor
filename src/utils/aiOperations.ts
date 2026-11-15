@@ -63,7 +63,7 @@ export const SetClipSpeedOpSchema = z.object({
 export const SetClipVolumeOpSchema = z.object({
   type: z.literal("set_clip_volume"),
   clipId: z.string().optional(),
-  volume: z.number().min(0).max(1),
+  volume: z.number().min(0).max(2),
   reason: z.string().min(1),
 });
 

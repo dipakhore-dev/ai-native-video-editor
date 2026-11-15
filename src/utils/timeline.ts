@@ -6,6 +6,12 @@ import type {
   TimelineClip,
   TimelineTrack,
 } from "../types/studio";
+import {
+  buildSpeechIntervals,
+  clampDuckingAmount,
+  clampFadeSeconds,
+  clampVolume,
+} from "./audio";
 
 export function createDefaultTracks(): TimelineTrack[] {
   return [
@@ -52,6 +58,8 @@ export function splitClipAtTimestamp(
   const leftClip: TimelineClip = {
     ...target,
     duration: leftDuration,
+    fadeInSec: clampFadeSeconds(target.fadeInSec, leftDuration),
+    fadeOutSec: 0,
   };
 
   const rightClip: TimelineClip = {
@@ -60,6 +68,8 @@ export function splitClipAtTimestamp(
     startTime: Number((target.startTime + leftDuration).toFixed(2)),
     duration: rightDuration,
     inPoint: rightInPoint,
+    fadeInSec: 0,
+    fadeOutSec: clampFadeSeconds(target.fadeOutSec, rightDuration),
     textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
@@ -352,10 +362,17 @@ export function trimClipStart(
       ? 0
       : Math.max(0, Number((clip.inPoint + delta * clip.speed).toFixed(2)));
 
+  const resolvedDuration = Math.max(0.5, nextDuration);
   return {
     startTime: clampedStart,
-    duration: Math.max(0.5, nextDuration),
+    duration: resolvedDuration,
     inPoint: nextInPoint,
+    ...(clip.fadeInSec !== undefined
+      ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, resolvedDuration) }
+      : {}),
+    ...(clip.fadeOutSec !== undefined
+      ? { fadeOutSec: clampFadeSeconds(clip.fadeOutSec, resolvedDuration) }
+      : {}),
   };
 }
 
@@ -378,10 +395,16 @@ export function trimClipEnd(
     : Number.POSITIVE_INFINITY;
 
   const maxDur = Math.min(sourceMaxDur, neighborMaxDur);
-  const clamped = Math.min(maxDur, Math.max(0.5, Number(desiredDuration.toFixed(2))));
+  const clamped = Number(Math.min(maxDur, Math.max(0.5, Number(desiredDuration.toFixed(2)))).toFixed(2));
 
   return {
-    duration: Number(clamped.toFixed(2)),
+    duration: clamped,
+    ...(clip.fadeInSec !== undefined
+      ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, clamped) }
+      : {}),
+    ...(clip.fadeOutSec !== undefined
+      ? { fadeOutSec: clampFadeSeconds(clip.fadeOutSec, clamped) }
+      : {}),
   };
 }
 
@@ -421,6 +444,7 @@ export function buildStructuredTimelineSpec(
     : project.fps) as 24 | 30 | 60;
 
   const sortedClips = [...project.clips].sort((a, b) => a.startTime - b.startTime);
+  const speechIntervals = buildSpeechIntervals(project.subtitles);
 
   return {
     schemaVersion: "1.0",
@@ -436,23 +460,36 @@ export function buildStructuredTimelineSpec(
       durationSeconds: Number(getSequenceDuration(project).toFixed(2)),
     },
     tracks: project.tracks.map((t) => ({ ...t })),
-    clips: sortedClips.map((c) => ({
-      id: c.id,
-      trackId: c.trackId,
-      kind: c.kind,
-      sourceName: c.sourceName || c.name,
-      sourceMimeType:
-        c.sourceMimeType ||
-        (c.kind === "text" ? "application/x-text-overlay" : "application/octet-stream"),
-      timelineStartSec: Number(c.startTime.toFixed(2)),
-      timelineEndSec: Number((c.startTime + c.duration).toFixed(2)),
-      durationSec: Number(c.duration.toFixed(2)),
-      sourceInSec: Number(c.inPoint.toFixed(2)),
-      sourceOutSec: Number((c.inPoint + c.duration * c.speed).toFixed(2)),
-      speed: c.speed,
-      volume: c.volume,
-      opacity: c.opacity,
-      ...(c.textStyle ? { textStyle: { ...c.textStyle } } : {}),
-    })),
+    clips: sortedClips.map((c) => {
+      const dur = Number(c.duration.toFixed(2));
+      return {
+        id: c.id,
+        trackId: c.trackId,
+        kind: c.kind,
+        sourceName: c.sourceName || c.name,
+        sourceMimeType:
+          c.sourceMimeType ||
+          (c.kind === "text" ? "application/x-text-overlay" : "application/octet-stream"),
+        timelineStartSec: Number(c.startTime.toFixed(2)),
+        timelineEndSec: Number((c.startTime + c.duration).toFixed(2)),
+        durationSec: dur,
+        sourceInSec: Number(c.inPoint.toFixed(2)),
+        sourceOutSec: Number((c.inPoint + c.duration * c.speed).toFixed(2)),
+        speed: c.speed,
+        volume: clampVolume(c.volume, 1),
+        muted: Boolean(c.muted),
+        fadeInSec: clampFadeSeconds(c.fadeInSec, dur),
+        fadeOutSec: clampFadeSeconds(c.fadeOutSec, dur),
+        ...(c.kind === "audio"
+          ? {
+              duckingEnabled: Boolean(c.duckingEnabled),
+              duckingAmount: clampDuckingAmount(c.duckingAmount),
+            }
+          : {}),
+        opacity: c.opacity,
+        ...(c.textStyle ? { textStyle: { ...c.textStyle } } : {}),
+      };
+    }),
+    ...(speechIntervals.length > 0 ? { speechIntervals } : {}),
   };
 }

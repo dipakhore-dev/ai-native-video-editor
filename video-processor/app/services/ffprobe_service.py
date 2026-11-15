@@ -226,3 +226,91 @@ def extract_video_metadata(
         "audio": audio_info,
         "stream_count": len(streams),
     }
+
+
+def extract_audio_metadata(
+    file_path: Path,
+    *,
+    original_filename: Optional[str] = None,
+    ffprobe_bin: str = "ffprobe",
+    timeout_sec: int = 30,
+) -> dict[str, Any]:
+    if not file_path.exists() or not file_path.is_file():
+        raise VideoMetadataError("Audio file does not exist for metadata inspection.", status_code=400)
+
+    if file_path.stat().st_size == 0:
+        raise VideoMetadataError("Audio file is empty (0 bytes).", status_code=400)
+
+    resolved_ffprobe = check_binary(ffprobe_bin)
+    if not resolved_ffprobe:
+        raise VideoMetadataError(
+            f"ffprobe binary '{ffprobe_bin}' is not installed or not on PATH.",
+            status_code=503,
+        )
+
+    cmd = [
+        resolved_ffprobe,
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(file_path),
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VideoMetadataError(
+            f"ffprobe timed out after {timeout_sec}s while inspecting audio.",
+            status_code=504,
+        ) from exc
+    except OSError as exc:
+        raise VideoMetadataError(f"Failed to execute ffprobe: {exc}", status_code=500) from exc
+
+    if proc.returncode != 0:
+        err_detail = (proc.stderr or "").strip()
+        raise VideoMetadataError(
+            f"Audio file is not valid or readable{': ' + err_detail if err_detail else '.'}",
+            status_code=422,
+        )
+
+    try:
+        probe_data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise VideoMetadataError("ffprobe returned malformed JSON metadata.", status_code=502) from exc
+
+    streams = probe_data.get("streams") or []
+    fmt = probe_data.get("format") or {}
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if not audio_stream:
+        raise VideoMetadataError("Uploaded audio file does not contain an audio stream.", status_code=422)
+
+    duration = _parse_optional_float(
+        fmt.get("duration") if fmt.get("duration") is not None else audio_stream.get("duration"),
+        default=0.0,
+    )
+    size_bytes = _parse_optional_int(fmt.get("size")) or file_path.stat().st_size
+
+    return {
+        "filename": original_filename or file_path.name,
+        "format_name": str(fmt.get("format_name") or "unknown"),
+        "duration_seconds": round(duration, 3),
+        "size_bytes": size_bytes,
+        "has_video": False,
+        "has_audio": True,
+        "audio": {
+            "index": int(audio_stream.get("index", 0)),
+            "codec_name": str(audio_stream.get("codec_name") or "unknown"),
+            "sample_rate": _parse_optional_int(audio_stream.get("sample_rate")),
+            "channels": _parse_optional_int(audio_stream.get("channels")),
+        },
+        "stream_count": len(streams),
+    }

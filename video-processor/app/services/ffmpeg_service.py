@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Literal, Sequence
 
-from .ffprobe_service import check_binary, extract_video_metadata
+from .ffprobe_service import check_binary, extract_audio_metadata, extract_video_metadata
 
 
 AspectRatioTarget = Literal["16:9", "9:16", "1:1"]
@@ -68,6 +68,22 @@ def _assert_short_video_limit(
     if duration > max_duration_sec:
         raise VideoProcessingError(
             f"Video duration ({duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+            status_code=400,
+        )
+    return meta
+
+
+def _assert_short_audio_limit(
+    file_path: Path,
+    *,
+    ffprobe_bin: str,
+    max_duration_sec: float,
+) -> dict:
+    meta = extract_audio_metadata(file_path, ffprobe_bin=ffprobe_bin)
+    duration = float(meta["duration_seconds"])
+    if duration > max_duration_sec:
+        raise VideoProcessingError(
+            f"Audio duration ({duration:.1f}s) exceeds synchronous short-media limit ({max_duration_sec:.0f}s).",
             status_code=400,
         )
     return meta
@@ -412,6 +428,170 @@ def _resolve_export_dimensions(
     return (1920, 1080) if resolution == "1080p" else (1280, 720)
 
 
+def _resolve_effective_fades(
+    duration_sec: float,
+    fade_in_sec: float,
+    fade_out_sec: float,
+) -> tuple[float, float]:
+    dur = max(0.0, float(duration_sec))
+    if dur <= 0.02:
+        return (0.0, 0.0)
+    f_in = max(0.0, float(fade_in_sec or 0.0))
+    f_out = max(0.0, float(fade_out_sec or 0.0))
+    total = f_in + f_out
+    if total > dur and total > 0:
+        scale = dur / total
+        f_in = round(f_in * scale, 3)
+        f_out = round(f_out * scale, 3)
+    return (f_in, f_out)
+
+
+def _merge_speech_intervals(
+    raw_intervals: Sequence[dict] | None,
+    subtitles: Sequence[dict] | None,
+    padding_sec: float = 0.15,
+) -> list[tuple[float, float]]:
+    pairs: list[tuple[float, float]] = []
+    if isinstance(raw_intervals, (list, tuple)) and len(raw_intervals) > 0:
+        for iv in raw_intervals:
+            if not isinstance(iv, dict):
+                continue
+            try:
+                s = max(0.0, float(iv.get("start", 0.0)))
+                e = float(iv.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if e > s:
+                pairs.append((round(s, 3), round(e, 3)))
+    elif isinstance(subtitles, (list, tuple)):
+        for cue in subtitles:
+            if not isinstance(cue, dict) or not str(cue.get("text", "")).strip():
+                continue
+            try:
+                s = max(0.0, float(cue.get("start", 0.0)) - padding_sec)
+                e = float(cue.get("end", 0.0)) + padding_sec
+            except (TypeError, ValueError):
+                continue
+            if e > s:
+                pairs.append((round(s, 3), round(e, 3)))
+
+    if not pairs:
+        return []
+
+    pairs.sort(key=lambda item: (item[0], item[1]))
+    merged: list[tuple[float, float]] = [pairs[0]]
+    for s, e in pairs[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e + 0.05:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _build_interval_ducking_expr(
+    intervals: Sequence[tuple[float, float]],
+    duck_amount: float,
+) -> str:
+    floor_gain = max(0.05, round(1.0 - max(0.0, min(0.95, float(duck_amount))), 4))
+    terms = [f"between(t\\,{s:.3f}\\,{e:.3f})" for s, e in intervals[:48]]
+    active_expr = f"min(1\\,{'+'.join(terms)})"
+    return f"1-{(1.0 - floor_gain):.4f}*{active_expr}"
+
+
+def _build_audio_clip_chain(
+    input_label: str,
+    *,
+    src_in: float,
+    src_out: float,
+    volume: float,
+    fade_in: float,
+    fade_out: float,
+) -> str:
+    seg_dur = max(0.05, src_out - src_in)
+    eff_in, eff_out = _resolve_effective_fades(seg_dur, fade_in, fade_out)
+    filters = [
+        f"atrim=start={src_in:.3f}:end={src_out:.3f}",
+        "asetpts=PTS-STARTPTS",
+        "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+        f"volume={max(0.0, min(2.0, volume)):.4f}",
+    ]
+    if eff_in > 0.01:
+        filters.append(f"afade=t=in:st=0:d={eff_in:.3f}:curve=tri")
+    if eff_out > 0.01:
+        fade_out_start = max(0.0, seg_dur - eff_out)
+        filters.append(f"afade=t=out:st={fade_out_start:.3f}:d={eff_out:.3f}:curve=tri")
+    return f"[{input_label}]{','.join(filters)}"
+
+
+def _render_v1_visual_mp4(
+    segments: Sequence[Path],
+    output_path: Path,
+    *,
+    resolution: ResolutionTarget,
+    fps: int,
+    aspect_ratio: AspectRatioTarget | None,
+    ffmpeg_bin: str,
+    ffprobe_bin: str,
+    timeout_sec: int,
+) -> dict:
+    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
+    target_w, target_h = _resolve_export_dimensions(resolution, aspect_ratio)
+    safe_fps = fps if fps in (24, 30, 60) else 30
+
+    if len(segments) == 1 and aspect_ratio is None:
+        meta = extract_video_metadata(segments[0], ffprobe_bin=ffprobe_bin)
+        max_h = 1080 if resolution == "1080p" else 720
+        src_w = int(meta["video"]["width"])
+        src_h = int(meta["video"]["height"])
+        scale_factor = min(1.0, max_h / src_h) if src_h > max_h else 1.0
+        target_w = max(2, int(round(src_w * scale_factor / 2) * 2))
+        target_h = max(2, int(round(src_h * scale_factor / 2) * 2))
+
+    cmd = [ffmpeg_path, "-y"]
+    filter_parts: list[str] = []
+    concat_inputs: list[str] = []
+
+    for idx, seg_path in enumerate(segments):
+        cmd.extend(["-i", str(seg_path)])
+        if len(segments) == 1:
+            filter_parts.append(
+                f"[{idx}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+                f"crop={target_w}:{target_h},setsar=1,fps={safe_fps},format=yuv420p[outv]"
+            )
+        else:
+            filter_parts.append(
+                f"[{idx}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={safe_fps},format=yuv420p[v{idx}]"
+            )
+            concat_inputs.append(f"[v{idx}]")
+
+    if len(segments) > 1:
+        filter_parts.append(f"{''.join(concat_inputs)}concat=n={len(segments)}:v=1:a=0[outv]")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd.extend([
+        "-filter_complex",
+        ";".join(filter_parts),
+        "-map",
+        "[outv]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+    _run_ffmpeg(cmd, timeout_sec)
+    return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
+
+
 def export_timeline_mp4(
     uploaded_files: Sequence[Path],
     output_path: Path,
@@ -441,6 +621,7 @@ def export_timeline_mp4(
             max_duration_sec=max_duration_sec,
         )
 
+    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     project_meta = timeline_spec.get("project") if isinstance(timeline_spec.get("project"), dict) else {}
     fmt = str(timeline_spec.get("format") or project_meta.get("format") or "mp4").lower()
     if fmt != "mp4":
@@ -495,11 +676,14 @@ def export_timeline_mp4(
     clips = timeline_spec.get("clips")
     if not isinstance(clips, list) or len(clips) == 0:
         raise VideoProcessingError("Timeline contains no clips to export.", status_code=400)
-    if len(clips) > 8:
+    if len(clips) > 16:
         raise VideoProcessingError(
-            "Synchronous local MP4 export supports up to 8 timeline clips.",
+            "Synchronous local MP4 export supports up to 16 clips (up to 8 video + 8 audio).",
             status_code=400,
         )
+
+    video_clips: list[dict] = []
+    audio_clips: list[dict] = []
 
     for clip in clips:
         if not isinstance(clip, dict):
@@ -508,19 +692,13 @@ def export_timeline_mp4(
         track_id = str(clip.get("trackId") or "")
         kind = str(clip.get("kind") or "")
 
-        if track_id in muted_tracks:
+        if kind == "video" and track_id == "track_v1":
+            video_clips.append(clip)
+        elif kind == "audio" and track_id == "track_a1":
+            audio_clips.append(clip)
+        else:
             raise VideoProcessingError(
-                f"Track '{track_id}' is muted but contains '{name}'. Unmute the track or remove its clips before exporting.",
-                status_code=400,
-            )
-        if kind != "video":
-            raise VideoProcessingError(
-                f"Timeline clip '{name}' (type '{kind}') is not supported in FFmpeg MP4 export yet. Only video clips on track V1 are supported (text overlays, images, and standalone audio tracks are not burned into MP4).",
-                status_code=400,
-            )
-        if track_id != "track_v1":
-            raise VideoProcessingError(
-                f"Clip '{name}' is on track '{track_id}'. FFmpeg MP4 export currently supports primary video track V1 ('track_v1') only.",
+                f"Timeline clip '{name}' (type '{kind}' on '{track_id}') is not supported in FFmpeg MP4 export yet. Only V1 video clips and A1 audio clips are supported.",
                 status_code=400,
             )
 
@@ -532,34 +710,65 @@ def export_timeline_mp4(
             )
 
         volume = float(clip.get("volume", 1.0))
-        if abs(volume - 1.0) > 0.05:
+        if volume < 0.0 or volume > 2.0:
             raise VideoProcessingError(
-                f"Clip '{name}' uses {int(round(volume * 100))}% volume. Per-clip volume mixing is not supported in FFmpeg MP4 export yet; set volume to 100%.",
+                f"Clip '{name}' volume ({int(round(volume * 100))}%) must be between 0% and 200%.",
                 status_code=400,
             )
 
-        opacity = float(clip.get("opacity", 1.0))
-        if abs(opacity - 1.0) > 0.01:
+        fade_in = float(clip.get("fadeInSec", 0.0) or 0.0)
+        fade_out = float(clip.get("fadeOutSec", 0.0) or 0.0)
+        if fade_in < 0.0 or fade_in > 30.0 or fade_out < 0.0 or fade_out > 30.0:
             raise VideoProcessingError(
-                f"Clip '{name}' uses {int(round(opacity * 100))}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.",
+                f"Clip '{name}' fade durations must be between 0s and 30s.",
                 status_code=400,
             )
 
-    sorted_clips = sorted(
-        clips,
-        key=lambda c: (float(c.get("timelineStartSec", 0.0)), str(c.get("id", ""))),
-    )
+        duck_amt = clip.get("duckingAmount")
+        if duck_amt is not None and (float(duck_amt) < 0.0 or float(duck_amt) > 0.95):
+            raise VideoProcessingError(
+                f"Clip '{name}' ducking amount must be between 0% and 95%.",
+                status_code=400,
+            )
 
-    first_start = float(sorted_clips[0].get("timelineStartSec", 0.0))
-    if first_start > 0.15:
+        if kind == "video":
+            opacity = float(clip.get("opacity", 1.0))
+            if abs(opacity - 1.0) > 0.01:
+                raise VideoProcessingError(
+                    f"Clip '{name}' uses {int(round(opacity * 100))}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.",
+                    status_code=400,
+                )
+
+    if len(video_clips) == 0:
         raise VideoProcessingError(
-            "Timeline starts with an empty gap before the first clip. Move the first clip to 00:00 before exporting.",
+            "Timeline must contain at least one video clip on track V1 to export MP4.",
+            status_code=400,
+        )
+    if len(video_clips) > 8 or len(audio_clips) > 8:
+        raise VideoProcessingError(
+            "Synchronous local MP4 export supports up to 8 V1 video clips and 8 A1 audio clips.",
             status_code=400,
         )
 
-    for idx in range(len(sorted_clips) - 1):
-        cur = sorted_clips[idx]
-        nxt = sorted_clips[idx + 1]
+    sorted_v1 = sorted(
+        video_clips,
+        key=lambda c: (float(c.get("timelineStartSec", 0.0)), str(c.get("id", ""))),
+    )
+    sorted_a1 = sorted(
+        audio_clips,
+        key=lambda c: (float(c.get("timelineStartSec", 0.0)), str(c.get("id", ""))),
+    )
+
+    first_start = float(sorted_v1[0].get("timelineStartSec", 0.0))
+    if first_start > 0.15:
+        raise VideoProcessingError(
+            "Timeline starts with an empty gap before the first V1 clip. Move the first clip to 00:00 before exporting.",
+            status_code=400,
+        )
+
+    for idx in range(len(sorted_v1) - 1):
+        cur = sorted_v1[idx]
+        nxt = sorted_v1[idx + 1]
         cur_start = float(cur.get("timelineStartSec", 0.0))
         cur_end = float(cur.get("timelineEndSec", cur_start + float(cur.get("durationSec", 0.0))))
         nxt_start = float(nxt.get("timelineStartSec", 0.0))
@@ -575,59 +784,52 @@ def export_timeline_mp4(
                 status_code=400,
             )
 
-    file_indices: list[int] = []
-    for clip in sorted_clips:
+    def _resolve_file_index(clip: dict) -> int:
         raw_idx = clip.get("fileIndex")
         if raw_idx is None:
             if len(uploaded_files) == 1:
-                file_idx = 0
-            else:
-                raise VideoProcessingError(
-                    "Each clip in timelineSpec must specify 'fileIndex' when uploading multiple video files.",
-                    status_code=400,
-                )
-        else:
-            try:
-                file_idx = int(raw_idx)
-            except (TypeError, ValueError) as exc:
-                raise VideoProcessingError("Invalid fileIndex in timelineSpec clip.", status_code=400) from exc
-        if file_idx < 0 or file_idx >= len(uploaded_files):
+                return 0
             raise VideoProcessingError(
-                f"Clip references missing uploaded video file index {file_idx}.",
+                "Each clip in timelineSpec must specify 'fileIndex' when uploading multiple media files.",
                 status_code=400,
             )
-        file_indices.append(file_idx)
+        try:
+            f_idx = int(raw_idx)
+        except (TypeError, ValueError) as exc:
+            raise VideoProcessingError("Invalid fileIndex in timelineSpec clip.", status_code=400) from exc
+        if f_idx < 0 or f_idx >= len(uploaded_files):
+            raise VideoProcessingError(
+                f"Clip references missing uploaded media file index {f_idx}.",
+                status_code=400,
+            )
+        return f_idx
 
-    source_metas: dict[int, dict] = {}
-    for file_idx in set(file_indices):
-        source_metas[file_idx] = _assert_short_video_limit(
-            uploaded_files[file_idx],
+    v1_file_indices = [_resolve_file_index(c) for c in sorted_v1]
+    a1_file_indices = [_resolve_file_index(c) for c in sorted_a1]
+
+    v1_source_metas: dict[int, dict] = {}
+    for f_idx in set(v1_file_indices):
+        v1_source_metas[f_idx] = _assert_short_video_limit(
+            uploaded_files[f_idx],
             ffprobe_bin=ffprobe_bin,
             max_duration_sec=max_duration_sec,
         )
 
-    total_export_duration = sum(
-        max(0.0, float(c.get("sourceOutSec", 0.0)) - float(c.get("sourceInSec", 0.0)))
-        if "sourceOutSec" in c
-        else float(c.get("durationSec", 0.0))
-        for c in sorted_clips
-    )
-    if total_export_duration > max_duration_sec:
-        raise VideoProcessingError(
-            f"Combined timeline duration ({total_export_duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
-            status_code=400,
+    a1_source_metas: dict[int, dict] = {}
+    for f_idx in set(a1_file_indices):
+        a1_source_metas[f_idx] = _assert_short_audio_limit(
+            uploaded_files[f_idx],
+            ffprobe_bin=ffprobe_bin,
+            max_duration_sec=max_duration_sec,
         )
 
-    work_dir = output_path.parent / "_timeline_work"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    segments: list[Path] = []
-
-    for idx, clip in enumerate(sorted_clips):
-        file_idx = file_indices[idx]
-        src_path = uploaded_files[file_idx]
-        src_meta = source_metas[file_idx]
+    v1_prepared_clips: list[dict] = []
+    total_v1_duration = 0.0
+    for idx, clip in enumerate(sorted_v1):
+        f_idx = v1_file_indices[idx]
+        src_path = uploaded_files[f_idx]
+        src_meta = v1_source_metas[f_idx]
         src_duration = float(src_meta["duration_seconds"])
-
         src_in = float(clip.get("sourceInSec", 0.0))
         default_out = (
             src_in + float(clip["durationSec"])
@@ -635,7 +837,6 @@ def export_timeline_mp4(
             else src_duration
         )
         src_out = float(clip.get("sourceOutSec", default_out))
-
         if src_in < 0 or src_out <= src_in:
             raise VideoProcessingError(
                 f"Invalid trim range ({src_in:.2f}s to {src_out:.2f}s) on clip '{clip.get('sourceName') or idx}'.",
@@ -646,14 +847,43 @@ def export_timeline_mp4(
                 f"Clip start offset ({src_in:.2f}s) exceeds source video duration ({src_duration:.2f}s).",
                 status_code=400,
             )
-
         effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
-        if effective_out - src_in < 0.1:
+        seg_dur = effective_out - src_in
+        if seg_dur < 0.1:
             raise VideoProcessingError("Clip duration must be at least 0.1 seconds.", status_code=400)
 
+        total_v1_duration += seg_dur
+        v1_prepared_clips.append({
+            "src_path": src_path,
+            "src_meta": src_meta,
+            "src_in": src_in,
+            "src_out": effective_out,
+            "seg_dur": seg_dur,
+            "volume": float(clip.get("volume", 1.0)),
+            "muted": bool(clip.get("muted", False)) or ("track_v1" in muted_tracks),
+            "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
+            "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
+        })
+
+    if total_v1_duration > max_duration_sec:
+        raise VideoProcessingError(
+            f"Combined timeline duration ({total_v1_duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+            status_code=400,
+        )
+
+    work_dir = output_path.parent / "_timeline_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    v1_visual_segments: list[Path] = []
+
+    for idx, item in enumerate(v1_prepared_clips):
+        src_path = item["src_path"]
+        src_duration = float(item["src_meta"]["duration_seconds"])
+        src_in = float(item["src_in"])
+        effective_out = float(item["src_out"])
         needs_trim = src_in > 0.05 or (src_duration > 0 and effective_out < src_duration - 0.05)
+
         if needs_trim:
-            trimmed_path = work_dir / f"seg_{idx}_trim.mp4"
+            trimmed_path = work_dir / f"v1_seg_{idx}_trim.mp4"
             trim_video(
                 src_path,
                 trimmed_path,
@@ -664,66 +894,280 @@ def export_timeline_mp4(
                 timeout_sec=timeout_sec,
                 max_duration_sec=max_duration_sec,
             )
-            segments.append(trimmed_path)
+            v1_visual_segments.append(trimmed_path)
         else:
-            segments.append(src_path)
+            v1_visual_segments.append(src_path)
 
-    if len(segments) == 1:
-        raw_export_path = (
-            work_dir / "pre_subtitles.mp4" if bool(timeline_spec.get("burnSubtitles")) else output_path
+    # Render V1 visual frames first so audio mixing matches exact final video duration
+    visual_only_mp4 = work_dir / "v1_visual_only.mp4"
+    visual_meta = _render_v1_visual_mp4(
+        v1_visual_segments,
+        visual_only_mp4,
+        resolution=eff_resolution,
+        fps=eff_fps,
+        aspect_ratio=eff_aspect,
+        ffmpeg_bin=ffmpeg_bin,
+        ffprobe_bin=ffprobe_bin,
+        timeout_sec=timeout_sec,
+    )
+    rendered_duration = float(visual_meta["duration_seconds"]) or total_v1_duration
+
+    # Prepare A1 active audio clips
+    a1_track_muted = "track_a1" in muted_tracks
+    active_a1_clips: list[dict] = []
+    for idx, clip in enumerate(sorted_a1):
+        if a1_track_muted or bool(clip.get("muted", False)):
+            continue
+        vol = float(clip.get("volume", 1.0))
+        if vol <= 0.001:
+            continue
+        tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
+        if tl_start >= rendered_duration - 0.02:
+            continue
+
+        f_idx = a1_file_indices[idx]
+        src_path = uploaded_files[f_idx]
+        src_meta = a1_source_metas[f_idx]
+        src_duration = float(src_meta["duration_seconds"])
+        src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
+        default_out = (
+            src_in + float(clip["durationSec"])
+            if "durationSec" in clip
+            else src_duration
         )
-        rendered_meta = export_mp4(
-            segments[0],
-            raw_export_path,
-            resolution=eff_resolution,
-            fps=eff_fps,
-            aspect_ratio=eff_aspect,
-            ffmpeg_bin=ffmpeg_bin,
-            ffprobe_bin=ffprobe_bin,
-            timeout_sec=timeout_sec,
-            max_duration_sec=max_duration_sec,
-        )
+        src_out = float(clip.get("sourceOutSec", default_out))
+        if src_out <= src_in:
+            continue
+        if src_duration > 0 and src_in >= src_duration:
+            continue
+        effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
+        if effective_out - src_in < 0.05:
+            continue
+
+        active_a1_clips.append({
+            "src_path": src_path,
+            "src_in": src_in,
+            "src_out": effective_out,
+            "tl_start": tl_start,
+            "volume": vol,
+            "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
+            "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
+            "ducking_enabled": bool(clip.get("duckingEnabled", False)),
+            "ducking_amount": float(
+                clip.get("duckingAmount", 0.6) if clip.get("duckingAmount") is not None else 0.6
+            ),
+        })
+
+    v1_has_any_audible = any(
+        bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
+        for item in v1_prepared_clips
+    )
+    v1_has_any_source_audio = any(bool(item["src_meta"].get("has_audio")) for item in v1_prepared_clips)
+    needs_sidechain_key = (
+        len(active_a1_clips) > 0
+        and any(c["ducking_enabled"] for c in active_a1_clips)
+        and v1_has_any_audible
+    )
+    speech_intervals = _merge_speech_intervals(
+        timeline_spec.get("speechIntervals"),
+        timeline_spec.get("subtitles"),
+    )
+
+    raw_export_path = (
+        work_dir / "pre_subtitles.mp4" if bool(timeline_spec.get("burnSubtitles")) else output_path
+    )
+    raw_export_path.parent.mkdir(parents=True, exist_ok=True)
+
+    has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0
+
+    if not has_output_audio:
+        shutil.copy2(visual_only_mp4, raw_export_path)
+        rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
     else:
-        target_w, target_h = _resolve_export_dimensions(eff_resolution, eff_aspect)
-        target_ratio = target_w / target_h
-        prepared_segments: list[Path] = []
-        for idx, seg_path in enumerate(segments):
-            if eff_aspect is not None:
-                seg_meta = extract_video_metadata(seg_path, ffprobe_bin=ffprobe_bin)
-                seg_w = int(seg_meta["video"]["width"])
-                seg_h = int(seg_meta["video"]["height"])
-                seg_ratio = seg_w / seg_h if seg_h > 0 else target_ratio
-                if abs(seg_ratio - target_ratio) > 0.03:
-                    cropped_path = work_dir / f"seg_{idx}_aspect.mp4"
-                    resize_crop_aspect_ratio(
-                        seg_path,
-                        cropped_path,
-                        target_width=target_w,
-                        target_height=target_h,
-                        fit_mode="crop",
-                        ffmpeg_bin=ffmpeg_bin,
-                        ffprobe_bin=ffprobe_bin,
-                        timeout_sec=timeout_sec,
-                        max_duration_sec=max_duration_sec,
-                    )
-                    prepared_segments.append(cropped_path)
-                    continue
-            prepared_segments.append(seg_path)
+        audio_cmd = [ffmpeg_path, "-y"]
+        audio_filters: list[str] = []
+        input_idx = 0
 
-        raw_export_path = (
-            work_dir / "pre_subtitles.mp4" if bool(timeline_spec.get("burnSubtitles")) else output_path
-        )
-        rendered_meta = merge_video_clips(
-            prepared_segments,
-            raw_export_path,
-            target_width=target_w,
-            target_height=target_h,
-            fps=eff_fps,
-            ffmpeg_bin=ffmpeg_bin,
-            ffprobe_bin=ffprobe_bin,
-            timeout_sec=timeout_sec,
-            max_total_duration_sec=max_duration_sec,
-        )
+        v1_mix_label: str | None = None
+        v1_key_label: str | None = None
+
+        if v1_has_any_audible:
+            v1_seg_labels: list[str] = []
+            for s_idx, item in enumerate(v1_prepared_clips):
+                seg_dur = float(item["seg_dur"])
+                has_src_audio = bool(item["src_meta"].get("has_audio"))
+                if not has_src_audio or item["muted"] or item["volume"] <= 0.001:
+                    audio_filters.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=44100:d={seg_dur:.3f}[v1a_{s_idx}]"
+                    )
+                else:
+                    cur_in_idx = input_idx
+                    audio_cmd.extend(["-i", str(item["src_path"])])
+                    input_idx += 1
+                    chain = _build_audio_clip_chain(
+                        f"{cur_in_idx}:a",
+                        src_in=item["src_in"],
+                        src_out=item["src_out"],
+                        volume=item["volume"],
+                        fade_in=item["fade_in"],
+                        fade_out=item["fade_out"],
+                    )
+                    audio_filters.append(f"{chain}[v1a_{s_idx}]")
+                v1_seg_labels.append(f"[v1a_{s_idx}]")
+
+            v1_base_chain = (
+                f"{v1_seg_labels[0]}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
+                if len(v1_seg_labels) == 1
+                else f"{''.join(v1_seg_labels)}concat=n={len(v1_seg_labels)}:v=0:a=1,"
+                f"apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
+            )
+            if needs_sidechain_key and len(speech_intervals) == 0:
+                audio_filters.append(f"{v1_base_chain},asplit=2[v1_out][v1_sc_raw]")
+                v1_mix_label = "[v1_out]"
+                v1_key_label = "[v1_sc_raw]"
+            else:
+                audio_filters.append(f"{v1_base_chain}[v1_out]")
+                v1_mix_label = "[v1_out]"
+
+        a1_clip_labels: list[str] = []
+        sidechain_duck_clips = [
+            c for c in active_a1_clips if c["ducking_enabled"] and len(speech_intervals) == 0 and v1_key_label
+        ]
+        sc_key_splits: list[str] = []
+        if sidechain_duck_clips and v1_key_label:
+            if len(sidechain_duck_clips) == 1:
+                sc_key_splits = ["[v1_sc_0]"]
+                audio_filters.append(
+                    f"{v1_key_label}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[v1_sc_0]"
+                )
+            else:
+                sc_raw_splits = [f"[v1_sc_raw_{i}]" for i in range(len(sidechain_duck_clips))]
+                sc_key_splits = [f"[v1_sc_{i}]" for i in range(len(sidechain_duck_clips))]
+                audio_filters.append(
+                    f"{v1_key_label}asplit={len(sidechain_duck_clips)}{''.join(sc_raw_splits)}"
+                )
+                for raw_lbl, fmt_lbl in zip(sc_raw_splits, sc_key_splits):
+                    audio_filters.append(
+                        f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{fmt_lbl}"
+                    )
+
+        sc_split_cursor = 0
+        for a_idx, item in enumerate(active_a1_clips):
+            cur_in_idx = input_idx
+            audio_cmd.extend(["-i", str(item["src_path"])])
+            input_idx += 1
+
+            base_chain = _build_audio_clip_chain(
+                f"{cur_in_idx}:a",
+                src_in=item["src_in"],
+                src_out=item["src_out"],
+                volume=item["volume"],
+                fade_in=item["fade_in"],
+                fade_out=item["fade_out"],
+            )
+            cur_label = f"[a1_base_{a_idx}]"
+            audio_filters.append(f"{base_chain}{cur_label}")
+
+            if item["tl_start"] > 0.01:
+                delay_ms = int(round(item["tl_start"] * 1000))
+                delayed_label = f"[a1_del_{a_idx}]"
+                audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
+                cur_label = delayed_label
+
+            padded_label = f"[a1_pad_{a_idx}]"
+            audio_filters.append(
+                f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
+                f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
+            )
+            cur_label = padded_label
+
+            if item["ducking_enabled"] and item["ducking_amount"] > 0.01:
+                if speech_intervals:
+                    duck_expr = _build_interval_ducking_expr(speech_intervals, item["ducking_amount"])
+                    ducked_label = f"[a1_duck_{a_idx}]"
+                    audio_filters.append(
+                        f"{cur_label}volume='{duck_expr}':eval=frame{ducked_label}"
+                    )
+                    cur_label = ducked_label
+                elif sc_split_cursor < len(sc_key_splits):
+                    key_lbl = sc_key_splits[sc_split_cursor]
+                    sc_split_cursor += 1
+                    duck_mix = max(0.1, min(1.0, item["ducking_amount"]))
+                    ducked_label = f"[a1_scduck_{a_idx}]"
+                    audio_filters.append(
+                        f"{cur_label}{key_lbl}sidechaincompress=threshold=0.04:ratio=6:attack=40:release=350:mix={duck_mix:.2f}{ducked_label}"
+                    )
+                    cur_label = ducked_label
+
+            a1_clip_labels.append(cur_label)
+
+        mix_inputs: list[str] = []
+        if v1_mix_label:
+            mix_inputs.append(v1_mix_label)
+        mix_inputs.extend(a1_clip_labels)
+
+        any_boost = any(
+            item["volume"] > 1.02
+            for item in v1_prepared_clips
+            if not item["muted"]
+        ) or any(c["volume"] > 1.02 for c in active_a1_clips)
+
+        if len(mix_inputs) == 1:
+            if any_boost:
+                audio_filters.append(
+                    f"{mix_inputs[0]}alimiter=limit=0.98:attack=5:release=50:level=0[final_a]"
+                )
+            else:
+                audio_filters.append(f"{mix_inputs[0]}acopy[final_a]")
+        else:
+            audio_filters.append(
+                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0:normalize=0,"
+                f"alimiter=limit=0.98:attack=5:release=50:level=0,atrim=0:{rendered_duration:.3f}[final_a]"
+            )
+
+        filter_script_path = work_dir / "audio_mix_filter.txt"
+        filter_script_path.write_text(";\n".join(audio_filters), encoding="utf-8")
+
+        mixed_audio_wav = work_dir / "mixed_audio.wav"
+        audio_cmd.extend([
+            "-filter_complex_script",
+            str(filter_script_path),
+            "-map",
+            "[final_a]",
+            "-c:a",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(mixed_audio_wav),
+        ])
+        _run_ffmpeg(audio_cmd, timeout_sec)
+
+        mux_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(visual_only_mp4),
+            "-i",
+            str(mixed_audio_wav),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(raw_export_path),
+        ]
+        _run_ffmpeg(mux_cmd, timeout_sec)
+        rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
 
     if bool(timeline_spec.get("burnSubtitles")):
         subtitles = timeline_spec.get("subtitles")

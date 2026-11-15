@@ -1,4 +1,5 @@
 import type { MediaAsset, MediaKind, TimelineClip } from "../types/studio";
+import { extractAudioWaveformPeaks, normalizeAudioMimeType } from "./audio";
 import { getMediaFromIndexedDB } from "./mediaStorage";
 
 export function formatTimecode(seconds: number, showFrames = false, fps = 30): string {
@@ -85,24 +86,28 @@ export async function extractMediaAsset(
     }
 
     if (kind === "audio") {
-      const duration = await new Promise<number>((resolve) => {
-        const audio = document.createElement("audio");
-        audio.preload = "metadata";
-        audio.onloadedmetadata = () => {
-          resolve(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
-        };
-        audio.onerror = () => resolve(10);
-        audio.src = objectUrl;
-      });
+      const [duration, waveformPeaks] = await Promise.all([
+        new Promise<number>((resolve) => {
+          const audio = document.createElement("audio");
+          audio.preload = "metadata";
+          audio.onloadedmetadata = () => {
+            resolve(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
+          };
+          audio.onerror = () => resolve(10);
+          audio.src = objectUrl;
+        }),
+        extractAudioWaveformPeaks(file),
+      ]);
 
       return {
         id,
         name: file.name,
         kind,
-        mimeType: file.type || "audio/mpeg",
+        mimeType: normalizeAudioMimeType(file),
         sizeBytes: file.size,
         duration,
         objectUrl,
+        waveformPeaks,
         sourceFile: file,
         addedAt: new Date().toISOString(),
       };
@@ -165,6 +170,9 @@ export async function extractMediaAsset(
       video.src = objectUrl;
     });
 
+    // Best-effort waveform extraction for short video clips so audio peaks can render on V1
+    const waveformPeaks = await extractAudioWaveformPeaks(file);
+
     return {
       id,
       name: file.name,
@@ -176,6 +184,7 @@ export async function extractMediaAsset(
       height: videoInfo.height,
       objectUrl,
       thumbnailUrl: videoInfo.thumbnailUrl,
+      waveformPeaks,
       sourceFile: file,
       addedAt: new Date().toISOString(),
     };

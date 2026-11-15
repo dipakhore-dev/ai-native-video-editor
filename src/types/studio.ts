@@ -22,6 +22,7 @@ export interface MediaAsset {
   height?: number;
   objectUrl: string;
   thumbnailUrl?: string;
+  waveformPeaks?: number[]; // normalized 0..1 amplitude buckets across source duration
   sourceFile?: File;
   addedAt: string;
 }
@@ -57,10 +58,16 @@ export interface TimelineClip {
   duration: number; // length on timeline in seconds
   inPoint: number; // offset inside source media in seconds
   sourceDuration: number;
-  volume: number; // 0 to 1
+  volume: number; // 0 to 2 (0% to 200%)
+  muted?: boolean;
+  fadeInSec?: number; // 0 to 30
+  fadeOutSec?: number; // 0 to 30
+  duckingEnabled?: boolean;
+  duckingAmount?: number; // 0 to 0.95 (fraction attenuated during speech)
   speed: number; // 0.5 to 2
   opacity: number; // 0 to 1
   thumbnailUrl?: string;
+  waveformPeaks?: number[];
   objectUrl: string;
   sourceName?: string;
   sourceSizeBytes?: number;
@@ -113,6 +120,11 @@ export interface Project {
   subtitleMeta?: SubtitleMetadata;
 }
 
+export interface SpeechInterval {
+  start: number;
+  end: number;
+}
+
 export interface RenderTimelineClipSpec {
   id: string;
   trackId: string;
@@ -126,6 +138,11 @@ export interface RenderTimelineClipSpec {
   sourceOutSec: number;
   speed: number;
   volume: number;
+  muted?: boolean;
+  fadeInSec?: number;
+  fadeOutSec?: number;
+  duckingEnabled?: boolean;
+  duckingAmount?: number;
   opacity: number;
   fileIndex?: number;
   textStyle?: TextOverlayStyle;
@@ -146,6 +163,7 @@ export interface RenderTimelinePayload {
   };
   tracks: TimelineTrack[];
   clips: RenderTimelineClipSpec[];
+  speechIntervals?: SpeechInterval[];
   burnSubtitles?: boolean;
   subtitles?: SubtitleSegment[];
   subtitleStyle?: SubtitleStyle;

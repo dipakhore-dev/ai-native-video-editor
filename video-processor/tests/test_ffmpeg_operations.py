@@ -518,6 +518,338 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotEqual(frame_plain.read_bytes(), frame_burned.read_bytes())
 
+    def _make_tone_audio(
+        self,
+        name: str,
+        *,
+        duration: float = 2.0,
+        freq: int = 880,
+        amplitude: float = 0.25,
+    ) -> Path:
+        out = self.test_root / name
+        ext = out.suffix.lower()
+        cmd = [
+            self.ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"aevalsrc={amplitude}*sin(2*PI*{freq}*t):s=44100:d={duration}",
+        ]
+        if ext == ".mp3":
+            cmd.extend(["-c:a", "libmp3lame", "-b:a", "128k"])
+        elif ext == ".m4a":
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+        else:
+            cmd.extend(["-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"])
+        cmd.append(str(out))
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return out
+
+    def _measure_pcm_rms(self, media_path: Path, start_sec: float, duration_sec: float) -> float:
+        import math
+        import struct
+        import wave
+
+        wav_out = self.test_root / f"rms_{media_path.stem}_{start_sec:.2f}_{duration_sec:.2f}.wav"
+        proc = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-ss",
+                f"{start_sec:.3f}",
+                "-t",
+                f"{duration_sec:.3f}",
+                "-i",
+                str(media_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(wav_out),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with wave.open(str(wav_out), "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+        if not frames:
+            return 0.0
+        sample_count = len(frames) // 2
+        samples = struct.unpack(f"<{sample_count}h", frames)
+        mean_sq = sum(s * s for s in samples) / max(1, sample_count)
+        return math.sqrt(mean_sq) / 32768.0
+
+    def test_phase2_audio_probe_and_mix_mp3_wav_m4a_with_mute_volume_fades(self) -> None:
+        from app.services.ffprobe_service import extract_audio_metadata
+
+        video_clip = self._make_clip("v_base.mp4", duration=3.0, with_audio=True)
+        mp3_file = self._make_tone_audio("bg.mp3", duration=2.5, freq=660, amplitude=0.25)
+        wav_file = self._make_tone_audio("bg.wav", duration=2.5, freq=520, amplitude=0.25)
+        m4a_file = self._make_tone_audio("bg.m4a", duration=2.5, freq=780, amplitude=0.25)
+
+        for audio_file in (mp3_file, wav_file, m4a_file):
+            ameta = extract_audio_metadata(audio_file, ffprobe_bin=check_binary("ffprobe") or "ffprobe")
+            self.assertTrue(ameta["has_audio"])
+            self.assertGreater(ameta["duration_seconds"], 2.0)
+
+        # 1. Verify M4A A1 clip + V1 muted at 50% vs 200% boost + delayed MP3
+        out_50 = self.test_root / "mix_50.mp4"
+        out_200 = self.test_root / "mix_200.mp4"
+        base_v1_muted = {
+            "id": "v1",
+            "trackId": "track_v1",
+            "kind": "video",
+            "sourceName": "v_base.mp4",
+            "timelineStartSec": 0.0,
+            "timelineEndSec": 3.0,
+            "durationSec": 3.0,
+            "sourceInSec": 0.0,
+            "sourceOutSec": 3.0,
+            "speed": 1.0,
+            "volume": 1.0,
+            "muted": True,
+            "opacity": 1.0,
+            "fileIndex": 0,
+        }
+
+        export_timeline_mp4(
+            [video_clip, m4a_file],
+            out_50,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    base_v1_muted,
+                    {
+                        "id": "a1_m4a",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "bg.m4a",
+                        "timelineStartSec": 0.5,
+                        "timelineEndSec": 2.5,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 0.5,
+                        "muted": False,
+                        "fadeInSec": 0.0,
+                        "fadeOutSec": 0.0,
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+
+        export_timeline_mp4(
+            [video_clip, wav_file],
+            out_200,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": True, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {**base_v1_muted, "muted": False},
+                    {
+                        "id": "a1_wav",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "bg.wav",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 3.0,
+                        "durationSec": 3.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.5,
+                        "speed": 1.0,
+                        "volume": 2.0,
+                        "muted": False,
+                        "fadeInSec": 0.7,
+                        "fadeOutSec": 0.7,
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+
+        # In out_50: 0.0-0.3s must be silent (V1 muted + A1 delayed to 0.5s); 0.7-1.7s must be audible
+        rms_before_delay = self._measure_pcm_rms(out_50, 0.05, 0.3)
+        rms_mid_50 = self._measure_pcm_rms(out_50, 0.8, 0.8)
+        self.assertLess(rms_before_delay, 0.01)
+        self.assertGreater(rms_mid_50, 0.04)
+
+        # In out_200: 200% mid RMS > 50% mid RMS, and fade-in / fade-out edges quieter than middle
+        rms_start_fade = self._measure_pcm_rms(out_200, 0.02, 0.25)
+        rms_mid_200 = self._measure_pcm_rms(out_200, 1.0, 0.5)
+        rms_end_fade = self._measure_pcm_rms(out_200, 2.2, 0.25)
+        self.assertGreater(rms_mid_200, rms_mid_50 * 2.0)
+        self.assertLess(rms_start_fade, rms_mid_200 * 0.65)
+        self.assertLess(rms_end_fade, rms_mid_200 * 0.65)
+
+        # 2. Verify MP3 + Bengali burned subtitles export cleanly together
+        out_mp3_bn = self.test_root / "mp3_bn.mp4"
+        bn_meta = export_timeline_mp4(
+            [video_clip, mp3_file],
+            out_mp3_bn,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {**base_v1_muted, "muted": False, "volume": 0.8},
+                    {
+                        "id": "a1_mp3",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "bg.mp3",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.5,
+                        "durationSec": 2.5,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.5,
+                        "speed": 1.0,
+                        "volume": 0.6,
+                        "muted": False,
+                        "fileIndex": 1,
+                    },
+                ],
+                "burnSubtitles": True,
+                "subtitles": [{"id": "s1", "start": 0.2, "end": 1.4, "text": "নমস্কার বাংলা"}],
+            },
+        )
+        self.assertTrue(out_mp3_bn.exists())
+        self.assertTrue(bn_meta["has_audio"])
+
+    def test_phase2_speech_aware_ducking_subtitles_and_sidechain(self) -> None:
+        silent_video = self._make_clip("v_silent.mp4", duration=3.0, with_audio=False)
+        music_wav = self._make_tone_audio("music.wav", duration=3.0, freq=500, amplitude=0.35)
+        out_ducked = self.test_root / "ducked_subs.mp4"
+
+        export_timeline_mp4(
+            [silent_video, music_wav],
+            out_ducked,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v_silent.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 3.0,
+                        "durationSec": 3.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 3.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "a1",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "music.wav",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 3.0,
+                        "durationSec": 3.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 3.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "muted": False,
+                        "duckingEnabled": True,
+                        "duckingAmount": 0.75,
+                        "fileIndex": 1,
+                    },
+                ],
+                "speechIntervals": [{"start": 1.0, "end": 2.0}],
+            },
+        )
+
+        rms_before = self._measure_pcm_rms(out_ducked, 0.1, 0.7)
+        rms_during = self._measure_pcm_rms(out_ducked, 1.15, 0.7)
+        rms_after = self._measure_pcm_rms(out_ducked, 2.15, 0.7)
+
+        self.assertGreater(rms_before, 0.15)
+        self.assertGreater(rms_after, 0.15)
+        self.assertLess(rms_during, rms_before * 0.4)
+        self.assertLess(rms_during, rms_after * 0.4)
+
+        # Also test V1 speech sidechaincompress fallback when no speechIntervals/subtitles are provided
+        speech_video = self._make_clip("v_speech.mp4", duration=2.5, with_audio=True)
+        out_sidechain = self.test_root / "ducked_sidechain.mp4"
+        sc_meta = export_timeline_mp4(
+            [speech_video, music_wav],
+            out_sidechain,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v_speech.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.5,
+                        "durationSec": 2.5,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.5,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "a1",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "music.wav",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.5,
+                        "durationSec": 2.5,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.5,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "muted": False,
+                        "duckingEnabled": True,
+                        "duckingAmount": 0.65,
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_sidechain.exists())
+        self.assertTrue(sc_meta["has_audio"])
+
 
 if __name__ == "__main__":
     unittest.main()

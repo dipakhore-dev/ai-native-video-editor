@@ -14,6 +14,7 @@ export interface StoredMediaRecord {
   width?: number;
   height?: number;
   thumbnailDataUrl?: string;
+  waveformPeaks?: number[];
   blob: Blob;
   addedAt: string;
   updatedAt: string;
@@ -305,6 +306,7 @@ export function hydrateAssetFromStoredRecord(record: StoredMediaRecord): MediaAs
     height: record.height,
     objectUrl,
     thumbnailUrl: record.thumbnailDataUrl || (record.kind === "image" ? objectUrl : undefined),
+    waveformPeaks: Array.isArray(record.waveformPeaks) ? record.waveformPeaks : undefined,
     sourceFile,
     addedAt: record.addedAt,
   };
@@ -368,6 +370,7 @@ export function reconcileProjectWithMediaAssets(
     const asset = assetsById.get(clip.assetId);
     if (asset) {
       const nextThumb = asset.thumbnailUrl ?? clip.thumbnailUrl;
+      const nextWaveform = asset.waveformPeaks ?? clip.waveformPeaks;
       const nextName = clip.sourceName || asset.name;
       const nextSize = clip.sourceSizeBytes ?? asset.sizeBytes;
       const nextMime = clip.sourceMimeType || asset.mimeType;
@@ -376,6 +379,7 @@ export function reconcileProjectWithMediaAssets(
         clip.objectUrl !== asset.objectUrl ||
         clip.needsRelink ||
         clip.thumbnailUrl !== nextThumb ||
+        clip.waveformPeaks !== nextWaveform ||
         clip.sourceName !== nextName ||
         clip.sourceSizeBytes !== nextSize ||
         clip.sourceMimeType !== nextMime
@@ -385,6 +389,7 @@ export function reconcileProjectWithMediaAssets(
           ...clip,
           objectUrl: asset.objectUrl,
           thumbnailUrl: nextThumb,
+          waveformPeaks: nextWaveform,
           sourceName: nextName,
           sourceSizeBytes: nextSize,
           sourceMimeType: nextMime,
