@@ -18,7 +18,7 @@ import { requestAiAssistant } from "../../services/api";
 import type { Project, TimelineClip } from "../../types/studio";
 import { describeAiOperation, type AiEditPlan } from "../../utils/aiOperations";
 import { formatTimecode } from "../../utils/media";
-import { trimClipStart } from "../../utils/timeline";
+import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import { SubtitlesPanel } from "./SubtitlesPanel";
 
 export type EditorPanelTab = "inspector" | "assistant" | "subtitles";
@@ -62,6 +62,7 @@ export function AiAssistantPanel({
 }: AiAssistantPanelProps) {
   const {
     updateClip,
+    moveClipOnTimeline,
     updateTextStyle,
     deleteClip,
     duplicateClip,
@@ -373,9 +374,10 @@ export function AiAssistantPanel({
                     step={0.1}
                     value={selectedClip.startTime}
                     onChange={(e) =>
-                      updateClip(selectedClip.id, {
-                        startTime: Math.max(0, Number(e.target.value) || 0),
-                      })
+                      moveClipOnTimeline(
+                        selectedClip.id,
+                        Math.max(0, Number(e.target.value) || 0)
+                      )
                     }
                     className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs font-mono text-white tabular-nums focus:border-violet-500 focus:outline-none"
                   />
@@ -392,11 +394,17 @@ export function AiAssistantPanel({
                     }
                     step={0.1}
                     value={selectedClip.duration}
-                    onChange={(e) =>
-                      updateClip(selectedClip.id, {
-                        duration: Math.max(0.5, Number(e.target.value) || 1),
-                      })
-                    }
+                    onChange={(e) => {
+                      const trackClips = project.clips.filter(
+                        (c) => c.trackId === selectedClip.trackId
+                      );
+                      const patch = trimClipEnd(
+                        selectedClip,
+                        Math.max(0.5, Number(e.target.value) || 1),
+                        trackClips
+                      );
+                      updateClip(selectedClip.id, patch);
+                    }}
                     className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs font-mono text-white tabular-nums focus:border-violet-500 focus:outline-none"
                   />
                 </div>
@@ -415,9 +423,13 @@ export function AiAssistantPanel({
                       onChange={(e) => {
                         const targetIn = Math.max(0, Number(e.target.value) || 0);
                         const deltaStart = (targetIn - selectedClip.inPoint) / selectedClip.speed;
+                        const trackClips = project.clips.filter(
+                          (c) => c.trackId === selectedClip.trackId
+                        );
                         const patch = trimClipStart(
                           selectedClip,
-                          selectedClip.startTime + deltaStart
+                          selectedClip.startTime + deltaStart,
+                          trackClips
                         );
                         updateClip(selectedClip.id, patch);
                       }}
@@ -442,7 +454,11 @@ export function AiAssistantPanel({
                         const nextDur = Number(
                           ((outSec - selectedClip.inPoint) / selectedClip.speed).toFixed(2)
                         );
-                        updateClip(selectedClip.id, { duration: Math.max(0.5, nextDur) });
+                        const trackClips = project.clips.filter(
+                          (c) => c.trackId === selectedClip.trackId
+                        );
+                        const patch = trimClipEnd(selectedClip, nextDur, trackClips);
+                        updateClip(selectedClip.id, patch);
                       }}
                       className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1.5 text-xs font-mono text-white tabular-nums focus:border-violet-500 focus:outline-none"
                     />

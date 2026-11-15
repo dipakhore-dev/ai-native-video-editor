@@ -49,6 +49,11 @@ export function EditorPage() {
     redo,
     lastLocalSaveAt,
     saveTimelineLocally,
+    isAuthenticated,
+    mongoSaveStatus,
+    lastMongoSaveAt,
+    mongoSaveError,
+    saveTimelineToMongo,
     sessionUser,
   } = useStudio();
 
@@ -56,6 +61,8 @@ export function EditorPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
+  const lastSyncedVideoClipIdRef = useRef<string | null>(null);
+  const lastSyncedAudioClipIdRef = useRef<string | null>(null);
 
   const [playheadTime, setPlayheadTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -159,9 +166,11 @@ export function EditorPage() {
   const syncVideoElement = useCallback(() => {
     const vid = videoRef.current;
     if (!vid || !primaryVisualClip || primaryVisualClip.kind !== "video" || primaryVisualClip.needsRelink) {
+      lastSyncedVideoClipIdRef.current = null;
       return;
     }
 
+    const clipChanged = lastSyncedVideoClipIdRef.current !== primaryVisualClip.id;
     const targetSourceTime =
       primaryVisualClip.inPoint +
       (playheadTime - primaryVisualClip.startTime) * primaryVisualClip.speed;
@@ -170,12 +179,16 @@ export function EditorPage() {
     vid.muted = masterMuted || primaryTrackMuted;
     vid.volume = Math.min(1, Math.max(0, masterVolume * primaryVisualClip.volume));
 
-    if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > (isPlaying ? 0.35 : 0.04)) {
+    const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
+    if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
       try {
         vid.currentTime = Math.max(0, Math.min(vid.duration || targetSourceTime, targetSourceTime));
+        lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
       } catch {
         // Ignore seek errors while media decodes
       }
+    } else if (vid.readyState >= 1 && clipChanged) {
+      lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
     }
 
     if (isPlaying && vid.paused) {
@@ -234,22 +247,28 @@ export function EditorPage() {
     if (!aud) return;
 
     if (!activeAudioClip || activeAudioClip.needsRelink) {
+      lastSyncedAudioClipIdRef.current = null;
       aud.pause();
       return;
     }
 
+    const clipChanged = lastSyncedAudioClipIdRef.current !== activeAudioClip.id;
     const targetSourceTime =
       activeAudioClip.inPoint + (playheadTime - activeAudioClip.startTime) * activeAudioClip.speed;
     aud.playbackRate = playbackRate * activeAudioClip.speed;
     aud.muted = masterMuted || Boolean(a1Track?.muted);
     aud.volume = Math.min(1, Math.max(0, masterVolume * activeAudioClip.volume));
 
-    if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > (isPlaying ? 0.35 : 0.05)) {
+    const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
+    if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > tolerance) {
       try {
         aud.currentTime = Math.max(0, targetSourceTime);
+        lastSyncedAudioClipIdRef.current = activeAudioClip.id;
       } catch {
         // Ignore seek before metadata loaded
       }
+    } else if (aud.readyState >= 1 && clipChanged) {
+      lastSyncedAudioClipIdRef.current = activeAudioClip.id;
     }
 
     if (isPlaying && aud.paused) {
@@ -286,9 +305,12 @@ export function EditorPage() {
 
   const triggerLocalSave = useCallback(() => {
     saveTimelineLocally();
+    if (isAuthenticated) {
+      void saveTimelineToMongo();
+    }
     setSaveFlash(true);
     setTimeout(() => setSaveFlash(false), 1800);
-  }, [saveTimelineLocally]);
+  }, [isAuthenticated, saveTimelineLocally, saveTimelineToMongo]);
 
   // Keyboard Shortcuts including Undo / Redo / Local Save
   useEffect(() => {
@@ -478,24 +500,35 @@ export function EditorPage() {
           </button>
           <button
             type="button"
-            disabled={!activeProject}
+            disabled={!activeProject || mongoSaveStatus === "saving"}
             onClick={triggerLocalSave}
             className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
             title={
-              lastLocalSaveAt
-                ? `Last saved locally at ${new Date(lastLocalSaveAt).toLocaleTimeString()}`
-                : "Save timeline state to browser storage (Ctrl+S)"
+              mongoSaveError
+                ? `MongoDB sync error: ${mongoSaveError}`
+                : isAuthenticated && lastMongoSaveAt
+                  ? `Synced to MongoDB at ${new Date(lastMongoSaveAt).toLocaleTimeString()}`
+                  : lastLocalSaveAt
+                    ? `Last saved locally at ${new Date(lastLocalSaveAt).toLocaleTimeString()}`
+                    : "Save timeline state locally and to MongoDB when signed in (Ctrl+S)"
             }
           >
-            {saveFlash ? (
+            {mongoSaveStatus === "saving" ? (
+              <>
+                <Save className="h-3.5 w-3.5 text-blue-400 animate-pulse" />
+                <span>Saving...</span>
+              </>
+            ) : saveFlash || (isAuthenticated && mongoSaveStatus === "saved") ? (
               <>
                 <Check className="h-3.5 w-3.5 text-emerald-400" />
-                <span className="text-emerald-300">Saved Locally</span>
+                <span className="text-emerald-300">
+                  {isAuthenticated ? "Saved to MongoDB" : "Saved Locally"}
+                </span>
               </>
             ) : (
               <>
                 <Save className="h-3.5 w-3.5 text-blue-400" />
-                <span>Save Locally</span>
+                <span>{isAuthenticated ? "Save Timeline" : "Save Locally"}</span>
               </>
             )}
           </button>
@@ -655,14 +688,20 @@ export function EditorPage() {
                   filteredBinAssets.map((asset) => (
                     <div
                       key={asset.id}
-                      className="rounded-lg border border-zinc-800/80 bg-[#111114] p-2 flex items-center gap-2.5 group hover:border-zinc-700 transition-colors"
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("application/x-ai-studio-asset-id", asset.id);
+                        e.dataTransfer.effectAllowed = "copy";
+                      }}
+                      className="rounded-lg border border-zinc-800/80 bg-[#111114] p-2 flex items-center gap-2.5 group hover:border-zinc-700 cursor-grab active:cursor-grabbing transition-colors"
+                      title="Drag onto a timeline track or click + to append"
                     >
                       <div className="h-10 w-14 rounded bg-zinc-950 overflow-hidden shrink-0 flex items-center justify-center">
                         {asset.thumbnailUrl ? (
                           <img
                             src={asset.thumbnailUrl}
                             alt={asset.name}
-                            className="h-full w-full object-cover"
+                            className="h-full w-full object-cover pointer-events-none"
                           />
                         ) : asset.kind === "audio" ? (
                           <Music className="h-4 w-4 text-blue-400" />
@@ -707,6 +746,7 @@ export function EditorPage() {
                           ref={videoRef}
                           src={primaryVisualClip.objectUrl}
                           onLoadedMetadata={syncVideoElement}
+                          onCanPlay={syncVideoElement}
                           playsInline
                           style={{ opacity: primaryVisualClip.opacity }}
                           className="h-full w-full object-contain"

@@ -69,6 +69,77 @@ export function splitClipAtTimestamp(
   };
 }
 
+export function sortTrackClips(clips: TimelineClip[], trackId: string): TimelineClip[] {
+  return clips
+    .filter((c) => c.trackId === trackId)
+    .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+}
+
+function applyOrderedTrackPositions(
+  allClips: TimelineClip[],
+  trackId: string,
+  orderedTrackClips: TimelineClip[],
+  startOrigin = 0
+): TimelineClip[] {
+  let cursor = Math.max(0, Number(startOrigin.toFixed(2)));
+  const updatedById = new Map<string, TimelineClip>();
+
+  for (const clip of orderedTrackClips) {
+    updatedById.set(clip.id, {
+      ...clip,
+      trackId,
+      startTime: cursor,
+    });
+    cursor = Number((cursor + clip.duration).toFixed(2));
+  }
+
+  return allClips.map((c) => updatedById.get(c.id) ?? c);
+}
+
+/**
+ * Packs all clips on a track sequentially back-to-back starting from 0s without gaps or overlaps.
+ */
+export function packTrackClips(
+  clips: TimelineClip[],
+  trackId: string
+): { clips: TimelineClip[]; changed: boolean } {
+  const trackClips = sortTrackClips(clips, trackId);
+  if (trackClips.length === 0) return { clips, changed: false };
+
+  const nextClips = applyOrderedTrackPositions(clips, trackId, trackClips, 0);
+  const changed = nextClips.some((c, i) => c.startTime !== clips[i].startTime);
+  return { clips: nextClips, changed };
+}
+
+/**
+ * Reorders a clip to an explicit 0-based index among clips on its track and packs them without overlap.
+ */
+export function reorderClipToIndex(
+  clips: TimelineClip[],
+  clipId: string,
+  targetIndex: number
+): { clips: TimelineClip[]; moved: boolean } {
+  const target = clips.find((c) => c.id === clipId);
+  if (!target) return { clips, moved: false };
+
+  const trackClips = sortTrackClips(clips, target.trackId);
+  const fromIndex = trackClips.findIndex((c) => c.id === clipId);
+  if (fromIndex === -1) return { clips, moved: false };
+
+  const clampedTarget = Math.max(0, Math.min(trackClips.length - 1, targetIndex));
+  if (clampedTarget === fromIndex) return { clips, moved: false };
+
+  const reordered = [...trackClips];
+  const [removed] = reordered.splice(fromIndex, 1);
+  reordered.splice(clampedTarget, 0, removed);
+
+  const origin = trackClips[0]?.startTime ?? 0;
+  return {
+    moved: true,
+    clips: applyOrderedTrackPositions(clips, target.trackId, reordered, origin),
+  };
+}
+
 /**
  * Reorders a clip relative to its immediate neighbor on the same track,
  * preserving each clip's duration and packing them cleanly without overlap.
@@ -81,10 +152,7 @@ export function reorderClipOnTrack(
   const target = clips.find((c) => c.id === clipId);
   if (!target) return { clips, moved: false };
 
-  const trackClips = clips
-    .filter((c) => c.trackId === target.trackId)
-    .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
-
+  const trackClips = sortTrackClips(clips, target.trackId);
   const index = trackClips.findIndex((c) => c.id === clipId);
   if (index === -1) return { clips, moved: false };
 
@@ -93,32 +161,183 @@ export function reorderClipOnTrack(
     return { clips, moved: false };
   }
 
-  const first = direction === "earlier" ? trackClips[swapIndex] : trackClips[index];
-  const second = direction === "earlier" ? trackClips[index] : trackClips[swapIndex];
+  return reorderClipToIndex(clips, clipId, swapIndex);
+}
 
-  // Gap between first.end and second.start (if any) is preserved between the swapped pair
-  const gap = Math.max(0, Number((second.startTime - (first.startTime + first.duration)).toFixed(2)));
-  const pairOrigin = first.startTime;
+/**
+ * Computes where a dragged clip should sit on a target track without overlapping siblings.
+ * When dropped over/past sibling midpoints, reorders clips sequentially; when dropped in clear open space,
+ * moves cleanly to desiredStartTime.
+ */
+export function moveClipWithTrackOrdering(
+  clips: TimelineClip[],
+  clipId: string,
+  desiredStartTime: number,
+  targetTrackId?: string,
+  isNewInsertion = false
+): { clips: TimelineClip[]; changed: boolean; insertionTime: number } {
+  const target = clips.find((c) => c.id === clipId);
+  if (!target) return { clips, changed: false, insertionTime: 0 };
 
-  const newFirstStart = pairOrigin;
-  const newSecondStart = Number((pairOrigin + second.duration + gap).toFixed(2));
+  const destTrackId = targetTrackId || target.trackId;
+  const clampedStart = Math.max(0, Number(desiredStartTime.toFixed(2)));
+  const siblings = clips
+    .filter((c) => c.trackId === destTrackId && c.id !== clipId)
+    .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+
+  if (siblings.length === 0) {
+    const changed = clampedStart !== target.startTime || destTrackId !== target.trackId;
+    return {
+      changed,
+      insertionTime: clampedStart,
+      clips: clips.map((c) =>
+        c.id === clipId ? { ...c, trackId: destTrackId, startTime: clampedStart } : c
+      ),
+    };
+  }
+
+  const lastSibling = siblings[siblings.length - 1];
+  const lastSiblingEnd = Number((lastSibling.startTime + lastSibling.duration).toFixed(2));
+
+  // If moving freely into open space at or past the end of all siblings
+  if (clampedStart >= lastSiblingEnd) {
+    const changed = clampedStart !== target.startTime || destTrackId !== target.trackId;
+    return {
+      changed,
+      insertionTime: clampedStart,
+      clips: clips.map((c) =>
+        c.id === clipId ? { ...c, trackId: destTrackId, startTime: clampedStart } : c
+      ),
+    };
+  }
+
+  // Check if clampedStart fits cleanly inside an existing gap between siblings
+  const desiredEnd = Number((clampedStart + target.duration).toFixed(2));
+  const overlapsAny = siblings.some(
+    (s) => clampedStart < s.startTime + s.duration - 0.01 && desiredEnd > s.startTime + 0.01
+  );
+  if (!overlapsAny) {
+    const changed = clampedStart !== target.startTime || destTrackId !== target.trackId;
+    return {
+      changed,
+      insertionTime: clampedStart,
+      clips: clips.map((c) =>
+        c.id === clipId ? { ...c, trackId: destTrackId, startTime: clampedStart } : c
+      ),
+    };
+  }
+
+  // Determine slot index using leading edge (moving earlier / dropping new asset) or trailing edge (moving later)
+  const movingEarlier = isNewInsertion || destTrackId !== target.trackId || clampedStart < target.startTime;
+  let insertIdx = siblings.length;
+  for (let i = 0; i < siblings.length; i++) {
+    const sibMid = siblings[i].startTime + siblings[i].duration / 2;
+    if (movingEarlier) {
+      if (clampedStart < sibMid) {
+        insertIdx = i;
+        break;
+      }
+    } else if (desiredEnd <= sibMid) {
+      insertIdx = i;
+      break;
+    }
+  }
+
+  const ordered = [...siblings];
+  const movedClip: TimelineClip = { ...target, trackId: destTrackId };
+  ordered.splice(insertIdx, 0, movedClip);
+
+  const isContiguousLeadSwap =
+    !isNewInsertion &&
+    destTrackId === target.trackId &&
+    target.startTime < siblings[0].startTime &&
+    target.startTime + target.duration >= siblings[0].startTime - 0.05;
+
+  const origin =
+    insertIdx === 0
+      ? Math.min(clampedStart, siblings[0].startTime === 0 ? 0 : clampedStart)
+      : isContiguousLeadSwap
+        ? target.startTime
+        : siblings[0].startTime;
+
+  const packed = applyOrderedTrackPositions(
+    clips.map((c) => (c.id === clipId ? movedClip : c)),
+    destTrackId,
+    ordered,
+    Math.max(0, origin)
+  );
+  const finalClip = packed.find((c) => c.id === clipId);
+  return {
+    changed: true,
+    insertionTime: finalClip?.startTime ?? clampedStart,
+    clips: packed,
+  };
+}
+
+/**
+ * Inserts a new clip onto a track at an optional time without overlapping existing clips on that track.
+ */
+export function insertClipOnTrack(
+  clips: TimelineClip[],
+  newClip: TimelineClip,
+  desiredStartTime?: number
+): TimelineClip[] {
+  const withNew = [...clips, { ...newClip, startTime: desiredStartTime ?? newClip.startTime }];
+  if (desiredStartTime === undefined) {
+    return withNew;
+  }
+  return moveClipWithTrackOrdering(withNew, newClip.id, desiredStartTime, newClip.trackId, true).clips;
+}
+
+/**
+ * Duplicates a clip directly after itself and shifts colliding/subsequent clips on the same track
+ * forward so no overlaps are created.
+ */
+export function duplicateClipWithoutOverlap(
+  clips: TimelineClip[],
+  clipId: string,
+  newId?: string
+): { clips: TimelineClip[]; duplicated: TimelineClip | null } {
+  const target = clips.find((c) => c.id === clipId);
+  if (!target) return { clips, duplicated: null };
+
+  const copyId = newId || `clip_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const copyStart = Number((target.startTime + target.duration).toFixed(2));
+  const copy: TimelineClip = {
+    ...target,
+    id: copyId,
+    startTime: copyStart,
+    textStyle: target.textStyle ? { ...target.textStyle } : undefined,
+  };
+
+  const shifted = clips.map((c) => {
+    if (c.trackId !== target.trackId || c.id === target.id) return c;
+    if (c.startTime >= target.startTime + target.duration - 0.01) {
+      return {
+        ...c,
+        startTime: Number((c.startTime + target.duration).toFixed(2)),
+      };
+    }
+    return c;
+  });
 
   return {
-    moved: true,
-    clips: clips.map((c) => {
-      if (c.id === second.id) return { ...c, startTime: newFirstStart };
-      if (c.id === first.id) return { ...c, startTime: newSecondStart };
-      return c;
-    }),
+    clips: [...shifted, copy],
+    duplicated: copy,
   };
 }
 
 export function trimClipStart(
   clip: TimelineClip,
-  desiredStartTime: number
+  desiredStartTime: number,
+  trackClips: TimelineClip[] = []
 ): Partial<TimelineClip> {
+  const prevNeighborEnd = trackClips
+    .filter((c) => c.id !== clip.id && c.startTime + c.duration <= clip.startTime + 0.05)
+    .reduce((max, c) => Math.max(max, c.startTime + c.duration), 0);
+
   const maxStart = clip.startTime + clip.duration - 0.5;
-  let clampedStart = Math.min(maxStart, Math.max(0, desiredStartTime));
+  let clampedStart = Math.min(maxStart, Math.max(prevNeighborEnd, desiredStartTime));
 
   if (clip.kind === "video" || clip.kind === "audio") {
     const minStartFromSource = clip.startTime - clip.inPoint / clip.speed;
@@ -137,6 +356,32 @@ export function trimClipStart(
     startTime: clampedStart,
     duration: Math.max(0.5, nextDuration),
     inPoint: nextInPoint,
+  };
+}
+
+export function trimClipEnd(
+  clip: TimelineClip,
+  desiredDuration: number,
+  trackClips: TimelineClip[] = []
+): Partial<TimelineClip> {
+  const sourceMaxDur =
+    clip.kind === "image" || clip.kind === "text"
+      ? 60
+      : Math.max(0.5, (clip.sourceDuration - clip.inPoint) / clip.speed);
+
+  const nextNeighborStart = trackClips
+    .filter((c) => c.id !== clip.id && c.startTime >= clip.startTime + clip.duration - 0.05)
+    .reduce((min, c) => Math.min(min, c.startTime), Number.POSITIVE_INFINITY);
+
+  const neighborMaxDur = Number.isFinite(nextNeighborStart)
+    ? Math.max(0.5, Number((nextNeighborStart - clip.startTime).toFixed(2)))
+    : Number.POSITIVE_INFINITY;
+
+  const maxDur = Math.min(sourceMaxDur, neighborMaxDur);
+  const clamped = Math.min(maxDur, Math.max(0.5, Number(desiredDuration.toFixed(2))));
+
+  return {
+    duration: Number(clamped.toFixed(2)),
   };
 }
 

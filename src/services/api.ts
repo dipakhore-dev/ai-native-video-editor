@@ -374,13 +374,13 @@ function serializeClipForServer(clip: TimelineClip) {
     trackId: clip.trackId,
     name: clip.name,
     kind: clip.kind,
-    startTime: clip.startTime,
-    duration: clip.duration,
-    inPoint: clip.inPoint,
-    sourceDuration: clip.sourceDuration,
-    volume: clip.volume,
-    speed: clip.speed,
-    opacity: clip.opacity,
+    startTime: Math.max(0, Number(clip.startTime.toFixed(2))),
+    duration: Math.max(0.1, Number(clip.duration.toFixed(2))),
+    inPoint: Math.max(0, Number(clip.inPoint.toFixed(2))),
+    sourceDuration: Math.max(0, Number(clip.sourceDuration.toFixed(2))),
+    volume: Math.min(1, Math.max(0, Number(clip.volume.toFixed(3)))),
+    speed: Math.min(4, Math.max(0.25, Number(clip.speed.toFixed(2)))),
+    opacity: Math.min(1, Math.max(0, Number(clip.opacity.toFixed(3)))),
     ...(clip.sourceName ? { sourceName: clip.sourceName } : {}),
     ...(clip.sourceSizeBytes !== undefined ? { sourceSizeBytes: clip.sourceSizeBytes } : {}),
     ...(clip.sourceMimeType ? { sourceMimeType: clip.sourceMimeType } : {}),
@@ -427,6 +427,30 @@ export async function createServerProject(
       ...(project.subtitleStyle ? { subtitleStyle: project.subtitleStyle } : {}),
       ...(project.subtitleMeta ? { subtitleMeta: project.subtitleMeta } : {}),
     }),
+  });
+}
+
+export async function updateServerProject(
+  projectId: string,
+  updates: {
+    name?: string;
+    description?: string;
+    aspectRatio?: "16:9" | "9:16" | "1:1";
+    resolution?: "720p" | "1080p" | "4K";
+    fps?: 24 | 30 | 60;
+  }
+): Promise<ApiResult<{ status: string; project: ServerProjectDto }>> {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+}
+
+export async function deleteServerProject(
+  projectId: string
+): Promise<ApiResult<{ status: string; deleted: boolean }>> {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
   });
 }
 

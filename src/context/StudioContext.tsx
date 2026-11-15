@@ -1,12 +1,15 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
   createServerProject,
+  deleteServerProject,
   fetchCurrentAuthUser,
   fetchIntegrationStatus,
   fetchServerProjects,
   mapServerProjectToStudioProject,
   saveServerProjectSubtitles,
+  saveServerProjectTimeline,
   submitAuthLogout,
+  updateServerProject,
   type AuthUserDto,
 } from "../services/api";
 import type {
@@ -27,8 +30,13 @@ import type {
 import { extractMediaAsset } from "../utils/media";
 import {
   createDefaultTracks,
+  duplicateClipWithoutOverlap,
   ensureProjectTracks,
+  insertClipOnTrack,
+  moveClipWithTrackOrdering,
+  packTrackClips,
   reorderClipOnTrack,
+  reorderClipToIndex,
   splitClipAtTimestamp,
 } from "../utils/timeline";
 import {
@@ -93,7 +101,16 @@ interface StudioContextValue {
   commitProjectSnapshot: (beforeSnapshot: Project) => void;
   splitClipAtTime: (clipId: string, playheadTime: number) => boolean;
   reorderClip: (clipId: string, direction: "earlier" | "later") => boolean;
-  duplicateClip: (clipId: string) => void;
+  reorderClipToSlot: (clipId: string, targetIndex: number) => boolean;
+  moveClipOnTimeline: (
+    clipId: string,
+    desiredStartTime: number,
+    targetTrackId?: string,
+    recordHistory?: boolean,
+    syncBase?: { clips: TimelineClip[]; subtitles?: SubtitleSegment[] }
+  ) => void;
+  packTrackGaps: (trackId: string) => boolean;
+  duplicateClip: (clipId: string) => TimelineClip | null;
   deleteClip: (clipId: string) => void;
   toggleTrackMute: (trackId: string) => void;
   toggleTrackLock: (trackId: string) => void;
@@ -128,6 +145,12 @@ interface StudioContextValue {
   redo: () => void;
   lastLocalSaveAt: string | null;
   saveTimelineLocally: () => void;
+  mongoSaveStatus: "idle" | "saving" | "saved" | "error";
+  lastMongoSaveAt: string | null;
+  mongoSaveError: string | null;
+  saveTimelineToMongo: (
+    overrideProjectId?: string
+  ) => Promise<{ ok: boolean; error?: string; projectId?: string }>;
   exportAttempts: ExportAttempt[];
   recordExportAttempt: (attempt: ExportAttempt) => void;
   integrations: IntegrationStatusMap | null;
@@ -207,6 +230,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [undoStack, setUndoStack] = useState<Project[]>([]);
   const [redoStack, setRedoStack] = useState<Project[]>([]);
   const [lastLocalSaveAt, setLastLocalSaveAt] = useState<string | null>(initialSaved.savedAt);
+  const [mongoSaveStatus, setMongoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [lastMongoSaveAt, setLastMongoSaveAt] = useState<string | null>(null);
+  const [mongoSaveError, setMongoSaveError] = useState<string | null>(null);
 
   const [sessionUser, setSessionUser] = useState<SessionUser>({
     displayName: "Elena Vance",
@@ -383,13 +409,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [setActiveProjectId]
   );
 
-  const renameProject = useCallback((id: string, name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setProjects((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, name: trimmed, updatedAt: new Date().toISOString() } : p))
-    );
-  }, []);
+  const renameProject = useCallback(
+    (id: string, name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      setProjects((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, name: trimmed, updatedAt: new Date().toISOString() } : p))
+      );
+      if (isAuthenticated && MONGO_OBJECT_ID_RE.test(id)) {
+        void updateServerProject(id, { name: trimmed });
+      }
+    },
+    [isAuthenticated]
+  );
 
   const duplicateProject = useCallback((id: string) => {
     setProjects((prev) => {
@@ -429,8 +461,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       if (activeProjectId === id) {
         setActiveProjectId(null);
       }
+      if (isAuthenticated && MONGO_OBJECT_ID_RE.test(id)) {
+        void deleteServerProject(id);
+      }
     },
-    [activeProjectId, setActiveProjectId]
+    [activeProjectId, isAuthenticated, setActiveProjectId]
   );
 
   const uploadLocalFiles = useCallback(async (files: FileList | File[]): Promise<MediaAsset[]> => {
@@ -633,7 +668,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             sourceMimeType: asset.mimeType,
             needsRelink: false,
           };
-          createdClip = clip;
+
+          const nextClips =
+            explicitStartTime !== undefined
+              ? insertClipOnTrack(proj.clips, clip, clip.startTime)
+              : [...proj.clips, clip];
+          createdClip = nextClips.find((c) => c.id === clip.id) ?? clip;
 
           setUndoStack((stack) => [...stack.slice(-(MAX_HISTORY_ENTRIES - 1)), cloneProject(proj)]);
           setRedoStack([]);
@@ -642,7 +682,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             ...proj,
             tracks,
             updatedAt: new Date().toISOString(),
-            clips: [...proj.clips, clip],
+            clips: nextClips,
           };
         });
       });
@@ -822,22 +862,119 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [mutateActiveProject]
   );
 
-  const duplicateClip = useCallback(
-    (clipId: string) => {
+  const reorderClipToSlot = useCallback(
+    (clipId: string, targetIndex: number): boolean => {
+      let didMove = false;
       mutateActiveProject((proj) => {
         const target = proj.clips.find((c) => c.id === clipId);
         if (!target) return proj;
-        const copy: TimelineClip = {
-          ...target,
-          id: `clip_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-          startTime: Number((target.startTime + target.duration).toFixed(2)),
-          textStyle: target.textStyle ? { ...target.textStyle } : undefined,
+        const track = proj.tracks.find((t) => t.id === target.trackId);
+        if (track?.locked) return proj;
+
+        const result = reorderClipToIndex(proj.clips, clipId, targetIndex);
+        didMove = result.moved;
+        if (!result.moved) return proj;
+
+        const nextProj = {
+          ...proj,
+          clips: result.clips,
         };
         return {
-          ...proj,
-          clips: [...proj.clips, copy],
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(proj, nextProj),
         };
       }, true);
+      return didMove;
+    },
+    [mutateActiveProject]
+  );
+
+  const moveClipOnTimeline = useCallback(
+    (
+      clipId: string,
+      desiredStartTime: number,
+      targetTrackId?: string,
+      recordHistory = true,
+      syncBase?: { clips: TimelineClip[]; subtitles?: SubtitleSegment[] }
+    ) => {
+      mutateActiveProject((proj) => {
+        const baseClips = syncBase ? syncBase.clips : proj.clips;
+        const target = baseClips.find((c) => c.id === clipId);
+        if (!target) return proj;
+
+        const destTrackId = targetTrackId || target.trackId;
+        const destTrack = proj.tracks.find((t) => t.id === destTrackId);
+        if (destTrack?.locked) return proj;
+
+        const movedResult = moveClipWithTrackOrdering(
+          baseClips,
+          clipId,
+          desiredStartTime,
+          destTrackId
+        );
+        const baseProj = syncBase
+          ? { ...proj, clips: syncBase.clips, subtitles: syncBase.subtitles }
+          : proj;
+        const nextProj = {
+          ...proj,
+          clips: movedResult.clips,
+        };
+        return {
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(baseProj, nextProj),
+        };
+      }, recordHistory);
+    },
+    [mutateActiveProject]
+  );
+
+  const packTrackGaps = useCallback(
+    (trackId: string): boolean => {
+      let didChange = false;
+      mutateActiveProject((proj) => {
+        const track = proj.tracks.find((t) => t.id === trackId);
+        if (track?.locked) return proj;
+
+        const result = packTrackClips(proj.clips, trackId);
+        didChange = result.changed;
+        if (!result.changed) return proj;
+
+        const nextProj = {
+          ...proj,
+          clips: result.clips,
+        };
+        return {
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(proj, nextProj),
+        };
+      }, true);
+      return didChange;
+    },
+    [mutateActiveProject]
+  );
+
+  const duplicateClip = useCallback(
+    (clipId: string): TimelineClip | null => {
+      let created: TimelineClip | null = null;
+      mutateActiveProject((proj) => {
+        const target = proj.clips.find((c) => c.id === clipId);
+        if (!target) return proj;
+        const track = proj.tracks.find((t) => t.id === target.trackId);
+        if (track?.locked) return proj;
+
+        const { clips: nextClips, duplicated } = duplicateClipWithoutOverlap(proj.clips, clipId);
+        if (!duplicated) return proj;
+        created = duplicated;
+        const nextProj = {
+          ...proj,
+          clips: nextClips,
+        };
+        return {
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(proj, nextProj),
+        };
+      }, true);
+      return created;
     },
     [mutateActiveProject]
   );
@@ -1100,6 +1237,91 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage, projects]
   );
 
+  const saveTimelineToMongo = useCallback(
+    async (
+      overrideProjectId?: string
+    ): Promise<{ ok: boolean; error?: string; projectId?: string }> => {
+      const targetId = overrideProjectId ?? activeProjectId;
+      const targetProject = projects.find((p) => p.id === targetId) ?? activeProject;
+      if (!targetProject) {
+        return { ok: false, error: "No active project selected." };
+      }
+
+      if (!isAuthenticated) {
+        return {
+          ok: false,
+          error: "Sign in to persist timeline changes in MongoDB.",
+        };
+      }
+
+      setMongoSaveStatus("saving");
+      setMongoSaveError(null);
+
+      if (MONGO_OBJECT_ID_RE.test(targetProject.id)) {
+        const res = await saveServerProjectTimeline(targetProject.id, targetProject);
+        if (res.ok) {
+          const savedAt = new Date().toISOString();
+          setMongoSaveStatus("saved");
+          setLastMongoSaveAt(savedAt);
+          return { ok: true, projectId: targetProject.id };
+        }
+        if (res.status !== 404) {
+          const errMsg = res.error || "Failed to save timeline to MongoDB.";
+          setMongoSaveStatus("error");
+          setMongoSaveError(errMsg);
+          return { ok: false, error: errMsg };
+        }
+      }
+
+      const createdRes = await createServerProject(targetProject);
+      if (!createdRes.ok || !createdRes.data?.project) {
+        const errMsg = createdRes.error || "Failed to create project in MongoDB.";
+        setMongoSaveStatus("error");
+        setMongoSaveError(errMsg);
+        return { ok: false, error: errMsg };
+      }
+
+      const mongoId = String(createdRes.data.project._id || createdRes.data.project.id || "");
+      if (!mongoId) {
+        const errMsg = "Server returned a project without an ID.";
+        setMongoSaveStatus("error");
+        setMongoSaveError(errMsg);
+        return { ok: false, error: errMsg };
+      }
+
+      setProjects((prev) => {
+        const nextList = prev.map((p) =>
+          p.id === targetProject.id ? { ...p, id: mongoId } : p
+        );
+        persistProjectsToLocalStorage(nextList);
+        return nextList;
+      });
+      setActiveProjectIdState((curr) => (curr === targetProject.id ? mongoId : curr));
+
+      const savedAt = new Date().toISOString();
+      setMongoSaveStatus("saved");
+      setLastMongoSaveAt(savedAt);
+      return { ok: true, projectId: mongoId };
+    },
+    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage, projects]
+  );
+
+  // Automatic debounced MongoDB persistence when authenticated user edits a Mongo-backed project
+  useEffect(() => {
+    if (!isAuthenticated || !activeProject) return;
+    if (!MONGO_OBJECT_ID_RE.test(activeProject.id) && activeProject.clips.length === 0) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void saveTimelineToMongo(activeProject.id);
+    }, 1500);
+
+    return () => window.clearTimeout(timer);
+    // Re-run whenever active project's timeline revision changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, activeProject?.id, activeProject?.updatedAt]);
+
   const recordExportAttempt = useCallback((attempt: ExportAttempt) => {
     setExportAttempts((prev) => [attempt, ...prev]);
   }, []);
@@ -1135,6 +1357,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     commitProjectSnapshot,
     splitClipAtTime,
     reorderClip,
+    reorderClipToSlot,
+    moveClipOnTimeline,
+    packTrackGaps,
     duplicateClip,
     deleteClip,
     toggleTrackMute,
@@ -1152,6 +1377,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     redo,
     lastLocalSaveAt,
     saveTimelineLocally,
+    mongoSaveStatus,
+    lastMongoSaveAt,
+    mongoSaveError,
+    saveTimelineToMongo,
     exportAttempts,
     recordExportAttempt,
     integrations,

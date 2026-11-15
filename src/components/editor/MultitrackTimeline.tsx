@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   MousePointer2,
   Scissors,
@@ -17,11 +17,13 @@ import {
   ArrowLeft,
   ArrowRight,
   AlertTriangle,
+  Maximize2,
+  AlignHorizontalJustifyStart,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
-import type { Project, TimelineClip } from "../../types/studio";
+import type { MediaKind, Project, TimelineClip, TrackType } from "../../types/studio";
 import { formatTimecode } from "../../utils/media";
-import { trimClipStart } from "../../utils/timeline";
+import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 
 interface MultitrackTimelineProps {
   project: Project;
@@ -32,6 +34,12 @@ interface MultitrackTimelineProps {
   activeTool: "select" | "razor";
   onToolChange: (tool: "select" | "razor") => void;
   totalDuration: number;
+}
+
+function isAssetKindCompatibleWithTrack(kind: MediaKind, trackType: TrackType): boolean {
+  if (kind === "audio") return trackType === "audio";
+  if (kind === "text") return trackType === "text";
+  return trackType === "video" || trackType === "overlay";
 }
 
 export function MultitrackTimeline({
@@ -45,6 +53,10 @@ export function MultitrackTimeline({
   totalDuration,
 }: MultitrackTimelineProps) {
   const {
+    mediaAssets,
+    addClipToTimeline,
+    moveClipOnTimeline,
+    packTrackGaps,
     updateClip,
     commitProjectSnapshot,
     splitClipAtTime,
@@ -62,10 +74,28 @@ export function MultitrackTimeline({
 
   const [zoomPxPerSec, setZoomPxPerSec] = useState(28);
   const [snapEnabled, setSnapEnabled] = useState(true);
+  const [draggingClipId, setDraggingClipId] = useState<string | null>(null);
+  const [dropIndicator, setDropIndicator] = useState<{
+    trackId: string;
+    timeSec: number;
+  } | null>(null);
   const tracksAreaRef = useRef<HTMLDivElement | null>(null);
+  const trackRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const timelineSeconds = Math.max(30, Math.ceil(totalDuration + 10));
   const timelineWidth = timelineSeconds * zoomPxPerSec;
+
+  // Keep playhead in view during playback
+  useEffect(() => {
+    const el = tracksAreaRef.current;
+    if (!el) return;
+    const playheadPx = playheadTime * zoomPxPerSec;
+    const viewLeft = el.scrollLeft;
+    const viewRight = viewLeft + el.clientWidth;
+    if (playheadPx > viewRight - 24 || playheadPx < viewLeft) {
+      el.scrollLeft = Math.max(0, playheadPx - el.clientWidth * 0.25);
+    }
+  }, [playheadTime, zoomPxPerSec]);
 
   const snapTime = (t: number): number => {
     if (!snapEnabled) return Math.max(0, Number(t.toFixed(2)));
@@ -95,6 +125,21 @@ export function MultitrackTimeline({
     window.addEventListener("mouseup", onUp);
   };
 
+  const resolveCompatibleTrackAtY = (clientY: number, clipKind: MediaKind, fallbackTrackId: string): string => {
+    for (const track of project.tracks) {
+      const rowEl = trackRowRefs.current[track.id];
+      if (!rowEl) continue;
+      const rect = rowEl.getBoundingClientRect();
+      if (clientY >= rect.top && clientY <= rect.bottom) {
+        if (!track.locked && isAssetKindCompatibleWithTrack(clipKind, track.type)) {
+          return track.id;
+        }
+        return fallbackTrackId;
+      }
+    }
+    return fallbackTrackId;
+  };
+
   const handleClipMouseDown = (
     e: React.MouseEvent<HTMLDivElement>,
     clip: TimelineClip,
@@ -111,12 +156,15 @@ export function MultitrackTimeline({
       return;
     }
 
-    const initialClip = { ...clip };
+    const initialClips = project.clips.map((c) => ({
+      ...c,
+      textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+    }));
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({
+      clips: initialClips.map((c) => ({
         ...c,
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
       })),
@@ -128,14 +176,22 @@ export function MultitrackTimeline({
     const initialX = e.clientX;
     const initialStart = clip.startTime;
     let moved = false;
+    setDraggingClipId(clip.id);
 
     const onMove = (moveEv: MouseEvent) => {
       const deltaPx = moveEv.clientX - initialX;
-      if (Math.abs(deltaPx) > 2) moved = true;
+      const targetTrackId = resolveCompatibleTrackAtY(
+        moveEv.clientY,
+        clip.kind,
+        clip.trackId
+      );
+      if (Math.abs(deltaPx) > 2 || targetTrackId !== clip.trackId) {
+        moved = true;
+      }
       const deltaSec = deltaPx / zoomPxPerSec;
       const nextStart = snapTime(initialStart + deltaSec);
-      updateClip(clip.id, { startTime: nextStart }, false, {
-        clip: initialClip,
+      moveClipOnTimeline(clip.id, nextStart, targetTrackId, false, {
+        clips: initialClips,
         subtitles: initialSubtitles,
       });
     };
@@ -143,6 +199,7 @@ export function MultitrackTimeline({
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      setDraggingClipId(null);
       if (moved) {
         commitProjectSnapshot(beforeSnapshot);
       }
@@ -162,6 +219,7 @@ export function MultitrackTimeline({
     if (trackLocked) return;
 
     const initialClip = { ...clip };
+    const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
@@ -183,7 +241,7 @@ export function MultitrackTimeline({
       if (Math.abs(deltaPx) > 1) moved = true;
       const deltaSec = deltaPx / zoomPxPerSec;
       const desiredStart = snapTime(initialClip.startTime + deltaSec);
-      const patch = trimClipStart(initialClip, desiredStart);
+      const patch = trimClipStart(initialClip, desiredStart, initialTrackClips);
       updateClip(clip.id, patch, false, {
         clip: initialClip,
         subtitles: initialSubtitles,
@@ -212,6 +270,7 @@ export function MultitrackTimeline({
     if (trackLocked) return;
 
     const initialClip = { ...clip };
+    const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
@@ -227,18 +286,15 @@ export function MultitrackTimeline({
 
     const initialX = e.clientX;
     const initialDur = clip.duration;
-    const maxDur =
-      clip.kind === "image" || clip.kind === "text"
-        ? 60
-        : Math.max(0.5, (clip.sourceDuration - clip.inPoint) / clip.speed);
     let moved = false;
 
     const onMove = (moveEv: MouseEvent) => {
       const deltaPx = moveEv.clientX - initialX;
       if (Math.abs(deltaPx) > 1) moved = true;
       const deltaSec = deltaPx / zoomPxPerSec;
-      const clamped = Math.min(maxDur, Math.max(0.5, snapTime(initialDur + deltaSec)));
-      updateClip(clip.id, { duration: clamped }, false, {
+      const desiredDur = snapTime(initialDur + deltaSec);
+      const patch = trimClipEnd(initialClip, desiredDur, initialTrackClips);
+      updateClip(clip.id, patch, false, {
         clip: initialClip,
         subtitles: initialSubtitles,
       });
@@ -283,7 +339,15 @@ export function MultitrackTimeline({
     }
   };
 
-  const rulerStep = zoomPxPerSec >= 36 ? 2 : zoomPxPerSec >= 20 ? 5 : 10;
+  const handleFitZoom = () => {
+    const viewport = tracksAreaRef.current?.clientWidth || 720;
+    const targetSpan = Math.max(10, totalDuration + 2);
+    const computed = Math.floor((viewport - 32) / targetSpan);
+    setZoomPxPerSec(Math.min(120, Math.max(10, computed)));
+  };
+
+  const rulerStep =
+    zoomPxPerSec >= 70 ? 1 : zoomPxPerSec >= 36 ? 2 : zoomPxPerSec >= 20 ? 5 : 10;
   const markers: number[] = [];
   for (let s = 0; s <= timelineSeconds; s += rulerStep) {
     markers.push(s);
@@ -394,9 +458,14 @@ export function MultitrackTimeline({
           <button
             type="button"
             disabled={!selectedClipId}
-            onClick={() => selectedClipId && duplicateClip(selectedClipId)}
+            onClick={() => {
+              if (!selectedClipId) return;
+              const copy = duplicateClip(selectedClipId);
+              if (copy) onSelectClip(copy.id);
+            }}
             className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white disabled:opacity-35 transition-colors"
             title="Duplicate selected clip"
+            aria-label="Duplicate selected clip"
           >
             <Copy className="h-3.5 w-3.5" />
           </button>
@@ -412,8 +481,20 @@ export function MultitrackTimeline({
             }}
             className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-rose-400 disabled:opacity-35 transition-colors"
             title="Delete selected clip (Del)"
+            aria-label="Delete selected clip"
           >
             <Trash2 className="h-3.5 w-3.5" />
+          </button>
+
+          <button
+            type="button"
+            disabled={project.clips.filter((c) => c.trackId === "track_v1").length === 0}
+            onClick={() => packTrackGaps("track_v1")}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35 transition-colors"
+            title="Pack V1 clips back-to-back to close timeline gaps"
+          >
+            <AlignHorizontalJustifyStart className="h-3.5 w-3.5 text-cyan-400" />
+            <span className="hidden md:inline">Close Gaps</span>
           </button>
         </div>
 
@@ -435,7 +516,7 @@ export function MultitrackTimeline({
           <div className="flex items-center gap-1.5">
             <button
               type="button"
-              onClick={() => setZoomPxPerSec((z) => Math.max(12, z - 6))}
+              onClick={() => setZoomPxPerSec((z) => Math.max(10, z - 8))}
               className="p-1 text-zinc-400 hover:text-white"
               aria-label="Zoom out timeline"
             >
@@ -443,8 +524,8 @@ export function MultitrackTimeline({
             </button>
             <input
               type="range"
-              min={12}
-              max={64}
+              min={10}
+              max={120}
               value={zoomPxPerSec}
               onChange={(e) => setZoomPxPerSec(Number(e.target.value))}
               className="w-20 accent-violet-500"
@@ -452,11 +533,20 @@ export function MultitrackTimeline({
             />
             <button
               type="button"
-              onClick={() => setZoomPxPerSec((z) => Math.min(64, z + 6))}
+              onClick={() => setZoomPxPerSec((z) => Math.min(120, z + 8))}
               className="p-1 text-zinc-400 hover:text-white"
               aria-label="Zoom in timeline"
             >
               <ZoomIn className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={handleFitZoom}
+              className="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-white"
+              title="Fit sequence to timeline width"
+              aria-label="Fit timeline zoom"
+            >
+              <Maximize2 className="h-3 w-3" />
             </button>
           </div>
         </div>
@@ -506,6 +596,14 @@ export function MultitrackTimeline({
           ref={tracksAreaRef}
           className="flex-1 overflow-x-auto overflow-y-hidden relative bg-[#09090B]"
           onClick={() => onSelectClip(null)}
+          onWheel={(e) => {
+            if (e.ctrlKey || e.metaKey || e.altKey) {
+              e.preventDefault();
+              setZoomPxPerSec((z) =>
+                Math.min(120, Math.max(10, z + (e.deltaY < 0 ? 6 : -6)))
+              );
+            }
+          }}
         >
           <div style={{ width: `${timelineWidth}px` }} className="relative">
             {/* Time Ruler */}
@@ -527,20 +625,70 @@ export function MultitrackTimeline({
             {/* Track Lanes */}
             {project.tracks.map((track) => {
               const trackClips = project.clips.filter((c) => c.trackId === track.id);
+              const isDropTarget = dropIndicator?.trackId === track.id;
               return (
                 <div
                   key={track.id}
+                  ref={(el) => {
+                    trackRowRefs.current[track.id] = el;
+                  }}
                   onMouseDown={(e) => {
                     if (e.target === e.currentTarget) {
                       onSeek(clientXToTime(e.clientX));
                     }
                   }}
-                  className={`h-14 border-b border-zinc-800/60 relative ${
-                    track.locked ? "bg-zinc-950/80 opacity-75" : ""
+                  onDragOver={(e) => {
+                    if (track.locked) return;
+                    if (e.dataTransfer.types.includes("application/x-ai-studio-asset-id")) {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = "copy";
+                      setDropIndicator({
+                        trackId: track.id,
+                        timeSec: snapTime(clientXToTime(e.clientX)),
+                      });
+                    }
+                  }}
+                  onDragLeave={() => {
+                    if (dropIndicator?.trackId === track.id) {
+                      setDropIndicator(null);
+                    }
+                  }}
+                  onDrop={(e) => {
+                    const assetId = e.dataTransfer.getData("application/x-ai-studio-asset-id");
+                    setDropIndicator(null);
+                    if (!assetId || track.locked) return;
+                    e.preventDefault();
+                    const asset = mediaAssets.find((a) => a.id === assetId);
+                    if (!asset) return;
+                    const dropTime = snapTime(clientXToTime(e.clientX));
+                    const targetTrackId = isAssetKindCompatibleWithTrack(asset.kind, track.type)
+                      ? track.id
+                      : asset.kind === "audio"
+                        ? "track_a1"
+                        : "track_v1";
+                    const created = addClipToTimeline(asset, targetTrackId, dropTime);
+                    if (created) {
+                      onSelectClip(created.id);
+                    }
+                  }}
+                  className={`h-14 border-b border-zinc-800/60 relative transition-colors ${
+                    track.locked
+                      ? "bg-zinc-950/80 opacity-75"
+                      : isDropTarget
+                        ? "bg-violet-500/10"
+                        : ""
                   }`}
                 >
+                  {isDropTarget && dropIndicator && (
+                    <div
+                      style={{ left: `${dropIndicator.timeSec * zoomPxPerSec}px` }}
+                      className="absolute top-0 bottom-0 w-0.5 bg-cyan-400 pointer-events-none z-20"
+                    />
+                  )}
+
                   {trackClips.map((clip) => {
                     const isSelected = clip.id === selectedClipId;
+                    const isDragging = clip.id === draggingClipId;
                     const leftPx = clip.startTime * zoomPxPerSec;
                     const widthPx = Math.max(28, clip.duration * zoomPxPerSec);
                     const colorClasses =
@@ -562,7 +710,11 @@ export function MultitrackTimeline({
                             ? "cursor-crosshair"
                             : "cursor-grab active:cursor-grabbing"
                         } ${colorClasses} ${
-                          isSelected ? "ring-2 ring-white/90 z-10" : "hover:brightness-110"
+                          isDragging
+                            ? "ring-2 ring-cyan-400 opacity-90 z-20"
+                            : isSelected
+                              ? "ring-2 ring-white/90 z-10"
+                              : "hover:brightness-110"
                         }`}
                       >
                         {/* Left Trim Handle */}
