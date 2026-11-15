@@ -1,4 +1,5 @@
-import type { MediaAsset, MediaKind } from "../types/studio";
+import type { MediaAsset, MediaKind, TimelineClip } from "../types/studio";
+import { getMediaFromIndexedDB } from "./mediaStorage";
 
 export function formatTimecode(seconds: number, showFrames = false, fps = 30): string {
   const clamped = Math.max(0, seconds);
@@ -27,6 +28,13 @@ export function formatBytes(bytes: number): string {
   return `${value >= 10 || idx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[idx]}`;
 }
 
+export function generateStableAssetId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `asset_${crypto.randomUUID()}`;
+  }
+  return `asset_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function detectMediaKind(file: File): MediaKind | null {
   if (file.type.startsWith("video/")) return "video";
   if (file.type.startsWith("image/")) return "image";
@@ -39,132 +47,187 @@ export function detectMediaKind(file: File): MediaKind | null {
   return null;
 }
 
-export async function extractMediaAsset(file: File): Promise<MediaAsset> {
+export async function extractMediaAsset(
+  file: File,
+  overrideAssetId?: string
+): Promise<MediaAsset> {
   const kind = detectMediaKind(file);
-  if (!kind) {
+  if (!kind || kind === "text") {
     throw new Error(`Unsupported file type: ${file.name}`);
   }
 
   const objectUrl = URL.createObjectURL(file);
-  const id = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const id = overrideAssetId || generateStableAssetId();
 
-  if (kind === "image") {
-    const dimensions = await new Promise<{ width: number; height: number }>((resolve) => {
-      const img = new Image();
-      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-      img.onerror = () => resolve({ width: 1920, height: 1080 });
-      img.src = objectUrl;
-    });
-
-    return {
-      id,
-      name: file.name,
-      kind,
-      mimeType: file.type || "image/png",
-      sizeBytes: file.size,
-      duration: 5,
-      width: dimensions.width,
-      height: dimensions.height,
-      objectUrl,
-      thumbnailUrl: objectUrl,
-      sourceFile: file,
-      addedAt: new Date().toISOString(),
-    };
-  }
-
-  if (kind === "audio") {
-    const duration = await new Promise<number>((resolve) => {
-      const audio = document.createElement("audio");
-      audio.preload = "metadata";
-      audio.onloadedmetadata = () => {
-        resolve(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
-      };
-      audio.onerror = () => resolve(10);
-      audio.src = objectUrl;
-    });
-
-    return {
-      id,
-      name: file.name,
-      kind,
-      mimeType: file.type || "audio/mpeg",
-      sizeBytes: file.size,
-      duration,
-      objectUrl,
-      sourceFile: file,
-      addedAt: new Date().toISOString(),
-    };
-  }
-
-  // Video inspection + canvas thumbnail capture
-  const videoInfo = await new Promise<{
-    duration: number;
-    width: number;
-    height: number;
-    thumbnailUrl?: string;
-  }>((resolve) => {
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.muted = true;
-    video.playsInline = true;
-
-    let settled = false;
-    const finish = (thumb?: string) => {
-      if (settled) return;
-      settled = true;
-      resolve({
-        duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 8,
-        width: video.videoWidth || 1920,
-        height: video.videoHeight || 1080,
-        thumbnailUrl: thumb,
+  try {
+    if (kind === "image") {
+      const dimensions = await new Promise<{ width: number; height: number }>((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+        img.onerror = () => resolve({ width: 1920, height: 1080 });
+        img.src = objectUrl;
       });
-    };
 
-    video.onloadeddata = () => {
-      const targetSeek = Math.min(0.6, Math.max(0.05, (video.duration || 1) * 0.1));
-      try {
-        video.currentTime = targetSeek;
-      } catch {
-        finish(undefined);
-      }
-    };
+      return {
+        id,
+        name: file.name,
+        kind,
+        mimeType: file.type || "image/png",
+        sizeBytes: file.size,
+        duration: 5,
+        width: dimensions.width,
+        height: dimensions.height,
+        objectUrl,
+        thumbnailUrl: objectUrl,
+        sourceFile: file,
+        addedAt: new Date().toISOString(),
+      };
+    }
 
-    video.onseeked = () => {
-      try {
-        const canvas = document.createElement("canvas");
-        const w = 320;
-        const h = Math.max(180, Math.round((video.videoHeight / (video.videoWidth || 16)) * w) || 180);
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, w, h);
-          finish(canvas.toDataURL("image/jpeg", 0.78));
-          return;
+    if (kind === "audio") {
+      const duration = await new Promise<number>((resolve) => {
+        const audio = document.createElement("audio");
+        audio.preload = "metadata";
+        audio.onloadedmetadata = () => {
+          resolve(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
+        };
+        audio.onerror = () => resolve(10);
+        audio.src = objectUrl;
+      });
+
+      return {
+        id,
+        name: file.name,
+        kind,
+        mimeType: file.type || "audio/mpeg",
+        sizeBytes: file.size,
+        duration,
+        objectUrl,
+        sourceFile: file,
+        addedAt: new Date().toISOString(),
+      };
+    }
+
+    // Video inspection + canvas thumbnail capture
+    const videoInfo = await new Promise<{
+      duration: number;
+      width: number;
+      height: number;
+      thumbnailUrl?: string;
+    }>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+
+      let settled = false;
+      const finish = (thumb?: string) => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 8,
+          width: video.videoWidth || 1920,
+          height: video.videoHeight || 1080,
+          thumbnailUrl: thumb,
+        });
+      };
+
+      video.onloadeddata = () => {
+        const targetSeek = Math.min(0.6, Math.max(0.05, (video.duration || 1) * 0.1));
+        try {
+          video.currentTime = targetSeek;
+        } catch {
+          finish(undefined);
         }
-      } catch {
-        // Fallback if canvas capture blocked
-      }
-      finish(undefined);
+      };
+
+      video.onseeked = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          const w = 320;
+          const h = Math.max(180, Math.round((video.videoHeight / (video.videoWidth || 16)) * w) || 180);
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, w, h);
+            finish(canvas.toDataURL("image/jpeg", 0.78));
+            return;
+          }
+        } catch {
+          // Fallback if canvas capture blocked
+        }
+        finish(undefined);
+      };
+
+      video.onerror = () => finish(undefined);
+      setTimeout(() => finish(undefined), 3500);
+      video.src = objectUrl;
+    });
+
+    return {
+      id,
+      name: file.name,
+      kind,
+      mimeType: file.type || "video/mp4",
+      sizeBytes: file.size,
+      duration: videoInfo.duration,
+      width: videoInfo.width,
+      height: videoInfo.height,
+      objectUrl,
+      thumbnailUrl: videoInfo.thumbnailUrl,
+      sourceFile: file,
+      addedAt: new Date().toISOString(),
     };
+  } catch (err) {
+    URL.revokeObjectURL(objectUrl);
+    throw err;
+  }
+}
 
-    video.onerror = () => finish(undefined);
-    setTimeout(() => finish(undefined), 3500);
-    video.src = objectUrl;
-  });
+/**
+ * Resolves the actual File bytes for a TimelineClip across in-memory sourceFile,
+ * IndexedDB persistent local media store, or an active blob: object URL.
+ */
+export async function resolveClipSourceFile(
+  clip: TimelineClip,
+  mediaAssets: MediaAsset[]
+): Promise<File> {
+  const asset = mediaAssets.find((a) => a.id === clip.assetId);
+  if (asset?.sourceFile && asset.sourceFile.size > 0) {
+    return asset.sourceFile;
+  }
 
-  return {
-    id,
-    name: file.name,
-    kind,
-    mimeType: file.type || "video/mp4",
-    sizeBytes: file.size,
-    duration: videoInfo.duration,
-    width: videoInfo.width,
-    height: videoInfo.height,
-    objectUrl,
-    thumbnailUrl: videoInfo.thumbnailUrl,
-    sourceFile: file,
-    addedAt: new Date().toISOString(),
-  };
+  // Fallback directly to IndexedDB using stable assetId (ensures export/subtitles work even right after reload)
+  try {
+    const stored = await getMediaFromIndexedDB(clip.assetId);
+    if (stored?.blob && stored.blob.size > 0) {
+      const filename = stored.name || clip.sourceName || clip.name || "clip.mp4";
+      return new File([stored.blob], filename, {
+        type: stored.mimeType || stored.blob.type || clip.sourceMimeType || "video/mp4",
+      });
+    }
+  } catch {
+    // Continue to object URL fallback if IndexedDB read is unavailable
+  }
+
+  const candidateUrl = clip.objectUrl || asset?.objectUrl || "";
+  if (candidateUrl.startsWith("blob:")) {
+    const response = await fetch(candidateUrl);
+    if (!response.ok) {
+      throw new Error(`Unable to read local file bytes for '${clip.name}'.`);
+    }
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      throw new Error(`Local media file for '${clip.name}' is empty.`);
+    }
+    const filename = clip.sourceName || clip.name || "clip.mp4";
+    return new File([blob], filename, {
+      type: blob.type || clip.sourceMimeType || "video/mp4",
+    });
+  }
+
+  throw new Error(
+    `Original media bytes for '${clip.sourceName || clip.name}' were not found in this browser's IndexedDB storage. Use "Re-link File" to restore it.`
+  );
 }

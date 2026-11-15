@@ -1,9 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
+  createServerMediaMetadata,
   createServerProject,
+  deleteServerMediaMetadata,
   deleteServerProject,
   fetchCurrentAuthUser,
   fetchIntegrationStatus,
+  fetchServerMediaAssets,
   fetchServerProjects,
   mapServerProjectToStudioProject,
   saveServerProjectSubtitles,
@@ -18,6 +21,7 @@ import type {
   ExportAttempt,
   IntegrationStatusMap,
   MediaAsset,
+  MediaKind,
   Project,
   ResolutionOption,
   SessionUser,
@@ -28,6 +32,21 @@ import type {
   TimelineClip,
 } from "../types/studio";
 import { extractMediaAsset } from "../utils/media";
+import {
+  checkStorageQuotaForBytes,
+  deleteMediaFromIndexedDB,
+  estimateBrowserStorage,
+  findOrphanedAssetIds,
+  findProjectsUsingAsset,
+  getAllMediaFromIndexedDB,
+  hydrateAssetFromStoredRecord,
+  MediaStorageQuotaError,
+  reconcileProjectsWithMediaAssets,
+  reconcileProjectWithMediaAssets,
+  saveMediaToIndexedDB,
+  type BrowserStorageEstimate,
+  type StoredMediaRecord,
+} from "../utils/mediaStorage";
 import {
   createDefaultTracks,
   duplicateClipWithoutOverlap,
@@ -80,10 +99,22 @@ interface StudioContextValue {
   deleteProject: (id: string) => void;
   mediaAssets: MediaAsset[];
   uploadingMedia: boolean;
+  idbHydrating: boolean;
+  storageEstimate: BrowserStorageEstimate | null;
+  refreshStorageEstimate: () => Promise<void>;
   mediaError: string | null;
   clearMediaError: () => void;
   uploadLocalFiles: (files: FileList | File[]) => Promise<MediaAsset[]>;
-  removeMediaAsset: (assetId: string) => void;
+  relinkMissingClipAsset: (
+    assetId: string,
+    file: File
+  ) => Promise<{ ok: boolean; error?: string }>;
+  getProjectsUsingAsset: (assetId: string) => Project[];
+  removeMediaAsset: (
+    assetId: string,
+    force?: boolean
+  ) => Promise<{ deleted: boolean; blockedByProjects?: Project[]; error?: string }>;
+  cleanupUnusedMediaAssets: () => Promise<number>;
   totalMediaBytes: number;
   addClipToTimeline: (asset: MediaAsset, trackId?: string, startTime?: number) => TimelineClip | null;
   addTextOverlay: (text?: string, startTime?: number) => TimelineClip | null;
@@ -194,8 +225,9 @@ function loadSavedProjects(): { projects: Project[]; savedAt: string | null } {
       tracks: ensureProjectTracks(p.tracks || createDefaultTracks()),
       clips: (p.clips || []).map((c) => ({
         ...c,
-        // Blob object URLs expire across browser page reloads; mark non-text clips for local relinking
-        needsRelink: c.kind !== "text" && c.objectUrl.startsWith("blob:"),
+        // Never treat persisted blob URLs as permanent references; IndexedDB hydration regenerates fresh URLs
+        objectUrl: "",
+        needsRelink: false,
       })),
       subtitles: Array.isArray(p.subtitles) ? p.subtitles : [],
     }));
@@ -220,6 +252,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
   const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>([]);
   const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [idbHydrating, setIdbHydrating] = useState(true);
+  const [storageEstimate, setStorageEstimate] = useState<BrowserStorageEstimate | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [exportAttempts, setExportAttempts] = useState<ExportAttempt[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationStatusMap | null>(null);
@@ -233,6 +267,46 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [mongoSaveStatus, setMongoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [lastMongoSaveAt, setLastMongoSaveAt] = useState<string | null>(null);
   const [mongoSaveError, setMongoSaveError] = useState<string | null>(null);
+
+  // Refs for leak-free Object URL tracking and async startup reconciliation (IndexedDB vs MongoDB fetch order)
+  const activeObjectUrlsRef = useRef<Map<string, string>>(new Map());
+  const mediaAssetsRef = useRef<MediaAsset[]>([]);
+  const projectsRef = useRef<Project[]>(initialSaved.projects);
+  const idbHydratedRef = useRef(false);
+  const serverMediaIdByClientIdRef = useRef<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    mediaAssetsRef.current = mediaAssets;
+  }, [mediaAssets]);
+
+  useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
+
+  const registerTrackedObjectUrl = useCallback((assetId: string, nextUrl: string) => {
+    const prevUrl = activeObjectUrlsRef.current.get(assetId);
+    if (prevUrl && prevUrl !== nextUrl && prevUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(prevUrl);
+    }
+    if (nextUrl.startsWith("blob:")) {
+      activeObjectUrlsRef.current.set(assetId, nextUrl);
+    } else {
+      activeObjectUrlsRef.current.delete(assetId);
+    }
+  }, []);
+
+  const revokeTrackedObjectUrl = useCallback((assetId: string) => {
+    const prevUrl = activeObjectUrlsRef.current.get(assetId);
+    if (prevUrl && prevUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(prevUrl);
+    }
+    activeObjectUrlsRef.current.delete(assetId);
+  }, []);
+
+  const refreshStorageEstimate = useCallback(async () => {
+    const estimate = await estimateBrowserStorage();
+    setStorageEstimate(estimate);
+  }, []);
 
   const [sessionUser, setSessionUser] = useState<SessionUser>({
     displayName: "Elena Vance",
@@ -287,7 +361,22 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         defaultResolution: user.defaultResolution,
       });
 
-      const projRes = await fetchServerProjects();
+      const [projRes, serverMediaRes] = await Promise.all([
+        fetchServerProjects(),
+        fetchServerMediaAssets(),
+      ]);
+
+      if (serverMediaRes.ok && serverMediaRes.data?.assets) {
+        const nextMap = new Map<string, string>();
+        for (const item of serverMediaRes.data.assets) {
+          const serverId = String(item._id || item.id || "");
+          if (serverId && item.storageKey) {
+            nextMap.set(item.storageKey, serverId);
+          }
+        }
+        serverMediaIdByClientIdRef.current = nextMap;
+      }
+
       if (projRes.ok && projRes.data?.projects) {
         const serverProjects = projRes.data.projects.map(mapServerProjectToStudioProject);
         setProjects((prev) => {
@@ -295,7 +384,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           const mergedServer = serverProjects.map((sp) => {
             const existing = prevById.get(sp.id);
             if (!existing) return sp;
-            // Preserve live in-session blob URLs & thumbnails if same clips exist
             return {
               ...sp,
               clips: sp.clips.map((sc) => {
@@ -315,7 +403,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           const serverIds = new Set(mergedServer.map((p) => p.id));
           const localOnly = prev.filter((p) => !serverIds.has(p.id) && !MONGO_OBJECT_ID_RE.test(p.id));
           const combined = [...localOnly, ...mergedServer];
-          return combined;
+          return reconcileProjectsWithMediaAssets(
+            combined,
+            mediaAssetsRef.current,
+            idbHydratedRef.current
+          );
         });
 
         setActiveProjectIdState((curr) => {
@@ -329,6 +421,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const logoutSession = useCallback(async () => {
     await submitAuthLogout();
+    serverMediaIdByClientIdRef.current.clear();
     setSessionUser({
       displayName: "Elena Vance",
       email: "editor@local.session",
@@ -339,10 +432,70 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  // Hydrate persistent local media from IndexedDB and revoke object URLs cleanly on unmount
   useEffect(() => {
+    let cancelled = false;
+
+    const hydrateLocalIndexedDb = async () => {
+      setIdbHydrating(true);
+      try {
+        const records = await getAllMediaFromIndexedDB();
+        const hydrated = records.map(hydrateAssetFromStoredRecord);
+
+        if (cancelled) {
+          for (const asset of hydrated) {
+            if (asset.objectUrl.startsWith("blob:")) {
+              URL.revokeObjectURL(asset.objectUrl);
+            }
+          }
+          return;
+        }
+
+        for (const asset of hydrated) {
+          registerTrackedObjectUrl(asset.id, asset.objectUrl);
+        }
+
+        mediaAssetsRef.current = hydrated;
+        idbHydratedRef.current = true;
+        setMediaAssets(hydrated);
+        setProjects((prev) => reconcileProjectsWithMediaAssets(prev, hydrated, true));
+      } catch (err) {
+        idbHydratedRef.current = true;
+        if (!cancelled) {
+          setProjects((prev) => reconcileProjectsWithMediaAssets(prev, mediaAssetsRef.current, true));
+          setMediaError(
+            err instanceof Error
+              ? `Local IndexedDB media could not be restored: ${err.message}`
+              : "Local IndexedDB media storage is unavailable in this browser."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIdbHydrating(false);
+          void refreshStorageEstimate();
+        }
+      }
+    };
+
+    void hydrateLocalIndexedDb();
     void refreshIntegrations();
     void hydrateAuthenticatedWorkspace();
-  }, [refreshIntegrations, hydrateAuthenticatedWorkspace]);
+
+    return () => {
+      cancelled = true;
+      for (const url of activeObjectUrlsRef.current.values()) {
+        if (url.startsWith("blob:")) {
+          URL.revokeObjectURL(url);
+        }
+      }
+      activeObjectUrlsRef.current.clear();
+    };
+  }, [
+    hydrateAuthenticatedWorkspace,
+    refreshIntegrations,
+    refreshStorageEstimate,
+    registerTrackedObjectUrl,
+  ]);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeProjectId) ?? null,
@@ -361,6 +514,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         ...p,
         clips: p.clips.map((c) => ({
           ...c,
+          // Never store temporary blob URLs in persistent localStorage; store stable assetId & metadata
+          objectUrl: "",
           thumbnailUrl: c.thumbnailUrl?.startsWith("data:") ? c.thumbnailUrl : undefined,
         })),
       }));
@@ -455,93 +610,341 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const cleanupOrphanedAssets = useCallback(
+    async (candidateAssetIds: string[], remainingProjects: Project[]): Promise<number> => {
+      const orphanedIds = findOrphanedAssetIds(candidateAssetIds, remainingProjects);
+      if (orphanedIds.length === 0) return 0;
+
+      const orphanedSet = new Set(orphanedIds);
+      for (const assetId of orphanedIds) {
+        try {
+          await deleteMediaFromIndexedDB(assetId);
+        } catch {
+          // Continue revoking/cleaning remaining entries even if one IDB record is already missing
+        }
+        revokeTrackedObjectUrl(assetId);
+
+        const serverMediaId = serverMediaIdByClientIdRef.current.get(assetId);
+        if (serverMediaId && isAuthenticated) {
+          serverMediaIdByClientIdRef.current.delete(assetId);
+          void deleteServerMediaMetadata(serverMediaId);
+        }
+      }
+
+      setMediaAssets((prev) => prev.filter((a) => !orphanedSet.has(a.id)));
+      void refreshStorageEstimate();
+      return orphanedIds.length;
+    },
+    [isAuthenticated, refreshStorageEstimate, revokeTrackedObjectUrl]
+  );
+
   const deleteProject = useCallback(
     (id: string) => {
-      setProjects((prev) => prev.filter((p) => p.id !== id));
+      const currentProjects = projectsRef.current;
+      const targetProject = currentProjects.find((p) => p.id === id);
+      const remainingProjects = currentProjects.filter((p) => p.id !== id);
+      const candidateAssetIds = targetProject
+        ? targetProject.clips
+            .filter((c) => c.kind !== "text" && Boolean(c.assetId))
+            .map((c) => c.assetId)
+        : [];
+
+      setProjects(remainingProjects);
+      persistProjectsToLocalStorage(remainingProjects);
       if (activeProjectId === id) {
         setActiveProjectId(null);
       }
       if (isAuthenticated && MONGO_OBJECT_ID_RE.test(id)) {
         void deleteServerProject(id);
       }
+      if (candidateAssetIds.length > 0) {
+        void cleanupOrphanedAssets(candidateAssetIds, remainingProjects);
+      }
     },
-    [activeProjectId, isAuthenticated, setActiveProjectId]
+    [
+      activeProjectId,
+      cleanupOrphanedAssets,
+      isAuthenticated,
+      persistProjectsToLocalStorage,
+      setActiveProjectId,
+    ]
   );
 
-  const uploadLocalFiles = useCallback(async (files: FileList | File[]): Promise<MediaAsset[]> => {
-    const fileArray = Array.from(files);
-    if (fileArray.length === 0) return [];
-    setUploadingMedia(true);
-    setMediaError(null);
+  const syncAssetMetadataToMongo = useCallback(
+    async (asset: MediaAsset) => {
+      if (!isAuthenticated || asset.kind === "text") return;
+      if (serverMediaIdByClientIdRef.current.has(asset.id)) return;
 
-    const added: MediaAsset[] = [];
-    const failures: string[] = [];
+      const projectId =
+        activeProjectId && MONGO_OBJECT_ID_RE.test(activeProjectId) ? activeProjectId : null;
 
-    for (const file of fileArray) {
-      try {
-        const asset = await extractMediaAsset(file);
-        added.push(asset);
-      } catch (err) {
-        failures.push(err instanceof Error ? err.message : `Could not read ${file.name}`);
+      const res = await createServerMediaMetadata({
+        projectId,
+        name: asset.name,
+        kind: asset.kind,
+        mimeType: asset.mimeType,
+        sizeBytes: asset.sizeBytes,
+        duration: Math.max(0, Number(asset.duration.toFixed(2))),
+        ...(asset.width ? { width: Math.round(asset.width) } : {}),
+        ...(asset.height ? { height: Math.round(asset.height) } : {}),
+        storageProvider: "local_browser",
+        storageKey: asset.id,
+      });
+
+      if (res.ok && res.data?.asset) {
+        const serverId = String(res.data.asset._id || res.data.asset.id || "");
+        if (serverId) {
+          serverMediaIdByClientIdRef.current.set(asset.id, serverId);
+        }
       }
-    }
+    },
+    [activeProjectId, isAuthenticated]
+  );
 
-    if (added.length > 0) {
-      setMediaAssets((prev) => [...added, ...prev]);
+  const uploadLocalFiles = useCallback(
+    async (files: FileList | File[]): Promise<MediaAsset[]> => {
+      const fileArray = Array.from(files);
+      if (fileArray.length === 0) return [];
+      setUploadingMedia(true);
+      setMediaError(null);
 
-      // Automatically relink any restored clips whose sourceName & size match newly uploaded files
-      setProjects((prevProjects) =>
-        prevProjects.map((proj) => ({
-          ...proj,
-          clips: proj.clips.map((clip) => {
-            if (!clip.needsRelink) return clip;
-            const match = added.find(
-              (a) =>
-                a.name === (clip.sourceName || clip.name) &&
-                (!clip.sourceSizeBytes || a.sizeBytes === clip.sourceSizeBytes)
+      const added: MediaAsset[] = [];
+      const failures: string[] = [];
+
+      for (const file of fileArray) {
+        let extractedAsset: MediaAsset | null = null;
+        try {
+          const quotaCheck = await checkStorageQuotaForBytes(file.size, file.name);
+          if (!quotaCheck.canFit) {
+            throw new MediaStorageQuotaError(
+              quotaCheck.reason || `Browser storage quota exceeded for '${file.name}'.`,
+              file.size,
+              quotaCheck.estimate.availableBytes
             );
-            if (!match) return clip;
-            return {
-              ...clip,
-              assetId: match.id,
-              objectUrl: match.objectUrl,
-              thumbnailUrl: match.thumbnailUrl ?? clip.thumbnailUrl,
-              needsRelink: false,
-            };
-          }),
-        }))
-      );
-    }
-    if (failures.length > 0) {
-      setMediaError(failures.join(" "));
-    }
-    setUploadingMedia(false);
-    return added;
-  }, []);
+          }
 
-  const removeMediaAsset = useCallback((assetId: string) => {
-    setMediaAssets((prev) => {
-      const target = prev.find((a) => a.id === assetId);
-      if (target) {
-        URL.revokeObjectURL(target.objectUrl);
+          extractedAsset = await extractMediaAsset(file);
+          const now = new Date().toISOString();
+          const record: StoredMediaRecord = {
+            id: extractedAsset.id,
+            name: extractedAsset.name,
+            kind: extractedAsset.kind as Exclude<MediaKind, "text">,
+            mimeType: extractedAsset.mimeType,
+            sizeBytes: extractedAsset.sizeBytes,
+            duration: extractedAsset.duration,
+            width: extractedAsset.width,
+            height: extractedAsset.height,
+            thumbnailDataUrl: extractedAsset.thumbnailUrl?.startsWith("data:")
+              ? extractedAsset.thumbnailUrl
+              : undefined,
+            blob: file,
+            addedAt: extractedAsset.addedAt,
+            updatedAt: now,
+          };
+
+          await saveMediaToIndexedDB(record);
+          registerTrackedObjectUrl(extractedAsset.id, extractedAsset.objectUrl);
+          added.push(extractedAsset);
+          void syncAssetMetadataToMongo(extractedAsset);
+        } catch (err) {
+          if (extractedAsset?.objectUrl.startsWith("blob:")) {
+            URL.revokeObjectURL(extractedAsset.objectUrl);
+          }
+          failures.push(err instanceof Error ? err.message : `Could not save ${file.name}`);
+        }
       }
-      return prev.filter((a) => a.id !== assetId);
-    });
-    setProjects((prev) =>
-      prev.map((proj) => {
-        const removedClipIds = new Set(
-          proj.clips.filter((c) => c.assetId === assetId).map((c) => c.id)
+
+      if (added.length > 0) {
+        setMediaAssets((prev) => [...added, ...prev]);
+
+        // Reconnect any restored clips missing media whose stable ID or original filename/size matches
+        setProjects((prevProjects) =>
+          prevProjects.map((proj) => {
+            let changed = false;
+            const nextClips = proj.clips.map((clip) => {
+              if (!clip.needsRelink) return clip;
+              const match =
+                added.find((a) => a.id === clip.assetId) ??
+                added.find(
+                  (a) =>
+                    a.name === (clip.sourceName || clip.name) &&
+                    (!clip.sourceSizeBytes || a.sizeBytes === clip.sourceSizeBytes)
+                );
+              if (!match) return clip;
+              changed = true;
+              return {
+                ...clip,
+                assetId: match.id,
+                objectUrl: match.objectUrl,
+                thumbnailUrl: match.thumbnailUrl ?? clip.thumbnailUrl,
+                sourceName: match.name,
+                sourceSizeBytes: match.sizeBytes,
+                sourceMimeType: match.mimeType,
+                needsRelink: false,
+              };
+            });
+            return changed
+              ? { ...proj, updatedAt: new Date().toISOString(), clips: nextClips }
+              : proj;
+          })
         );
-        return {
-          ...proj,
-          clips: proj.clips.filter((c) => c.assetId !== assetId),
-          subtitles: (proj.subtitles ?? []).filter(
-            (s) => !s.clipId || !removedClipIds.has(s.clipId)
-          ),
-        };
-      })
-    );
-  }, []);
+      }
+
+      if (failures.length > 0) {
+        setMediaError(failures.join(" "));
+      }
+
+      await refreshStorageEstimate();
+      setUploadingMedia(false);
+      return added;
+    },
+    [refreshStorageEstimate, registerTrackedObjectUrl, syncAssetMetadataToMongo]
+  );
+
+  const relinkMissingClipAsset = useCallback(
+    async (assetId: string, file: File): Promise<{ ok: boolean; error?: string }> => {
+      setUploadingMedia(true);
+      setMediaError(null);
+      let extracted: MediaAsset | null = null;
+      try {
+        const quotaCheck = await checkStorageQuotaForBytes(file.size, file.name);
+        if (!quotaCheck.canFit) {
+          throw new MediaStorageQuotaError(
+            quotaCheck.reason || `Browser storage quota exceeded for '${file.name}'.`,
+            file.size,
+            quotaCheck.estimate.availableBytes
+          );
+        }
+
+        extracted = await extractMediaAsset(file, assetId);
+        const now = new Date().toISOString();
+        await saveMediaToIndexedDB({
+          id: assetId,
+          name: extracted.name,
+          kind: extracted.kind as Exclude<MediaKind, "text">,
+          mimeType: extracted.mimeType,
+          sizeBytes: extracted.sizeBytes,
+          duration: extracted.duration,
+          width: extracted.width,
+          height: extracted.height,
+          thumbnailDataUrl: extracted.thumbnailUrl?.startsWith("data:")
+            ? extracted.thumbnailUrl
+            : undefined,
+          blob: file,
+          addedAt: extracted.addedAt,
+          updatedAt: now,
+        });
+
+        registerTrackedObjectUrl(assetId, extracted.objectUrl);
+
+        setMediaAssets((prev) => {
+          const without = prev.filter((a) => a.id !== assetId);
+          return [extracted!, ...without];
+        });
+
+        setProjects((prev) =>
+          prev.map((proj) => {
+            let changed = false;
+            const nextClips = proj.clips.map((clip) => {
+              if (clip.assetId !== assetId) return clip;
+              changed = true;
+              return {
+                ...clip,
+                objectUrl: extracted!.objectUrl,
+                thumbnailUrl: extracted!.thumbnailUrl ?? clip.thumbnailUrl,
+                sourceName: extracted!.name,
+                sourceSizeBytes: extracted!.sizeBytes,
+                sourceMimeType: extracted!.mimeType,
+                needsRelink: false,
+              };
+            });
+            return changed
+              ? { ...proj, updatedAt: new Date().toISOString(), clips: nextClips }
+              : proj;
+          })
+        );
+
+        void syncAssetMetadataToMongo(extracted);
+        await refreshStorageEstimate();
+        setUploadingMedia(false);
+        return { ok: true };
+      } catch (err) {
+        if (extracted?.objectUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(extracted.objectUrl);
+        }
+        const msg = err instanceof Error ? err.message : `Could not relink '${file.name}'.`;
+        setMediaError(msg);
+        setUploadingMedia(false);
+        return { ok: false, error: msg };
+      }
+    },
+    [refreshStorageEstimate, registerTrackedObjectUrl, syncAssetMetadataToMongo]
+  );
+
+  const getProjectsUsingAsset = useCallback(
+    (assetId: string): Project[] => findProjectsUsingAsset(assetId, projectsRef.current),
+    []
+  );
+
+  const removeMediaAsset = useCallback(
+    async (
+      assetId: string,
+      force = false
+    ): Promise<{ deleted: boolean; blockedByProjects?: Project[]; error?: string }> => {
+      const referencingProjects = findProjectsUsingAsset(assetId, projectsRef.current);
+      if (referencingProjects.length > 0 && !force) {
+        const names = referencingProjects.map((p) => `'${p.name}'`).join(", ");
+        const msg = `Cannot delete media while still used by ${referencingProjects.length} project(s): ${names}.`;
+        setMediaError(msg);
+        return { deleted: false, blockedByProjects: referencingProjects, error: msg };
+      }
+
+      try {
+        await deleteMediaFromIndexedDB(assetId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to remove media from IndexedDB.";
+        setMediaError(msg);
+        return { deleted: false, error: msg };
+      }
+
+      revokeTrackedObjectUrl(assetId);
+      setMediaAssets((prev) => prev.filter((a) => a.id !== assetId));
+
+      const serverMediaId = serverMediaIdByClientIdRef.current.get(assetId);
+      if (serverMediaId && isAuthenticated) {
+        serverMediaIdByClientIdRef.current.delete(assetId);
+        void deleteServerMediaMetadata(serverMediaId);
+      }
+
+      if (referencingProjects.length > 0) {
+        setProjects((prev) =>
+          prev.map((proj) => {
+            const removedClipIds = new Set(
+              proj.clips.filter((c) => c.assetId === assetId).map((c) => c.id)
+            );
+            if (removedClipIds.size === 0) return proj;
+            return {
+              ...proj,
+              updatedAt: new Date().toISOString(),
+              clips: proj.clips.filter((c) => c.assetId !== assetId),
+              subtitles: (proj.subtitles ?? []).filter(
+                (s) => !s.clipId || !removedClipIds.has(s.clipId)
+              ),
+            };
+          })
+        );
+      }
+
+      await refreshStorageEstimate();
+      return { deleted: true };
+    },
+    [isAuthenticated, refreshStorageEstimate, revokeTrackedObjectUrl]
+  );
+
+  const cleanupUnusedMediaAssets = useCallback(async (): Promise<number> => {
+    const allIds = mediaAssetsRef.current.map((a) => a.id);
+    return cleanupOrphanedAssets(allIds, projectsRef.current);
+  }, [cleanupOrphanedAssets]);
 
   const mutateActiveProject = useCallback(
     (updater: (project: Project) => Project, recordHistory = true) => {
@@ -579,12 +982,18 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!activeProjectId || undoStack.length === 0) return;
     const previous = undoStack[undoStack.length - 1];
     setUndoStack((stack) => stack.slice(0, -1));
+    const assetsById = new Map(mediaAssetsRef.current.map((a) => [a.id, a]));
     setProjects((prev) => {
       const current = prev.find((p) => p.id === activeProjectId);
       if (current) {
         setRedoStack((r) => [...r.slice(-(MAX_HISTORY_ENTRIES - 1)), cloneProject(current)]);
       }
-      return prev.map((p) => (p.id === activeProjectId ? cloneProject(previous) : p));
+      const restored = reconcileProjectWithMediaAssets(
+        cloneProject(previous),
+        assetsById,
+        idbHydratedRef.current
+      );
+      return prev.map((p) => (p.id === activeProjectId ? restored : p));
     });
   }, [activeProjectId, undoStack]);
 
@@ -592,12 +1001,18 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     if (!activeProjectId || redoStack.length === 0) return;
     const next = redoStack[redoStack.length - 1];
     setRedoStack((stack) => stack.slice(0, -1));
+    const assetsById = new Map(mediaAssetsRef.current.map((a) => [a.id, a]));
     setProjects((prev) => {
       const current = prev.find((p) => p.id === activeProjectId);
       if (current) {
         setUndoStack((u) => [...u.slice(-(MAX_HISTORY_ENTRIES - 1)), cloneProject(current)]);
       }
-      return prev.map((p) => (p.id === activeProjectId ? cloneProject(next) : p));
+      const restored = reconcileProjectWithMediaAssets(
+        cloneProject(next),
+        assetsById,
+        idbHydratedRef.current
+      );
+      return prev.map((p) => (p.id === activeProjectId ? restored : p));
     });
   }, [activeProjectId, redoStack]);
 
@@ -1345,10 +1760,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     deleteProject,
     mediaAssets,
     uploadingMedia,
+    idbHydrating,
+    storageEstimate,
+    refreshStorageEstimate,
     mediaError,
     clearMediaError: () => setMediaError(null),
     uploadLocalFiles,
+    relinkMissingClipAsset,
+    getProjectsUsingAsset,
     removeMediaAsset,
+    cleanupUnusedMediaAssets,
     totalMediaBytes,
     addClipToTimeline,
     addTextOverlay,

@@ -16,14 +16,13 @@ import {
 import { useStudio } from "../../context/StudioContext";
 import { generateVideoSubtitles } from "../../services/api";
 import type {
-  MediaAsset,
   Project,
   SubtitleMetadata,
   SubtitlePosition,
   SubtitleSegment,
   TimelineClip,
 } from "../../types/studio";
-import { formatTimecode } from "../../utils/media";
+import { formatTimecode, resolveClipSourceFile } from "../../utils/media";
 import {
   buildSubtitleFilenameSlug,
   exportSubtitlesToSrt,
@@ -44,35 +43,6 @@ interface SubtitlesPanelProps {
 const COLOR_PRESETS = ["#FFFFFF", "#F4F4F5", "#FBBF24", "#60A5FA", "#A78BFA"];
 const BG_COLOR_PRESETS = ["#09090B", "#000000", "#1E1B4B", "#18181B"];
 
-async function resolveClipFileForSubtitles(
-  clip: TimelineClip,
-  mediaAssets: MediaAsset[]
-): Promise<File> {
-  const asset = mediaAssets.find((a) => a.id === clip.assetId);
-  if (asset?.sourceFile && asset.sourceFile.size > 0) {
-    return asset.sourceFile;
-  }
-
-  const candidateUrl = clip.objectUrl || asset?.objectUrl || "";
-  if (candidateUrl.startsWith("blob:")) {
-    const response = await fetch(candidateUrl);
-    if (!response.ok) {
-      throw new Error(`Unable to read local file bytes for '${clip.name}'.`);
-    }
-    const blob = await response.blob();
-    if (blob.size === 0) {
-      throw new Error(`Selected video file '${clip.name}' is empty.`);
-    }
-    const filename = clip.sourceName || clip.name || "video.mp4";
-    return new File([blob], filename, {
-      type: blob.type || clip.sourceMimeType || "video/mp4",
-    });
-  }
-
-  throw new Error(
-    `Original video bytes for '${clip.name}' are unavailable in this browser session. Re-import or relink the video file first.`
-  );
-}
 
 function triggerTextDownload(content: string, filename: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
@@ -161,7 +131,7 @@ export function SubtitlesPanel({
     setGenerating(true);
 
     try {
-      const fileObj = await resolveClipFileForSubtitles(targetClip, mediaAssets);
+      const fileObj = await resolveClipSourceFile(targetClip, mediaAssets);
       const formData = new FormData();
       formData.append("video", fileObj, fileObj.name);
       if (language.trim()) {

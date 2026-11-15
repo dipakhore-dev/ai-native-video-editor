@@ -53,10 +53,10 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         id: "objectStorage",
         label: "Media Object Storage",
         connected: false,
-        provider: "Local Browser Object URLs (₹0 Free Mode)",
+        provider: "Local Browser IndexedDB (₹0 Free Mode)",
         endpoint: "/api/media",
         summary:
-          "Media metadata is stored in MongoDB while video binaries remain local on your machine (no paid cloud storage bucket required).",
+          "Media Blobs persist locally in your browser's IndexedDB across refreshes/restarts while stable asset IDs and metadata sync to MongoDB (no paid cloud bucket required).",
       },
       aiAssistant: {
         id: "aiAssistant",

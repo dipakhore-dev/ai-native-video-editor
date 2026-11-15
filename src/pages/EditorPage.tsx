@@ -20,14 +20,17 @@ import {
   AlertTriangle,
   Type,
   Captions,
+  HardDrive,
+  RefreshCw,
+  X,
 } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
 import { MultitrackTimeline } from "../components/editor/MultitrackTimeline";
 import { AiAssistantPanel, type EditorPanelTab } from "../components/editor/AiAssistantPanel";
 import { ExportModal } from "../components/editor/ExportModal";
 import { useStudio } from "../context/StudioContext";
-import type { MediaAsset, Project, TimelineClip } from "../types/studio";
-import { formatTimecode } from "../utils/media";
+import type { MediaAsset, MediaKind, Project, TimelineClip } from "../types/studio";
+import { formatBytes, formatTimecode } from "../utils/media";
 import { getSubtitleStyle, hexToRgba } from "../utils/subtitles";
 
 export function EditorPage() {
@@ -39,6 +42,11 @@ export function EditorPage() {
     mediaAssets,
     uploadLocalFiles,
     uploadingMedia,
+    idbHydrating,
+    storageEstimate,
+    mediaError,
+    clearMediaError,
+    relinkMissingClipAsset,
     addClipToTimeline,
     addTextOverlay,
     updateTextStyle,
@@ -58,6 +66,8 @@ export function EditorPage() {
   } = useStudio();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const relinkInputRef = useRef<HTMLInputElement | null>(null);
+  const relinkTargetAssetIdRef = useRef<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
@@ -90,9 +100,28 @@ export function EditorPage() {
     [activeProject, selectedClipId]
   );
 
-  const hasClipsNeedingRelink = useMemo(
-    () => Boolean(activeProject?.clips.some((c) => c.needsRelink)),
-    [activeProject]
+  const missingMediaItems = useMemo(() => {
+    if (!activeProject) return [];
+    const seen = new Map<
+      string,
+      { assetId: string; name: string; sizeBytes?: number; kind: MediaKind }
+    >();
+    for (const clip of activeProject.clips) {
+      if (clip.needsRelink && clip.assetId && !seen.has(clip.assetId)) {
+        seen.set(clip.assetId, {
+          assetId: clip.assetId,
+          name: clip.sourceName || clip.name,
+          sizeBytes: clip.sourceSizeBytes,
+          kind: clip.kind,
+        });
+      }
+    }
+    return Array.from(seen.values());
+  }, [activeProject]);
+
+  const hasClipsNeedingRelink = !idbHydrating && missingMediaItems.length > 0;
+  const isRestoringProjectMedia = Boolean(
+    idbHydrating && activeProject?.clips.some((c) => c.kind !== "text" && !c.objectUrl)
   );
 
   const v1Track = activeProject?.tracks.find((t) => t.id === "track_v1");
@@ -403,6 +432,20 @@ export function EditorPage() {
     e.target.value = "";
   };
 
+  const triggerSingleClipRelink = (assetId: string) => {
+    relinkTargetAssetIdRef.current = assetId;
+    relinkInputRef.current?.click();
+  };
+
+  const handleRelinkFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const targetAssetId = relinkTargetAssetIdRef.current;
+    e.target.value = "";
+    relinkTargetAssetIdRef.current = null;
+    if (!file || !targetAssetId) return;
+    await relinkMissingClipAsset(targetAssetId, file);
+  };
+
   const handleAddAssetToTimeline = (asset: MediaAsset) => {
     const clip = addClipToTimeline(asset);
     if (clip) setSelectedClipId(clip.id);
@@ -552,6 +595,13 @@ export function EditorPage() {
         onChange={(e) => void handleUploadInEditor(e)}
         className="hidden"
       />
+      <input
+        ref={relinkInputRef}
+        type="file"
+        accept="video/*,image/*,audio/*"
+        onChange={(e) => void handleRelinkFileSelected(e)}
+        className="hidden"
+      />
 
       {!activeProject ? (
         <div className="flex-1 flex items-center justify-center p-6">
@@ -594,21 +644,71 @@ export function EditorPage() {
         </div>
       ) : (
         <div className="flex-1 flex flex-col min-h-0">
-          {hasClipsNeedingRelink && (
-            <div className="px-4 py-2 border-b border-amber-500/30 bg-amber-500/10 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
-              <div className="flex items-center gap-2">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                <span>
-                  Timeline restored from local storage. Re-select your local video/audio files to relink playback URLs.
-                </span>
+          {mediaError && (
+            <div className="px-4 py-2 border-b border-rose-500/30 bg-rose-500/10 flex items-center justify-between gap-2 text-xs text-rose-200">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+                <span className="truncate" title={mediaError}>{mediaError}</span>
               </div>
               <button
                 type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="rounded-md bg-amber-500/20 border border-amber-400/40 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-amber-500/30"
+                onClick={clearMediaError}
+                className="rounded p-1 text-rose-200 hover:bg-rose-500/20 hover:text-white shrink-0"
+                aria-label="Dismiss media error"
               >
-                Relink Local Media
+                <X className="h-3.5 w-3.5" />
               </button>
+            </div>
+          )}
+
+          {isRestoringProjectMedia && (
+            <div className="px-4 py-1.5 border-b border-blue-500/30 bg-blue-500/10 flex items-center gap-2 text-xs text-blue-200">
+              <RefreshCw className="h-3.5 w-3.5 animate-spin shrink-0 text-blue-400" />
+              <span>Restoring local media files from browser IndexedDB storage...</span>
+            </div>
+          )}
+
+          {hasClipsNeedingRelink && (
+            <div className="px-4 py-2.5 border-b border-amber-500/30 bg-amber-500/10 space-y-2 text-xs text-amber-200">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                  <span>
+                    {missingMediaItems.length} local media file{missingMediaItems.length > 1 ? "s were" : " was"} not found in this browser&apos;s IndexedDB storage (browser data cleared or opened on another device).
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="rounded-md bg-amber-500/20 border border-amber-400/40 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-amber-500/30"
+                >
+                  Batch Re-link Files
+                </button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {missingMediaItems.map((item) => (
+                  <div
+                    key={item.assetId}
+                    className="inline-flex items-center gap-2 rounded-md border border-amber-400/30 bg-black/30 px-2.5 py-1 text-[11px]"
+                  >
+                    <span className="font-medium text-amber-100 truncate max-w-[180px]" title={item.name}>
+                      {item.name}
+                    </span>
+                    {item.sizeBytes !== undefined && item.sizeBytes > 0 && (
+                      <span className="font-mono text-[10px] text-amber-300/80">
+                        {formatBytes(item.sizeBytes)}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => triggerSingleClipRelink(item.assetId)}
+                      className="rounded bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-black hover:bg-amber-400 transition-colors"
+                    >
+                      Re-link File
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
@@ -730,6 +830,27 @@ export function EditorPage() {
                   ))
                 )}
               </div>
+              <div className="px-3 py-2 border-t border-zinc-800/80 bg-[#09090B]/70 space-y-1">
+                <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                  <span className="inline-flex items-center gap-1">
+                    <HardDrive className="h-3 w-3 text-blue-400" />
+                    <span>IndexedDB Local</span>
+                  </span>
+                  {storageEstimate?.supported ? (
+                    <span>
+                      {formatBytes(storageEstimate.usageBytes)}
+                      {storageEstimate.quotaBytes > 0
+                        ? ` / ${formatBytes(storageEstimate.quotaBytes)}`
+                        : ""}
+                    </span>
+                  ) : (
+                    <span>{mediaAssets.length} files</span>
+                  )}
+                </div>
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  Saved on this browser/device only. Clearing browser site data removes local media.
+                </p>
+              </div>
             </aside>
 
             {/* Center Preview Monitor & Transport Controls */}
@@ -739,7 +860,7 @@ export function EditorPage() {
                   ref={previewFrameRef}
                   className={`${frameAspectClass} relative rounded-xl border border-zinc-800 bg-black overflow-hidden flex items-center justify-center shadow-xl`}
                 >
-                  {primaryVisualClip && !primaryVisualClip.needsRelink ? (
+                  {primaryVisualClip && !primaryVisualClip.needsRelink && primaryVisualClip.objectUrl ? (
                     <>
                       {primaryVisualClip.kind === "video" ? (
                         <video
@@ -761,15 +882,27 @@ export function EditorPage() {
                       )}
                     </>
                   ) : (
-                    <div className="text-center p-6">
-                      <Film className="h-8 w-8 text-zinc-700 mx-auto mb-2" />
+                    <div className="text-center p-6 space-y-2.5">
+                      <Film className="h-8 w-8 text-zinc-700 mx-auto" />
                       <p className="text-xs text-zinc-400">
                         {primaryVisualClip?.needsRelink
-                          ? `Relink "${primaryVisualClip.sourceName || primaryVisualClip.name}" to preview video`
-                          : activeProject.clips.length === 0
-                          ? "Import a local video or image to start previewing"
-                          : "Playhead is in an empty timeline gap"}
+                          ? `Missing local media for "${primaryVisualClip.sourceName || primaryVisualClip.name}"`
+                          : isRestoringProjectMedia
+                            ? "Restoring media from IndexedDB..."
+                            : activeProject.clips.length === 0
+                              ? "Import a local video or image to start previewing"
+                              : "Playhead is in an empty timeline gap"}
                       </p>
+                      {primaryVisualClip?.needsRelink && (
+                        <button
+                          type="button"
+                          onClick={() => triggerSingleClipRelink(primaryVisualClip.assetId)}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-black hover:bg-amber-400"
+                        >
+                          <Upload className="h-3.5 w-3.5" />
+                          <span>Re-link File</span>
+                        </button>
+                      )}
                     </div>
                   )}
 

@@ -11,6 +11,8 @@ import {
   LayoutGrid,
   List,
   X,
+  HardDrive,
+  AlertTriangle,
 } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
 import { IntegrationNotice } from "../components/common/IntegrationNotice";
@@ -21,11 +23,16 @@ import { formatBytes, formatTimecode } from "../utils/media";
 export function MediaLibraryPage() {
   const {
     mediaAssets,
+    projects,
     uploadLocalFiles,
     uploadingMedia,
+    idbHydrating,
+    storageEstimate,
     mediaError,
     clearMediaError,
+    getProjectsUsingAsset,
     removeMediaAsset,
+    cleanupUnusedMediaAssets,
     addClipToTimeline,
     navigate,
   } = useStudio();
@@ -36,6 +43,8 @@ export function MediaLibraryPage() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [dragOver, setDragOver] = useState(false);
   const [previewAsset, setPreviewAsset] = useState<MediaAsset | null>(null);
+  const [confirmDeleteAssetId, setConfirmDeleteAssetId] = useState<string | null>(null);
+  const [cleanupNotice, setCleanupNotice] = useState<string | null>(null);
 
   const filteredAssets = useMemo(() => {
     return mediaAssets.filter((asset) => {
@@ -45,8 +54,14 @@ export function MediaLibraryPage() {
     });
   }, [mediaAssets, filter, search]);
 
+  const unusedCount = useMemo(() => {
+    const usedIds = new Set(projects.flatMap((p) => p.clips.map((c) => c.assetId)));
+    return mediaAssets.filter((a) => !usedIds.has(a.id)).length;
+  }, [mediaAssets, projects]);
+
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    setCleanupNotice(null);
     await uploadLocalFiles(files);
   };
 
@@ -59,6 +74,26 @@ export function MediaLibraryPage() {
   const sendToEditor = (asset: MediaAsset) => {
     addClipToTimeline(asset);
     navigate("editor");
+  };
+
+  const handleRequestDeleteAsset = async (assetId: string) => {
+    setCleanupNotice(null);
+    const usedBy = getProjectsUsingAsset(assetId);
+    if (usedBy.length > 0 && confirmDeleteAssetId !== assetId) {
+      setConfirmDeleteAssetId(assetId);
+      return;
+    }
+    setConfirmDeleteAssetId(null);
+    await removeMediaAsset(assetId, usedBy.length > 0);
+  };
+
+  const handleCleanUnused = async () => {
+    const removed = await cleanupUnusedMediaAssets();
+    setCleanupNotice(
+      removed > 0
+        ? `Removed ${removed} unused local media file${removed > 1 ? "s" : ""} from IndexedDB.`
+        : "No unused media files found."
+    );
   };
 
   return (
@@ -92,12 +127,62 @@ export function MediaLibraryPage() {
           <div>
             <h1 className="font-display text-2xl font-semibold text-white">Media Library</h1>
             <p className="mt-1 text-sm text-zinc-400">
-              Select local video, image, and audio files for instant browser preview and timeline assembly.
+              Select local video, image, and audio files stored persistently in IndexedDB for playback, trimming, subtitles, and export.
             </p>
           </div>
-          <p className="text-xs font-mono text-zinc-400 tabular-nums">
-            {mediaAssets.length} assets · {formatBytes(mediaAssets.reduce((s, a) => s + a.sizeBytes, 0))}
-          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            {unusedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleCleanUnused()}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors"
+              >
+                <Trash2 className="h-3.5 w-3.5 text-zinc-400" />
+                <span>Clean Unused ({unusedCount})</span>
+              </button>
+            )}
+            <p className="text-xs font-mono text-zinc-400 tabular-nums">
+              {idbHydrating ? "Restoring..." : `${mediaAssets.length} assets`} · {formatBytes(mediaAssets.reduce((s, a) => s + a.sizeBytes, 0))}
+            </p>
+          </div>
+        </div>
+
+        {/* Browser-local IndexedDB Warning & Quota Meter */}
+        <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-2.5 text-xs text-amber-200/90">
+            <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="font-medium text-amber-100">
+                IndexedDB Local Browser Storage Active (₹0 Free Mode)
+              </p>
+              <p className="text-amber-200/80 leading-relaxed">
+                Uploaded media files stay inside IndexedDB on this browser and device across page refreshes and browser restarts. Clearing browser site data will permanently remove local files, and media does not sync across separate browsers or devices.
+              </p>
+            </div>
+          </div>
+          {storageEstimate?.supported && (
+            <div className="shrink-0 min-w-[200px] space-y-1.5 rounded-lg border border-zinc-800 bg-[#09090B]/80 px-3 py-2">
+              <div className="flex items-center justify-between text-[11px] font-mono text-zinc-300">
+                <span className="inline-flex items-center gap-1">
+                  <HardDrive className="h-3 w-3 text-blue-400" />
+                  <span>Browser Quota</span>
+                </span>
+                <span>{storageEstimate.percentUsed}%</span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all ${
+                    storageEstimate.percentUsed > 85 ? "bg-rose-500" : "bg-blue-500"
+                  }`}
+                  style={{ width: `${Math.max(2, storageEstimate.percentUsed)}%` }}
+                />
+              </div>
+              <p className="text-[10px] font-mono text-zinc-400 tabular-nums">
+                {formatBytes(storageEstimate.usageBytes)} used
+                {storageEstimate.quotaBytes > 0 ? ` of ${formatBytes(storageEstimate.quotaBytes)}` : ""}
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Upload Dropzone */}
@@ -121,7 +206,7 @@ export function MediaLibraryPage() {
             Drop local video, image, or audio files here
           </p>
           <p className="mt-1 text-xs text-zinc-400">
-            Supports MP4, WebM, MOV, PNG, JPG, MP3, WAV. Files are processed locally via Object URLs.
+            Supports MP4, WebM, MOV, PNG, JPG, MP3, WAV. Files persist locally in IndexedDB with stable asset IDs.
           </p>
           <div className="mt-4">
             <button
@@ -130,10 +215,19 @@ export function MediaLibraryPage() {
               disabled={uploadingMedia}
               className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2 text-xs font-medium text-zinc-100 hover:bg-zinc-800 transition-colors"
             >
-              <span>{uploadingMedia ? "Generating Thumbnails..." : "Browse Computer"}</span>
+              <span>{uploadingMedia ? "Saving to IndexedDB..." : "Browse Computer"}</span>
             </button>
           </div>
         </div>
+
+        {cleanupNotice && (
+          <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-xs text-emerald-200 flex items-center justify-between">
+            <span>{cleanupNotice}</span>
+            <button type="button" onClick={() => setCleanupNotice(null)} className="text-emerald-300 hover:text-white">
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {mediaError && (
           <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-300 flex items-center justify-between">
@@ -263,24 +357,67 @@ export function MediaLibraryPage() {
                     </p>
                   </div>
 
-                  <div className="flex items-center justify-between gap-2 pt-2 border-t border-zinc-800/80">
-                    <button
-                      type="button"
-                      onClick={() => sendToEditor(asset)}
-                      className="inline-flex items-center gap-1.5 text-xs font-medium text-violet-400 hover:text-violet-300 transition-colors"
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                      <span>Add to Timeline</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => removeMediaAsset(asset.id)}
-                      className="rounded-md p-1 text-zinc-500 hover:bg-zinc-800 hover:text-rose-400 transition-colors"
-                      aria-label={`Remove ${asset.name}`}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
+                  {(() => {
+                    const usedBy = getProjectsUsingAsset(asset.id);
+                    const isConfirming = confirmDeleteAssetId === asset.id;
+                    return (
+                      <div className="pt-2 border-t border-zinc-800/80 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => sendToEditor(asset)}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium text-violet-400 hover:text-violet-300 transition-colors"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                            <span>Add to Timeline</span>
+                          </button>
+                          <div className="flex items-center gap-1.5">
+                            {usedBy.length > 0 && (
+                              <span className="text-[10px] font-mono text-zinc-500">
+                                {usedBy.length} proj
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => void handleRequestDeleteAsset(asset.id)}
+                              className="rounded-md p-1 text-zinc-500 hover:bg-zinc-800 hover:text-rose-400 transition-colors"
+                              aria-label={`Remove ${asset.name}`}
+                              title={
+                                usedBy.length > 0
+                                  ? `Used by ${usedBy.map((p) => p.name).join(", ")}`
+                                  : "Delete media asset"
+                              }
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        {isConfirming && (
+                          <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-2 text-[11px] text-rose-200 space-y-1.5">
+                            <p className="leading-snug">
+                              Used in {usedBy.map((p) => p.name).join(", ")}. Delete anyway?
+                            </p>
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteAssetId(null)}
+                                className="rounded px-2 py-0.5 text-zinc-300 hover:bg-zinc-800"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void removeMediaAsset(asset.id, true)}
+                                className="rounded bg-rose-600 px-2 py-0.5 font-medium text-white hover:bg-rose-500"
+                              >
+                                Delete Anyway
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             ))}
@@ -324,23 +461,48 @@ export function MediaLibraryPage() {
                       {formatBytes(asset.sizeBytes)}
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <div className="inline-flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => sendToEditor(asset)}
-                          className="text-violet-400 hover:text-violet-300 font-medium"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => removeMediaAsset(asset.id)}
-                          className="text-zinc-500 hover:text-rose-400"
-                          aria-label={`Remove ${asset.name}`}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
+                      {confirmDeleteAssetId === asset.id ? (
+                        <div className="inline-flex items-center gap-2 text-[11px]">
+                          <span className="text-rose-200">
+                            Used in {getProjectsUsingAsset(asset.id).length} project(s).
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteAssetId(null)}
+                            className="rounded px-2 py-0.5 text-zinc-300 hover:bg-zinc-800"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setConfirmDeleteAssetId(null);
+                              void removeMediaAsset(asset.id, true);
+                            }}
+                            className="rounded bg-rose-600 px-2 py-0.5 font-medium text-white hover:bg-rose-500"
+                          >
+                            Delete Anyway
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => sendToEditor(asset)}
+                            className="text-violet-400 hover:text-violet-300 font-medium"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleRequestDeleteAsset(asset.id)}
+                            className="text-zinc-500 hover:text-rose-400"
+                            aria-label={`Remove ${asset.name}`}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -350,9 +512,9 @@ export function MediaLibraryPage() {
         )}
 
         <IntegrationNotice
-          title="Object Storage Integration Point"
-          endpoint="POST /api/media/presign"
-          description="Assets uploaded here are stored in browser session memory via Object URLs. Connect S3 or Cloud Storage to persist media files across devices."
+          title="IndexedDB Local Media + MongoDB Metadata Architecture"
+          endpoint="POST /api/media"
+          description="Actual media Blobs persist locally in IndexedDB on this browser/device across refreshes and restarts, while stable asset IDs and metadata sync to MongoDB (no temporary blob URLs saved)."
         />
       </div>
 

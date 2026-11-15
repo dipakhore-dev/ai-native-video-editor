@@ -12,8 +12,8 @@ import {
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import { exportTimelineMp4 } from "../../services/api";
-import type { MediaAsset, Project, RenderTimelinePayload, TimelineClip } from "../../types/studio";
-import { formatBytes, formatTimecode } from "../../utils/media";
+import type { Project, RenderTimelinePayload } from "../../types/studio";
+import { formatBytes, formatTimecode, resolveClipSourceFile } from "../../utils/media";
 import { getSubtitleStyle } from "../../utils/subtitles";
 import { buildStructuredTimelineSpec } from "../../utils/timeline";
 
@@ -70,7 +70,7 @@ function validateTimelineForLocalMp4(
       return `Clip '${clip.name}' is on track '${clip.trackId}'. FFmpeg MP4 export currently supports primary video track V1 only.`;
     }
     if (clip.needsRelink) {
-      return `Clip '${clip.name}' needs to be relinked from your local disk before exporting.`;
+      return `Clip '${clip.name}' is missing from local IndexedDB storage. Use "Re-link File" before exporting.`;
     }
     if (Math.abs(clip.speed - 1) > 0.01) {
       return `Clip '${clip.name}' uses ${clip.speed}x speed. Variable clip speed is not supported in FFmpeg MP4 export yet; reset speed to 1.0x.`;
@@ -100,36 +100,6 @@ function validateTimelineForLocalMp4(
   }
 
   return null;
-}
-
-async function resolveClipFile(
-  clip: TimelineClip,
-  mediaAssets: MediaAsset[]
-): Promise<File> {
-  const asset = mediaAssets.find((a) => a.id === clip.assetId);
-  if (asset?.sourceFile && asset.sourceFile.size > 0) {
-    return asset.sourceFile;
-  }
-
-  const candidateUrl = clip.objectUrl || asset?.objectUrl || "";
-  if (candidateUrl.startsWith("blob:")) {
-    const response = await fetch(candidateUrl);
-    if (!response.ok) {
-      throw new Error(`Unable to read local file bytes for '${clip.name}'.`);
-    }
-    const blob = await response.blob();
-    if (blob.size === 0) {
-      throw new Error(`Local media file for '${clip.name}' is empty.`);
-    }
-    const filename = clip.sourceName || clip.name || "clip.mp4";
-    return new File([blob], filename, {
-      type: blob.type || clip.sourceMimeType || "video/mp4",
-    });
-  }
-
-  throw new Error(
-    `Original video file bytes for '${clip.name}' are unavailable in this browser session. Re-import or relink the video file before exporting.`
-  );
 }
 
 function triggerBrowserDownload(url: string, filename: string): void {
@@ -223,7 +193,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         const key = clip.assetId || clip.objectUrl || clip.id;
         let idx = sourceKeyToIndex.get(key);
         if (idx === undefined) {
-          const fileObj = await resolveClipFile(clip, mediaAssets);
+          const fileObj = await resolveClipSourceFile(clip, mediaAssets);
           idx = uniqueFiles.length;
           uniqueFiles.push(fileObj);
           sourceKeyToIndex.set(key, idx);

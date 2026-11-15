@@ -496,3 +496,53 @@ export async function saveServerProjectSubtitles(
     }),
   });
 }
+
+export interface ServerMediaAssetDto {
+  _id?: string;
+  id?: string;
+  projectId?: string | null;
+  name: string;
+  kind: "video" | "image" | "audio";
+  mimeType: string;
+  sizeBytes: number;
+  duration: number;
+  width?: number;
+  height?: number;
+  storageProvider: "local_browser" | "s3" | "gcs";
+  storageKey?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export async function fetchServerMediaAssets(): Promise<
+  ApiResult<{ status: string; assets: ServerMediaAssetDto[] }>
+> {
+  return requestJson("/api/media");
+}
+
+export async function createServerMediaMetadata(payload: {
+  projectId?: string | null;
+  name: string;
+  kind: "video" | "image" | "audio";
+  mimeType: string;
+  sizeBytes: number;
+  duration: number;
+  width?: number;
+  height?: number;
+  storageProvider: "local_browser";
+  storageKey: string;
+}): Promise<ApiResult<{ status: string; asset: ServerMediaAssetDto }>> {
+  return requestJson("/api/media", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteServerMediaMetadata(
+  mediaId: string
+): Promise<ApiResult<{ status: string; deleted: boolean }>> {
+  return requestJson(`/api/media/${encodeURIComponent(mediaId)}`, {
+    method: "DELETE",
+  });
+}
+
