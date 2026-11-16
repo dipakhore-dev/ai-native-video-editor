@@ -770,6 +770,44 @@ def _render_v1_visual_mp4(
     return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin), seam_overlaps
 
 
+def _normalize_overlay_transform(
+    raw: dict | None,
+    canvas_w: int,
+    canvas_h: int,
+) -> tuple[float, float, int, int, bool]:
+    ov = raw if isinstance(raw, dict) else {}
+    try:
+        x_pct = max(0.0, min(100.0, float(ov.get("x", 50.0))))
+    except (TypeError, ValueError):
+        x_pct = 50.0
+    try:
+        y_pct = max(0.0, min(100.0, float(ov.get("y", 50.0))))
+    except (TypeError, ValueError):
+        y_pct = 50.0
+    try:
+        width_pct = max(5.0, min(100.0, float(ov.get("widthPct", 100.0))))
+    except (TypeError, ValueError):
+        width_pct = 100.0
+    try:
+        height_pct = max(5.0, min(100.0, float(ov.get("heightPct", 100.0))))
+    except (TypeError, ValueError):
+        height_pct = 100.0
+    try:
+        scale = max(0.1, min(2.0, float(ov.get("scale", 1.0))))
+    except (TypeError, ValueError):
+        scale = 1.0
+    lock_aspect = bool(ov.get("lockAspectRatio", True))
+
+    eff_w_pct = max(5.0, min(100.0, width_pct * scale))
+    eff_h_pct = max(5.0, min(100.0, height_pct * scale))
+
+    box_w = max(4, int(round(canvas_w * (eff_w_pct / 100.0))))
+    box_h = max(4, int(round(canvas_h * (eff_h_pct / 100.0))))
+    box_w -= box_w % 2
+    box_h -= box_h % 2
+    return x_pct / 100.0, y_pct / 100.0, max(2, box_w), max(2, box_h), lock_aspect
+
+
 def _composite_v2_overlays_mp4(
     base_video_path: Path,
     v2_overlays: Sequence[dict],
@@ -801,9 +839,19 @@ def _composite_v2_overlays_mp4(
             cmd.extend(["-i", str(ov["src_path"])])
             ov_steps = [f"trim=start={ov['src_in']:.3f}:end={ov['src_out']:.3f}"]
 
+        x_frac, y_frac, box_w, box_h, lock_aspect = _normalize_overlay_transform(
+            ov.get("overlay_transform"),
+            width,
+            height,
+        )
+        if lock_aspect:
+            scale_step = f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease"
+        else:
+            scale_step = f"scale={box_w}:{box_h},setsar=1"
+
         ov_steps.extend([
             f"setpts=PTS-STARTPTS+{tl_start:.3f}/TB",
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+            scale_step,
             f"fps={fps}",
         ])
         ov_steps.extend(
@@ -826,7 +874,7 @@ def _composite_v2_overlays_mp4(
         next_lbl = "[outv]" if idx == len(v2_overlays) - 1 else f"[base{idx + 1}]"
         filter_parts.append(f"[{in_idx}:v]{','.join(ov_steps)}{ov_lbl}")
         filter_parts.append(
-            f"{cur_label}{ov_lbl}overlay=x=(W-w)/2:y=(H-h)/2:enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
+            f"{cur_label}{ov_lbl}overlay=x='round(W*{x_frac:.5f}-w/2)':y='round(H*{y_frac:.5f}-h/2)':enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
         )
         cur_label = next_lbl
 
@@ -1261,15 +1309,21 @@ def export_timeline_mp4(
 
             active_v2_overlays.append({
                 "src_path": src_path,
+                "src_meta": src_meta,
                 "is_image": is_image,
                 "tl_start": tl_start,
                 "tl_end": tl_end,
                 "src_in": src_in,
                 "src_out": src_out,
                 "opacity": opacity,
+                "volume": float(clip.get("volume", 1.0)),
+                "muted": bool(clip.get("muted", False)) or v2_track_muted or is_image,
+                "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
+                "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
                 "transition_in": clip.get("transitionIn"),
                 "transition_out": clip.get("transitionOut"),
                 "effects": clip.get("effects"),
+                "overlay_transform": clip.get("overlayTransform"),
             })
 
     if active_v2_overlays:
@@ -1386,11 +1440,20 @@ def export_timeline_mp4(
     else:
         subtitles = []
 
+    active_v2_audio_clips = [
+        item
+        for item in active_v2_overlays
+        if not item["is_image"]
+        and bool(item["src_meta"].get("has_audio"))
+        and not item["muted"]
+        and item["volume"] > 0.001
+    ]
+
     needs_ass_pass = burn_subs or len(active_t1_overlays) > 0
     raw_export_path = work_dir / "pre_ass_pass.mp4" if needs_ass_pass else output_path
     raw_export_path.parent.mkdir(parents=True, exist_ok=True)
 
-    has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0
+    has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0 or len(active_v2_audio_clips) > 0
 
     if not has_output_audio:
         shutil.copy2(visual_only_mp4, raw_export_path)
@@ -1531,16 +1594,51 @@ def export_timeline_mp4(
 
             a1_clip_labels.append(cur_label)
 
+        v2_audio_labels: list[str] = []
+        for v2_idx, item in enumerate(active_v2_audio_clips):
+            cur_in_idx = input_idx
+            audio_cmd.extend(["-i", str(item["src_path"])])
+            input_idx += 1
+
+            base_chain = _build_audio_clip_chain(
+                f"{cur_in_idx}:a",
+                src_in=item["src_in"],
+                src_out=item["src_out"],
+                volume=item["volume"],
+                fade_in=item["fade_in"],
+                fade_out=item["fade_out"],
+            )
+            cur_label = f"[v2a_base_{v2_idx}]"
+            audio_filters.append(f"{base_chain}{cur_label}")
+
+            if item["tl_start"] > 0.01:
+                delay_ms = int(round(item["tl_start"] * 1000))
+                delayed_label = f"[v2a_del_{v2_idx}]"
+                audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
+                cur_label = delayed_label
+
+            padded_label = f"[v2a_pad_{v2_idx}]"
+            audio_filters.append(
+                f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
+                f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
+            )
+            v2_audio_labels.append(padded_label)
+
         mix_inputs: list[str] = []
         if v1_mix_label:
             mix_inputs.append(v1_mix_label)
+        mix_inputs.extend(v2_audio_labels)
         mix_inputs.extend(a1_clip_labels)
 
-        any_boost = any(
-            item["volume"] > 1.02
-            for item in v1_prepared_clips
-            if not item["muted"]
-        ) or any(c["volume"] > 1.02 for c in active_a1_clips)
+        any_boost = (
+            any(
+                item["volume"] > 1.02
+                for item in v1_prepared_clips
+                if not item["muted"]
+            )
+            or any(c["volume"] > 1.02 for c in active_a1_clips)
+            or any(c["volume"] > 1.02 for c in active_v2_audio_clips)
+        )
 
         if len(mix_inputs) == 1:
             if any_boost:

@@ -1135,6 +1135,210 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         avg_red_during = sum(rgb_during[0::3][::41]) / max(1, len(rgb_during[0::3][::41]))
         self.assertGreater(avg_red_during, avg_red_before + 40)
 
+    def test_phase35_v2_overlay_transform_corner_pip_and_video_audio(self) -> None:
+        bg_clip = self.test_root / "bg_blue_pip.mp4"
+        proc_bg = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=640x360:d=2.0:r=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:duration=2.0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(bg_clip),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_bg.returncode, 0, proc_bg.stderr)
+
+        logo_png = self.test_root / "logo_red.png"
+        proc_png = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=200x200",
+                "-frames:v",
+                "1",
+                str(logo_png),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_png.returncode, 0, proc_png.stderr)
+
+        pip_video = self.test_root / "pip_green.mp4"
+        proc_pip = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=green:s=320x180:d=2.0:r=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=660:duration=2.0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(pip_video),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_pip.returncode, 0, proc_pip.stderr)
+
+        # 1) Top-right corner logo watermark (60% opacity) + V1 muted + V2 PiP green video (unlocked stretch)
+        out_tr = self.test_root / "top_right_logo.mp4"
+        export_timeline_mp4(
+            [bg_clip, logo_png],
+            out_tr,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_v2", "name": "V2 Overlay", "type": "overlay", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_bg",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "bg_blue_pip.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "v2_logo",
+                        "trackId": "track_v2",
+                        "kind": "image",
+                        "sourceName": "logo_red.png",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 0.6,
+                        "overlayTransform": {
+                            "x": 84,
+                            "y": 16,
+                            "widthPct": 26,
+                            "heightPct": 26,
+                            "scale": 1.0,
+                            "lockAspectRatio": True,
+                        },
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        rgb_tr = self._extract_rgb24_frame(out_tr, 0.8)
+        w, h = 1280, 720
+        # Pixel near top-right anchor (x=84% -> 1075, y=16% -> 115) should have strong red blend
+        tr_idx = (115 * w + 1075) * 3
+        bl_idx = (600 * w + 150) * 3
+        self.assertGreater(rgb_tr[tr_idx], 100)
+        self.assertGreater(rgb_tr[bl_idx + 2], 180)
+        self.assertLess(rgb_tr[bl_idx], 40)
+
+        # 2) Picture-in-Picture V2 video in bottom-right with V1 muted -> V2 audio must still be mixed
+        out_pip = self.test_root / "pip_video_out.mp4"
+        pip_meta = export_timeline_mp4(
+            [bg_clip, pip_video],
+            out_pip,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_v2", "name": "V2 Overlay", "type": "overlay", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_bg",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "bg_blue_pip.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "muted": True,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "v2_pip",
+                        "trackId": "track_v2",
+                        "kind": "video",
+                        "sourceName": "pip_green.mp4",
+                        "timelineStartSec": 0.2,
+                        "timelineEndSec": 1.8,
+                        "durationSec": 1.6,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 1.6,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "muted": False,
+                        "opacity": 1.0,
+                        "overlayTransform": {
+                            "x": 82,
+                            "y": 80,
+                            "widthPct": 28,
+                            "heightPct": 28,
+                            "scale": 1.0,
+                            "lockAspectRatio": False,
+                        },
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(pip_meta["has_audio"])
+        rgb_pip = self._extract_rgb24_frame(out_pip, 0.9)
+        br_idx = (576 * w + 1050) * 3
+        tl_idx = (100 * w + 120) * 3
+        # Bottom-right PiP is green; top-left background stays blue
+        self.assertGreater(rgb_pip[br_idx + 1], 100)
+        self.assertGreater(rgb_pip[tl_idx + 2], 180)
+        self.assertGreater(self._measure_pcm_rms(out_pip, 0.4, 0.8), 0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

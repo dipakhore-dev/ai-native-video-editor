@@ -33,6 +33,16 @@ import {
   normalizeEffects,
   normalizeTransition,
 } from "../../utils/effects";
+import {
+  DEFAULT_OVERLAY_TRANSFORM,
+  OVERLAY_MODE_PRESETS,
+  OVERLAY_POSITION_PRESETS,
+  applyOverlayPreset,
+  computeEffectiveOverlayBox,
+  hasCustomOverlayTransform,
+  normalizeOverlayTransform,
+  updateOverlayBoxDimensions,
+} from "../../utils/overlays";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import { SubtitlesPanel } from "./SubtitlesPanel";
@@ -61,10 +71,10 @@ interface AssistantMessage {
 }
 
 const EXAMPLE_PROMPTS = [
-  "Remove the first 5 seconds.",
+  "Apply cinematic filter to the first clip.",
+  "Add a 1-second cross dissolve between clips.",
+  "Move the logo to the top-right corner.",
   "Convert the video to 9:16.",
-  "Add a title at the beginning.",
-  "Generate English subtitles.",
 ];
 
 export function AiAssistantPanel({
@@ -129,6 +139,11 @@ export function AiAssistantPanel({
           sourceDuration: c.sourceDuration,
           speed: c.speed,
           volume: c.volume,
+          opacity: c.opacity,
+          ...(c.effects ? { effects: { ...c.effects } } : {}),
+          ...(c.transitionIn ? { transitionIn: { ...c.transitionIn } } : {}),
+          ...(c.transitionOut ? { transitionOut: { ...c.transitionOut } } : {}),
+          ...(c.overlayTransform ? { overlayTransform: { ...c.overlayTransform } } : {}),
           ...(c.textStyle ? { text: c.textStyle.text } : {}),
         })),
       },
@@ -169,7 +184,7 @@ export function AiAssistantPanel({
     const supportedOps = plan.operations.filter((op) => op.type !== "unsupported");
     if (supportedOps.length === 0) return;
 
-    const result = applyAiEditPlan(supportedOps);
+    const result = applyAiEditPlan(supportedOps, selectedClip?.id ?? null);
     const feedbackParts: string[] = [];
     if (result.appliedCount > 0) {
       feedbackParts.push(
@@ -689,6 +704,262 @@ export function AiAssistantPanel({
                   />
                 </div>
               )}
+
+              {selectedClip.trackId === "track_v2" &&
+                (selectedClip.kind === "image" || selectedClip.kind === "video") &&
+                (() => {
+                  const ov = normalizeOverlayTransform(selectedClip.overlayTransform);
+                  const effBox = computeEffectiveOverlayBox(ov);
+                  const customized = hasCustomOverlayTransform(ov);
+
+                  return (
+                    <div className="space-y-3 pt-2 border-t border-zinc-800/80">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-medium text-zinc-300">
+                          Overlay Transform &amp; PiP
+                        </span>
+                        {customized && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateClip(selectedClip.id, {
+                                overlayTransform: { ...DEFAULT_OVERLAY_TRANSFORM },
+                              })
+                            }
+                            className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:text-white"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Mode Presets: PiP / Watermark / Full Frame */}
+                      <div className="grid grid-cols-3 gap-1">
+                        {OVERLAY_MODE_PRESETS.map((mode) => (
+                          <button
+                            key={mode.id}
+                            type="button"
+                            onClick={() => {
+                              const applied = applyOverlayPreset(ov, mode.id);
+                              updateClip(selectedClip.id, {
+                                overlayTransform: applied.overlayTransform,
+                                ...(applied.suggestedOpacity !== undefined
+                                  ? { opacity: applied.suggestedOpacity }
+                                  : {}),
+                              });
+                            }}
+                            className="rounded-md border border-zinc-800 bg-[#09090B] py-1 px-1.5 text-[10px] font-medium text-zinc-300 hover:border-blue-500/60 hover:text-white transition-colors"
+                          >
+                            {mode.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Corner & Center Position Presets */}
+                      <div>
+                        <p className="text-[10px] text-zinc-500 mb-1">
+                          Corner &amp; Center Presets
+                        </p>
+                        <div className="grid grid-cols-3 gap-1">
+                          {OVERLAY_POSITION_PRESETS.map((pos) => {
+                            const isAtPos =
+                              Math.abs(ov.x - pos.x) < 1.5 && Math.abs(ov.y - pos.y) < 1.5;
+                            return (
+                              <button
+                                key={pos.id}
+                                type="button"
+                                onClick={() => {
+                                  const applied = applyOverlayPreset(ov, pos.id);
+                                  updateClip(selectedClip.id, {
+                                    overlayTransform: applied.overlayTransform,
+                                  });
+                                }}
+                                className={`rounded-md py-1 px-1 text-[10px] font-medium border truncate transition-colors ${
+                                  isAtPos
+                                    ? "border-blue-500 bg-blue-500/15 text-white"
+                                    : "border-zinc-800 bg-[#09090B] text-zinc-400 hover:text-zinc-200"
+                                }`}
+                              >
+                                {pos.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* X / Y Position Sliders */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span className="text-zinc-400">X (%)</span>
+                            <span className="font-mono text-zinc-300 tabular-nums">
+                              {ov.x.toFixed(0)}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={1}
+                            value={ov.x}
+                            onChange={(e) =>
+                              updateClip(selectedClip.id, {
+                                overlayTransform: normalizeOverlayTransform({
+                                  ...ov,
+                                  x: Number(e.target.value),
+                                }),
+                              })
+                            }
+                            className="w-full accent-blue-500"
+                            aria-label="Overlay X position"
+                          />
+                        </div>
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span className="text-zinc-400">Y (%)</span>
+                            <span className="font-mono text-zinc-300 tabular-nums">
+                              {ov.y.toFixed(0)}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={1}
+                            value={ov.y}
+                            onChange={(e) =>
+                              updateClip(selectedClip.id, {
+                                overlayTransform: normalizeOverlayTransform({
+                                  ...ov,
+                                  y: Number(e.target.value),
+                                }),
+                              })
+                            }
+                            className="w-full accent-blue-500"
+                            aria-label="Overlay Y position"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Uniform Scale */}
+                      <div>
+                        <div className="flex items-center justify-between text-[11px] mb-1">
+                          <span className="text-zinc-400">Scale</span>
+                          <span className="font-mono text-zinc-300 tabular-nums">
+                            {Math.round(ov.scale * 100)}% ({effBox.widthPct.toFixed(0)}% ×{" "}
+                            {effBox.heightPct.toFixed(0)}%)
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.1}
+                          max={1.5}
+                          step={0.05}
+                          value={ov.scale}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              overlayTransform: normalizeOverlayTransform({
+                                ...ov,
+                                scale: Number(e.target.value),
+                              }),
+                            })
+                          }
+                          className="w-full accent-violet-500"
+                          aria-label="Overlay scale"
+                        />
+                      </div>
+
+                      {/* Width / Height with Aspect Ratio Lock */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span className="text-zinc-400">Width (%)</span>
+                            <span className="font-mono text-zinc-300 tabular-nums">
+                              {ov.widthPct.toFixed(0)}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={5}
+                            max={100}
+                            step={1}
+                            value={ov.widthPct}
+                            onChange={(e) => {
+                              const dims = updateOverlayBoxDimensions(
+                                ov,
+                                { widthPct: Number(e.target.value) },
+                                {
+                                  aspectRatio: project.aspectRatio,
+                                  sourceWidth: selectedClip.sourceWidth,
+                                  sourceHeight: selectedClip.sourceHeight,
+                                }
+                              );
+                              updateClip(selectedClip.id, {
+                                overlayTransform: normalizeOverlayTransform({
+                                  ...ov,
+                                  ...dims,
+                                }),
+                              });
+                            }}
+                            className="w-full accent-blue-500"
+                            aria-label="Overlay width percentage"
+                          />
+                        </div>
+                        <div>
+                          <div className="flex items-center justify-between text-[11px] mb-1">
+                            <span className="text-zinc-400">Height (%)</span>
+                            <span className="font-mono text-zinc-300 tabular-nums">
+                              {ov.heightPct.toFixed(0)}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={5}
+                            max={100}
+                            step={1}
+                            value={ov.heightPct}
+                            onChange={(e) => {
+                              const dims = updateOverlayBoxDimensions(
+                                ov,
+                                { heightPct: Number(e.target.value) },
+                                {
+                                  aspectRatio: project.aspectRatio,
+                                  sourceWidth: selectedClip.sourceWidth,
+                                  sourceHeight: selectedClip.sourceHeight,
+                                }
+                              );
+                              updateClip(selectedClip.id, {
+                                overlayTransform: normalizeOverlayTransform({
+                                  ...ov,
+                                  ...dims,
+                                }),
+                              });
+                            }}
+                            className="w-full accent-blue-500"
+                            aria-label="Overlay height percentage"
+                          />
+                        </div>
+                      </div>
+
+                      <label className="flex items-center justify-between text-[11px] text-zinc-300 cursor-pointer pt-0.5">
+                        <span>Lock Aspect Ratio</span>
+                        <input
+                          type="checkbox"
+                          checked={ov.lockAspectRatio}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              overlayTransform: normalizeOverlayTransform({
+                                ...ov,
+                                lockAspectRatio: e.target.checked,
+                              }),
+                            })
+                          }
+                          className="accent-blue-500 h-3.5 w-3.5 rounded"
+                        />
+                      </label>
+                    </div>
+                  );
+                })()}
 
               {(selectedClip.kind === "video" || selectedClip.kind === "image") && (() => {
                 const eff = normalizeEffects(selectedClip.effects);

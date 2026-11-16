@@ -23,6 +23,11 @@ export const AssistantRequestSchema = z.object({
         sourceDuration: z.number(),
         speed: z.number(),
         volume: z.number(),
+        opacity: z.number().optional(),
+        effects: z.record(z.string(), z.unknown()).optional(),
+        transitionIn: z.record(z.string(), z.unknown()).optional(),
+        transitionOut: z.record(z.string(), z.unknown()).optional(),
+        overlayTransform: z.record(z.string(), z.unknown()).optional(),
         text: z.string().optional(),
       })
     ),

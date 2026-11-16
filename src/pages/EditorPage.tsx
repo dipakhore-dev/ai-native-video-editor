@@ -37,6 +37,7 @@ import {
   normalizeEffects,
   normalizeTransition,
 } from "../utils/effects";
+import { computeEffectiveOverlayBox, normalizeOverlayTransform } from "../utils/overlays";
 import { formatBytes, formatTimecode } from "../utils/media";
 import { getSubtitleStyle, hexToRgba } from "../utils/subtitles";
 
@@ -56,6 +57,7 @@ export function EditorPage() {
     relinkMissingClipAsset,
     addClipToTimeline,
     addTextOverlay,
+    updateClip,
     updateTextStyle,
     commitProjectSnapshot,
     splitClipAtTime,
@@ -76,6 +78,7 @@ export function EditorPage() {
   const relinkInputRef = useRef<HTMLInputElement | null>(null);
   const relinkTargetAssetIdRef = useRef<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const v2VideoRef = useRef<HTMLVideoElement | null>(null);
   const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaGainMapRef = useRef<
@@ -83,6 +86,7 @@ export function EditorPage() {
   >(new WeakMap());
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
   const lastSyncedVideoClipIdRef = useRef<string | null>(null);
+  const lastSyncedV2ClipIdRef = useRef<string | null>(null);
   const lastSyncedAudioMapRef = useRef<Map<string, boolean>>(new Map());
 
   const [playheadTime, setPlayheadTime] = useState(0);
@@ -401,6 +405,73 @@ export function EditorPage() {
     syncVideoElement();
   }, [syncVideoElement]);
 
+  const syncV2VideoElement = useCallback(() => {
+    const vid = v2VideoRef.current;
+    if (
+      !vid ||
+      !activeV1Clip ||
+      !activeV2Clip ||
+      activeV2Clip.kind !== "video" ||
+      activeV2Clip.needsRelink ||
+      v2Track?.muted
+    ) {
+      lastSyncedV2ClipIdRef.current = null;
+      if (vid && !vid.paused) {
+        vid.pause();
+      }
+      return;
+    }
+
+    const clipChanged = lastSyncedV2ClipIdRef.current !== activeV2Clip.id;
+    const targetSourceTime =
+      activeV2Clip.inPoint + (playheadTime - activeV2Clip.startTime) * activeV2Clip.speed;
+
+    vid.playbackRate = playbackRate * activeV2Clip.speed;
+    const { effectiveGain, isMuted } = computeEffectiveClipGain({
+      clip: activeV2Clip,
+      timelineTimeSec: playheadTime,
+      trackMuted: Boolean(v2Track?.muted),
+      masterVolume,
+      masterMuted,
+    });
+    applyClipAudioGain(vid, effectiveGain, isMuted);
+
+    const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
+    if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
+      try {
+        vid.currentTime = Math.max(0, Math.min(vid.duration || targetSourceTime, targetSourceTime));
+        lastSyncedV2ClipIdRef.current = activeV2Clip.id;
+      } catch {
+        // Ignore seek errors while media decodes
+      }
+    } else if (vid.readyState >= 1 && clipChanged) {
+      lastSyncedV2ClipIdRef.current = activeV2Clip.id;
+    }
+
+    if (isPlaying && vid.paused) {
+      if (audioCtxRef.current?.state === "suspended") {
+        void audioCtxRef.current.resume().catch(() => {});
+      }
+      void vid.play().catch(() => {});
+    } else if (!isPlaying && !vid.paused) {
+      vid.pause();
+    }
+  }, [
+    activeV1Clip,
+    activeV2Clip,
+    playheadTime,
+    isPlaying,
+    playbackRate,
+    masterMuted,
+    masterVolume,
+    v2Track?.muted,
+    applyClipAudioGain,
+  ]);
+
+  useEffect(() => {
+    syncV2VideoElement();
+  }, [syncV2VideoElement]);
+
   // Synchronize all A1 Audio track elements via Web Audio GainNodes (volume 0-200%, fades, ducking, mute)
   useEffect(() => {
     const activeIds = new Set(a1AudioClips.map((c) => c.id));
@@ -650,6 +721,66 @@ export function EditorPage() {
       updateTextStyle(
         clip.id,
         { x: Number(xPct.toFixed(1)), y: Number(yPct.toFixed(1)) },
+        false
+      );
+    };
+
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      if (moved) {
+        commitProjectSnapshot(beforeSnapshot);
+      }
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const handleV2OverlayDrag = (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip) => {
+    e.stopPropagation();
+    setSelectedClipId(clip.id);
+    if (!previewFrameRef.current || !activeProject) return;
+
+    const beforeTransform = normalizeOverlayTransform(clip.overlayTransform);
+    const beforeSnapshot: Project = {
+      ...activeProject,
+      tracks: activeProject.tracks.map((t) => ({ ...t })),
+      clips: activeProject.clips.map((c) => ({
+        ...c,
+        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
+        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+        transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
+        transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
+        effects: c.effects ? normalizeEffects(c.effects) : undefined,
+        overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
+      })),
+    };
+
+    const rect = previewFrameRef.current.getBoundingClientRect();
+    const startMouseX = e.clientX;
+    const startMouseY = e.clientY;
+    const startX = beforeTransform.x;
+    const startY = beforeTransform.y;
+    let moved = false;
+
+    const onMove = (moveEv: MouseEvent) => {
+      const dxPct = ((moveEv.clientX - startMouseX) / Math.max(1, rect.width)) * 100;
+      const dyPct = ((moveEv.clientY - startMouseY) / Math.max(1, rect.height)) * 100;
+      if (Math.abs(dxPct) > 0.2 || Math.abs(dyPct) > 0.2) {
+        moved = true;
+      }
+      const nextX = Math.min(100, Math.max(0, startX + dxPct));
+      const nextY = Math.min(100, Math.max(0, startY + dyPct));
+      updateClip(
+        clip.id,
+        {
+          overlayTransform: normalizeOverlayTransform({
+            ...beforeTransform,
+            x: Number(nextX.toFixed(1)),
+            y: Number(nextY.toFixed(1)),
+          }),
+        },
         false
       );
     };
@@ -1115,25 +1246,64 @@ export function EditorPage() {
                     </div>
                   )}
 
-                  {/* Optional V2 Overlay Image Layer when V1 is also active */}
+                  {/* Optional V2 Overlay Image / PiP Video Layer when V1 is also active */}
                   {activeV1Clip &&
                     activeV2Clip &&
-                    activeV2Clip.kind === "image" &&
+                    (activeV2Clip.kind === "image" || activeV2Clip.kind === "video") &&
                     !v2Track?.muted &&
                     !activeV2Clip.needsRelink &&
-                    activeV2Clip.objectUrl && (
-                      <img
-                        src={activeV2Clip.objectUrl}
-                        alt={activeV2Clip.name}
-                        style={{
-                          ...computeClipTransitionStyle(activeV2Clip, playheadTime),
-                          ...(buildPreviewCssFilter(activeV2Clip.effects) !== "none"
-                            ? { filter: buildPreviewCssFilter(activeV2Clip.effects) }
-                            : {}),
-                        }}
-                        className="absolute inset-0 h-full w-full object-contain pointer-events-none"
-                      />
-                    )}
+                    activeV2Clip.objectUrl &&
+                    (() => {
+                      const ovBox = computeEffectiveOverlayBox(activeV2Clip.overlayTransform);
+                      const v2TransStyle = computeClipTransitionStyle(activeV2Clip, playheadTime);
+                      const v2Filter = buildPreviewCssFilter(activeV2Clip.effects);
+                      const isV2Selected = activeV2Clip.id === selectedClipId;
+                      return (
+                        <div
+                          onMouseDown={(e) => handleV2OverlayDrag(e, activeV2Clip)}
+                          style={{
+                            left: `${ovBox.x}%`,
+                            top: `${ovBox.y}%`,
+                            width: `${ovBox.widthPct}%`,
+                            height: `${ovBox.heightPct}%`,
+                            transform: "translate(-50%, -50%)",
+                          }}
+                          className={`absolute z-[5] cursor-move select-none ${
+                            isV2Selected ? "ring-1 ring-blue-400/90" : "hover:ring-1 hover:ring-blue-400/40"
+                          }`}
+                          title="Drag to reposition V2 overlay"
+                        >
+                          {activeV2Clip.kind === "video" ? (
+                            <video
+                              ref={v2VideoRef}
+                              src={activeV2Clip.objectUrl}
+                              onLoadedMetadata={syncV2VideoElement}
+                              onCanPlay={syncV2VideoElement}
+                              playsInline
+                              style={{
+                                ...v2TransStyle,
+                                ...(v2Filter !== "none" ? { filter: v2Filter } : {}),
+                              }}
+                              className={`h-full w-full pointer-events-none ${
+                                ovBox.lockAspectRatio ? "object-contain" : "object-fill"
+                              }`}
+                            />
+                          ) : (
+                            <img
+                              src={activeV2Clip.objectUrl}
+                              alt={activeV2Clip.name}
+                              style={{
+                                ...v2TransStyle,
+                                ...(v2Filter !== "none" ? { filter: v2Filter } : {}),
+                              }}
+                              className={`h-full w-full pointer-events-none ${
+                                ovBox.lockAspectRatio ? "object-contain" : "object-fill"
+                              }`}
+                            />
+                          )}
+                        </div>
+                      );
+                    })()}
 
                   {/* Active Editable Text Overlays (Draggable on Preview Canvas) */}
                   {activeTextClips.map((textClip) => {

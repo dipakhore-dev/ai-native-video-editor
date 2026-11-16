@@ -407,6 +407,14 @@ interface ParsedTimelineExportSpec {
       saturation?: number;
       blur?: number;
     };
+    overlayTransform?: {
+      x?: number;
+      y?: number;
+      widthPct?: number;
+      heightPct?: number;
+      scale?: number;
+      lockAspectRatio?: boolean;
+    };
     textStyle?: {
       text?: string;
       fontSize?: number;
@@ -600,6 +608,40 @@ function validateTimelineExportSpec(
         (!Number.isFinite(Number(fx.blur)) || Number(fx.blur) < 0 || Number(fx.blur) > 10)
       ) {
         return `Clip '${name}' blur must be between 0 and 10.`;
+      }
+    }
+
+    if (clip.overlayTransform) {
+      const ov = clip.overlayTransform;
+      if (
+        ov.x !== undefined &&
+        (!Number.isFinite(Number(ov.x)) || Number(ov.x) < 0 || Number(ov.x) > 100)
+      ) {
+        return `Clip '${name}' overlay X position must be between 0% and 100%.`;
+      }
+      if (
+        ov.y !== undefined &&
+        (!Number.isFinite(Number(ov.y)) || Number(ov.y) < 0 || Number(ov.y) > 100)
+      ) {
+        return `Clip '${name}' overlay Y position must be between 0% and 100%.`;
+      }
+      if (
+        ov.widthPct !== undefined &&
+        (!Number.isFinite(Number(ov.widthPct)) || Number(ov.widthPct) < 5 || Number(ov.widthPct) > 100)
+      ) {
+        return `Clip '${name}' overlay width must be between 5% and 100%.`;
+      }
+      if (
+        ov.heightPct !== undefined &&
+        (!Number.isFinite(Number(ov.heightPct)) || Number(ov.heightPct) < 5 || Number(ov.heightPct) > 100)
+      ) {
+        return `Clip '${name}' overlay height must be between 5% and 100%.`;
+      }
+      if (
+        ov.scale !== undefined &&
+        (!Number.isFinite(Number(ov.scale)) || Number(ov.scale) < 0.1 || Number(ov.scale) > 2)
+      ) {
+        return `Clip '${name}' overlay scale must be between 0.1 and 2.0.`;
       }
     }
 

@@ -374,6 +374,8 @@ export function reconcileProjectWithMediaAssets(
       const nextName = clip.sourceName || asset.name;
       const nextSize = clip.sourceSizeBytes ?? asset.sizeBytes;
       const nextMime = clip.sourceMimeType || asset.mimeType;
+      const nextWidth = clip.sourceWidth ?? asset.width;
+      const nextHeight = clip.sourceHeight ?? asset.height;
 
       if (
         clip.objectUrl !== asset.objectUrl ||
@@ -382,7 +384,9 @@ export function reconcileProjectWithMediaAssets(
         clip.waveformPeaks !== nextWaveform ||
         clip.sourceName !== nextName ||
         clip.sourceSizeBytes !== nextSize ||
-        clip.sourceMimeType !== nextMime
+        clip.sourceMimeType !== nextMime ||
+        clip.sourceWidth !== nextWidth ||
+        clip.sourceHeight !== nextHeight
       ) {
         anyClipChanged = true;
         return {
@@ -393,6 +397,8 @@ export function reconcileProjectWithMediaAssets(
           sourceName: nextName,
           sourceSizeBytes: nextSize,
           sourceMimeType: nextMime,
+          ...(nextWidth ? { sourceWidth: nextWidth } : {}),
+          ...(nextHeight ? { sourceHeight: nextHeight } : {}),
           needsRelink: false,
         };
       }

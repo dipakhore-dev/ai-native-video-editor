@@ -57,6 +57,7 @@ function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
     transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
     transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
     effects: c.effects ? normalizeEffects(c.effects) : undefined,
+    overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
   };
 }
 

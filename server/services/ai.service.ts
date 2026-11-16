@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import mongoose from "mongoose";
 import { getEnvConfig, isGeminiConfigured } from "../config/env.ts";
 import { isDatabaseConnected } from "../config/database.ts";
@@ -26,6 +26,11 @@ export interface TimelineMetadataInput {
     sourceDuration: number;
     speed: number;
     volume: number;
+    opacity?: number;
+    effects?: Record<string, unknown>;
+    transitionIn?: Record<string, unknown>;
+    transitionOut?: Record<string, unknown>;
+    overlayTransform?: Record<string, unknown>;
     text?: string;
   }>;
 }
@@ -65,115 +70,153 @@ Only use these operation types:
 5. "split_clip": split a clip at a timestamp ("atTime", optional "clipId", "reason").
 6. "delete_clip": remove a clip ("clipId", "reason").
 7. "set_clip_speed": change playback speed between 0.5 and 2 ("speed", optional "clipId", "reason").
-8. "set_clip_volume": change clip volume between 0 and 1 ("volume", optional "clipId", "reason").
+8. "set_clip_volume": change clip volume between 0 and 2 ("volume", optional "clipId", "reason").
 9. "reorder_clip": move a clip "earlier" or "later" on its track ("clipId", "direction", "reason").
-10. "unsupported": use whenever the user asks for anything requiring server-side media/audio processing or unimplemented capabilities (such as generating/transcribing subtitles or captions from audio, background noise removal, face blurring, color grading LUTs, AI object removal, or rendering/exporting MP4 files). Set "requestedAction", "reason" (explaining clearly why a media-processing backend is required), and "requiresBackendProcessing": true.
+10. "set_clip_effects": apply color grading presets, black-and-white filter, brightness, contrast, saturation, or blur to one clip or all V1 clips.
+   Fields: optional "clipId", optional "targetScope" ("clip" | "all_v1"), optional "preset" ("none" | "cinematic" | "bw" | "vintage" | "warm" | "cool" | "vivid"), optional "brightness" (-0.5..0.5), optional "brightnessDelta" (-0.5..0.5, use e.g. 0.15 for "increase brightness" or -0.15 for "darken"), optional "contrast" (0.5..1.8), optional "saturation" (0..2), optional "blur" (0..10), and "reason".
+   - If user says "Make the video black and white" without naming one clip, set "targetScope": "all_v1" and "preset": "bw".
+   - If user says "Apply cinematic filter to the first clip", resolve the earliest track_v1 clip ID and MUST include "preset": "cinematic".
+   - If user says "Increase brightness of the selected clip", set "clipId": selectedClipId (or omit if null) and MUST include "brightnessDelta": 0.15.
+   - CRITICAL: Every "set_clip_effects" operation MUST include at least one of "preset", "brightness", "brightnessDelta", "contrast", "saturation", or "blur". Never omit all effect parameters.
+11. "set_clip_transition": add transitions on a clip or between adjacent V1 clips.
+   Fields: optional "clipId", optional "targetScope" ("clip" | "between_v1_clips"), optional "edge" ("in" | "out" | "both"), "transitionType" ("none" | "fade" | "dissolve" | "wipeleft" | "wiperight" | "slideleft" | "slideright" | "zoomin"), optional "durationSec" (0.2..2.0, default 0.6), and "reason".
+   - For "Add a 1-second cross dissolve between clips", set "targetScope": "between_v1_clips", "edge": "out", "transitionType": "dissolve", and MUST set "durationSec": 1.0 (always honor the user's explicit seconds).
+12. "set_clip_opacity": change clip visual opacity between 0 and 1 ("opacity" 0..1, optional "clipId", "reason"). For example, "Set the logo opacity to 60%" sets clipId to the track_v2 logo/overlay clip (if present) and "opacity": 0.6.
+13. "set_overlay_transform": position, resize, scale, or apply layout presets to a V2 image/video overlay ("track_v2" clip such as logo, watermark, or PiP).
+   Fields: optional "clipId", optional "preset" ("top-left" | "top-center" | "top-right" | "center" | "bottom-left" | "bottom-right" | "pip" | "watermark" | "fullscreen"), optional "x" (0..100), optional "y" (0..100), optional "widthPct" (5..100), optional "heightPct" (5..100), optional "scale" (0.1..2.0), optional "lockAspectRatio" boolean, and "reason".
+   - For "Move the logo to the top-right corner", target the track_v2 overlay clip ID and set "preset": "top-right".
+   - For "Put overlay in picture-in-picture mode", set "preset": "pip".
+14. "unsupported": use whenever the user asks for anything requiring offline/specialized media AI not available in timeline ops (such as generating/transcribing subtitles or captions from audio — remind them to use the Generate Subtitles panel — background noise removal, face blurring, AI object removal, or rendering/exporting MP4 files). Set "requestedAction", "reason", and "requiresBackendProcessing": true.
 
-Always inspect the provided timelineMetadata carefully. If the user says "Add a title at the beginning", set startTime: 0 and pick a concise, sensible title unless they specified exact text. Only include fields relevant to each operation's type.`;
+Always inspect the provided timelineMetadata carefully (trackId, clip names, selectedClipId, current effects/opacity/overlayTransform). Match target clip IDs accurately: "first clip" -> earliest track_v1 clip id; "selected clip" -> selectedClipId; "logo"/"watermark"/"overlay"/"PiP" -> track_v2 clip id. Only include fields relevant to each operation's type, and ALWAYS include the requested numeric or preset value.
 
-  const callGemini = async () =>
+Return ONLY valid JSON matching:
+{
+  "summary": "1-sentence summary",
+  "operations": [ ... ]
+}
+
+Concrete examples:
+- "Apply cinematic filter to the first clip." -> {"summary":"Apply cinematic filter to the first clip.","operations":[{"type":"set_clip_effects","clipId":"v1-clip-1","targetScope":"clip","preset":"cinematic","reason":"Apply cinematic preset to first clip."}]}
+- "Add a 1-second cross dissolve between clips." -> {"summary":"Add a 1-second cross dissolve between V1 clips.","operations":[{"type":"set_clip_transition","targetScope":"between_v1_clips","edge":"out","transitionType":"dissolve","durationSec":1.0,"reason":"Add 1s cross dissolve between clips."}]}
+- "Increase brightness of the selected clip." -> {"summary":"Increase brightness of selected clip.","operations":[{"type":"set_clip_effects","clipId":"v1-clip-1","targetScope":"clip","brightnessDelta":0.15,"reason":"Increase brightness of selected clip."}]}
+- "Move the logo to the top-right corner." -> {"summary":"Move logo overlay to top-right.","operations":[{"type":"set_overlay_transform","clipId":"v2-logo","preset":"top-right","reason":"Place logo at top-right corner."}]}`;
+
+  const callGemini = async (extraReminder?: string) =>
     ai.models.generateContent({
       model: "gemini-4-hydrogen",
       contents: `Current timeline metadata:\n${JSON.stringify(
         params.timelineMetadata,
         null,
         2
-      )}\n\nUser editing instruction: "${params.prompt}"`,
+      )}\n\nUser editing instruction: "${params.prompt}"${
+        extraReminder ? `\n\nValidation reminder: ${extraReminder}` : ""
+      }`,
       config: {
+        temperature: 0.1,
         systemInstruction,
         responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: {
-              type: Type.STRING,
-              description: "A concise 1-sentence summary of the proposed edits.",
-            },
-            operations: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  type: {
-                    type: Type.STRING,
-                    description:
-                      "One of: trim_start, trim_end, set_aspect_ratio, add_text_overlay, split_clip, delete_clip, set_clip_speed, set_clip_volume, reorder_clip, unsupported",
-                  },
-                  clipId: { type: Type.STRING },
-                  removeSeconds: { type: Type.NUMBER },
-                  rippleShift: { type: Type.BOOLEAN },
-                  aspectRatio: { type: Type.STRING },
-                  text: { type: Type.STRING },
-                  startTime: { type: Type.NUMBER },
-                  duration: { type: Type.NUMBER },
-                  x: { type: Type.NUMBER },
-                  y: { type: Type.NUMBER },
-                  fontSize: { type: Type.NUMBER },
-                  color: { type: Type.STRING },
-                  atTime: { type: Type.NUMBER },
-                  speed: { type: Type.NUMBER },
-                  volume: { type: Type.NUMBER },
-                  direction: { type: Type.STRING },
-                  requestedAction: { type: Type.STRING },
-                  requiresBackendProcessing: { type: Type.BOOLEAN },
-                  reason: { type: Type.STRING },
-                },
-                required: ["type", "reason"],
-              },
-            },
-          },
-          required: ["summary", "operations"],
-        },
       },
     });
 
-  let response: Awaited<ReturnType<typeof callGemini>> | undefined;
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      response = await callGemini();
-      break;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isTransient =
-        msg.includes("503") ||
-        msg.includes("429") ||
-        msg.includes("UNAVAILABLE") ||
-        msg.includes("RESOURCE_EXHAUSTED");
-      if (!isTransient || attempt === maxAttempts) {
-        throw err;
+  const validatePlanCompleteness = (plan: AiEditPlan): string | null => {
+    for (const op of plan.operations) {
+      if (
+        op.type === "set_clip_effects" &&
+        op.preset === undefined &&
+        op.brightness === undefined &&
+        op.brightnessDelta === undefined &&
+        op.contrast === undefined &&
+        op.saturation === undefined &&
+        op.blur === undefined
+      ) {
+        return "Every 'set_clip_effects' operation MUST include at least one parameter: preset, brightness, brightnessDelta, contrast, saturation, or blur.";
       }
-      await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+      if (
+        op.type === "set_overlay_transform" &&
+        op.preset === undefined &&
+        op.x === undefined &&
+        op.y === undefined &&
+        op.widthPct === undefined &&
+        op.heightPct === undefined &&
+        op.scale === undefined &&
+        op.lockAspectRatio === undefined
+      ) {
+        return "Every 'set_overlay_transform' operation MUST include at least one transform property (preset, x, y, widthPct, heightPct, scale, or lockAspectRatio).";
+      }
     }
+    return null;
+  };
+
+  let planParse: ReturnType<typeof AiEditPlanSchema.safeParse> | undefined;
+  let extraReminder: string | undefined;
+
+  for (let semanticAttempt = 1; semanticAttempt <= 2; semanticAttempt += 1) {
+    let response: Awaited<ReturnType<typeof callGemini>> | undefined;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        response = await callGemini(extraReminder);
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient =
+          msg.includes("503") ||
+          msg.includes("429") ||
+          msg.includes("UNAVAILABLE") ||
+          msg.includes("RESOURCE_EXHAUSTED");
+        if (!isTransient || attempt === maxAttempts) {
+          throw err;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+      }
+    }
+
+    const rawText = (response?.text ?? "").trim();
+    if (!rawText) {
+      throw Object.assign(
+        new Error("Gemini returned an empty response. Try rephrasing your editing instruction."),
+        { statusCode: 502 }
+      );
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(rawText);
+    } catch {
+      throw Object.assign(new Error("Gemini returned non-JSON output that could not be parsed."), {
+        statusCode: 502,
+      });
+    }
+
+    planParse = AiEditPlanSchema.safeParse(parsedJson);
+    if (!planParse.success) {
+      if (semanticAttempt === 2) {
+        throw Object.assign(
+          new Error(
+            `Proposed operations failed Zod validation: ${planParse.error.issues
+              .map((i) => `${i.path.join(".")}: ${i.message}`)
+              .join("; ")}`
+          ),
+          { statusCode: 422 }
+        );
+      }
+      extraReminder = "Output valid JSON matching the exact schema field names and numeric bounds.";
+      continue;
+    }
+
+    const completenessErr = validatePlanCompleteness(planParse.data);
+    if (!completenessErr) {
+      break;
+    }
+    if (semanticAttempt === 2) {
+      throw Object.assign(new Error(completenessErr), { statusCode: 422 });
+    }
+    extraReminder = completenessErr;
   }
 
-  const rawText = (response?.text ?? "").trim();
-  if (!rawText) {
-    throw Object.assign(
-      new Error("Gemini returned an empty response. Try rephrasing your editing instruction."),
-      { statusCode: 502 }
-    );
-  }
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(rawText);
-  } catch {
-    throw Object.assign(new Error("Gemini returned non-JSON output that could not be parsed."), {
-      statusCode: 502,
-    });
-  }
-
-  const planParse = AiEditPlanSchema.safeParse(parsedJson);
-  if (!planParse.success) {
-    throw Object.assign(
-      new Error(
-        `Proposed operations failed Zod validation: ${planParse.error.issues
-          .map((i) => `${i.path.join(".")}: ${i.message}`)
-          .join("; ")}`
-      ),
-      { statusCode: 422 }
-    );
+  if (!planParse || !planParse.success) {
+    throw Object.assign(new Error("Failed to parse valid AI edit operations."), { statusCode: 422 });
   }
 
   let requestId: string | undefined;

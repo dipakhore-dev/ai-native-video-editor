@@ -78,6 +78,11 @@ export interface TimelineMetadataPayload {
     sourceDuration: number;
     speed: number;
     volume: number;
+    opacity?: number;
+    effects?: Record<string, unknown>;
+    transitionIn?: Record<string, unknown>;
+    transitionOut?: Record<string, unknown>;
+    overlayTransform?: Record<string, unknown>;
     text?: string;
   }>;
 }
@@ -371,6 +376,9 @@ export function mapServerProjectToStudioProject(dto: ServerProjectDto): Project 
       ...(c.transitionIn ? { transitionIn: { ...c.transitionIn } } : {}),
       ...(c.transitionOut ? { transitionOut: { ...c.transitionOut } } : {}),
       ...(c.effects ? { effects: { ...c.effects } } : {}),
+      ...(c.overlayTransform ? { overlayTransform: { ...c.overlayTransform } } : {}),
+      ...(c.sourceWidth ? { sourceWidth: c.sourceWidth } : {}),
+      ...(c.sourceHeight ? { sourceHeight: c.sourceHeight } : {}),
       objectUrl: "",
       needsRelink: c.kind !== "text",
     })),
@@ -408,6 +416,9 @@ function serializeClipForServer(clip: TimelineClip) {
     ...(clip.transitionIn ? { transitionIn: clip.transitionIn } : {}),
     ...(clip.transitionOut ? { transitionOut: clip.transitionOut } : {}),
     ...(clip.effects ? { effects: clip.effects } : {}),
+    ...(clip.overlayTransform ? { overlayTransform: clip.overlayTransform } : {}),
+    ...(clip.sourceWidth ? { sourceWidth: clip.sourceWidth } : {}),
+    ...(clip.sourceHeight ? { sourceHeight: clip.sourceHeight } : {}),
     ...(clip.sourceName ? { sourceName: clip.sourceName } : {}),
     ...(clip.sourceSizeBytes !== undefined ? { sourceSizeBytes: clip.sourceSizeBytes } : {}),
     ...(clip.sourceMimeType ? { sourceMimeType: clip.sourceMimeType } : {}),

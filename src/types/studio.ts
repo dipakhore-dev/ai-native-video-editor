@@ -80,6 +80,26 @@ export interface ClipVisualEffects {
   blur: number; // 0 to 10 (default 0)
 }
 
+export type OverlayPresetId =
+  | "top-left"
+  | "top-center"
+  | "top-right"
+  | "center"
+  | "bottom-left"
+  | "bottom-right"
+  | "pip"
+  | "watermark"
+  | "fullscreen";
+
+export interface OverlayTransform {
+  x: number; // 0 to 100 (% horizontal center)
+  y: number; // 0 to 100 (% vertical center)
+  widthPct: number; // 5 to 100 (% of canvas width)
+  heightPct: number; // 5 to 100 (% of canvas height)
+  scale: number; // 0.1 to 2.0 (uniform scale multiplier)
+  lockAspectRatio: boolean;
+}
+
 export interface TimelineClip {
   id: string;
   assetId: string;
@@ -101,6 +121,9 @@ export interface TimelineClip {
   transitionIn?: ClipTransition;
   transitionOut?: ClipTransition;
   effects?: ClipVisualEffects;
+  overlayTransform?: OverlayTransform;
+  sourceWidth?: number;
+  sourceHeight?: number;
   thumbnailUrl?: string;
   waveformPeaks?: number[];
   objectUrl: string;
@@ -182,6 +205,9 @@ export interface RenderTimelineClipSpec {
   transitionIn?: ClipTransition;
   transitionOut?: ClipTransition;
   effects?: ClipVisualEffects;
+  overlayTransform?: OverlayTransform;
+  sourceWidth?: number;
+  sourceHeight?: number;
   fileIndex?: number;
   textStyle?: TextOverlayStyle;
 }

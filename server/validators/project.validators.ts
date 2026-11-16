@@ -34,6 +34,15 @@ export const ClipVisualEffectsSchema = z.object({
   blur: z.number().min(0).max(10).default(0),
 });
 
+export const OverlayTransformSchema = z.object({
+  x: z.number().min(0).max(100).default(50),
+  y: z.number().min(0).max(100).default(50),
+  widthPct: z.number().min(5).max(100).default(100),
+  heightPct: z.number().min(5).max(100).default(100),
+  scale: z.number().min(0.1).max(2).default(1),
+  lockAspectRatio: z.boolean().default(true),
+});
+
 export const TimelineClipSchema = z.object({
   id: z.string().min(1),
   assetId: z.string().min(1),
@@ -55,6 +64,9 @@ export const TimelineClipSchema = z.object({
   transitionIn: ClipTransitionSchema.optional(),
   transitionOut: ClipTransitionSchema.optional(),
   effects: ClipVisualEffectsSchema.optional(),
+  overlayTransform: OverlayTransformSchema.optional(),
+  sourceWidth: z.number().int().positive().optional(),
+  sourceHeight: z.number().int().positive().optional(),
   sourceName: z.string().optional(),
   sourceSizeBytes: z.number().min(0).optional(),
   sourceMimeType: z.string().optional(),

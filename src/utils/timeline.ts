@@ -13,6 +13,7 @@ import {
   clampVolume,
 } from "./audio";
 import { hasCustomEffects, normalizeEffects, normalizeTransition } from "./effects";
+import { hasCustomOverlayTransform, normalizeOverlayTransform } from "./overlays";
 
 export function createDefaultTracks(): TimelineTrack[] {
   return [
@@ -71,6 +72,7 @@ export function splitClipAtTimestamp(
     ...(leftTransitionIn ? { transitionIn: leftTransitionIn } : {}),
     transitionOut: undefined,
     effects: target.effects ? { ...target.effects } : undefined,
+    overlayTransform: target.overlayTransform ? { ...target.overlayTransform } : undefined,
   };
 
   const rightClip: TimelineClip = {
@@ -84,6 +86,7 @@ export function splitClipAtTimestamp(
     transitionIn: undefined,
     ...(rightTransitionOut ? { transitionOut: rightTransitionOut } : {}),
     effects: target.effects ? { ...target.effects } : undefined,
+    overlayTransform: target.overlayTransform ? { ...target.overlayTransform } : undefined,
     textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
@@ -334,6 +337,7 @@ export function duplicateClipWithoutOverlap(
     transitionIn: target.transitionIn ? { ...target.transitionIn } : undefined,
     transitionOut: target.transitionOut ? { ...target.transitionOut } : undefined,
     effects: target.effects ? { ...target.effects } : undefined,
+    overlayTransform: target.overlayTransform ? { ...target.overlayTransform } : undefined,
     textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
@@ -482,6 +486,9 @@ export function buildStructuredTimelineSpec(
       const tIn = normalizeTransition(c.transitionIn, dur);
       const tOut = normalizeTransition(c.transitionOut, dur);
       const normEffects = normalizeEffects(c.effects);
+      const normOverlay = c.overlayTransform
+        ? normalizeOverlayTransform(c.overlayTransform)
+        : undefined;
       return {
         id: c.id,
         trackId: c.trackId,
@@ -510,6 +517,11 @@ export function buildStructuredTimelineSpec(
         ...(tIn.type !== "none" ? { transitionIn: tIn } : {}),
         ...(tOut.type !== "none" ? { transitionOut: tOut } : {}),
         ...(hasCustomEffects(normEffects) ? { effects: normEffects } : {}),
+        ...(normOverlay && (c.trackId === "track_v2" || hasCustomOverlayTransform(normOverlay))
+          ? { overlayTransform: normOverlay }
+          : {}),
+        ...(c.sourceWidth ? { sourceWidth: c.sourceWidth } : {}),
+        ...(c.sourceHeight ? { sourceHeight: c.sourceHeight } : {}),
         ...(c.textStyle ? { textStyle: { ...c.textStyle } } : {}),
       };
     }),

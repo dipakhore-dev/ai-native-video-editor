@@ -146,7 +146,7 @@ interface StudioContextValue {
   deleteClip: (clipId: string) => void;
   toggleTrackMute: (trackId: string) => void;
   toggleTrackLock: (trackId: string) => void;
-  applyAiEditPlan: (operations: AiEditOperation[]) => ApplyOperationsResult;
+  applyAiEditPlan: (operations: AiEditOperation[], selectedClipId?: string | null) => ApplyOperationsResult;
   replaceClipSubtitles: (
     clipId: string,
     segments: SubtitleSegment[],
@@ -210,6 +210,7 @@ function cloneProject(project: Project): Project {
       transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
       transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
       effects: c.effects ? { ...c.effects } : undefined,
+      overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
       textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     })),
     subtitles: project.subtitles ? project.subtitles.map((s) => ({ ...s })) : [],
@@ -1133,6 +1134,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
               : {}),
             speed: 1,
             opacity: 1,
+            ...(asset.width ? { sourceWidth: asset.width } : {}),
+            ...(asset.height ? { sourceHeight: asset.height } : {}),
             thumbnailUrl: asset.thumbnailUrl,
             waveformPeaks: asset.waveformPeaks,
             objectUrl: asset.objectUrl,
@@ -1493,7 +1496,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
 
   const applyAiEditPlan = useCallback(
-    (operations: AiEditOperation[]): ApplyOperationsResult => {
+    (operations: AiEditOperation[], selectedClipId?: string | null): ApplyOperationsResult => {
       let result: ApplyOperationsResult = {
         project: activeProject as Project,
         appliedCount: 0,
@@ -1501,7 +1504,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       };
 
       mutateActiveProject((proj) => {
-        result = applyAiOperationsToProject(proj, operations);
+        result = applyAiOperationsToProject(proj, operations, selectedClipId);
         const syncedSubs = syncSubtitlesForProjectClips(proj, result.project);
         result = {
           ...result,

@@ -32,6 +32,15 @@ export interface IClipVisualEffectsSubdoc {
   blur: number;
 }
 
+export interface IOverlayTransformSubdoc {
+  x: number;
+  y: number;
+  widthPct: number;
+  heightPct: number;
+  scale: number;
+  lockAspectRatio: boolean;
+}
+
 export interface ITimelineClipSubdoc {
   id: string;
   assetId: string;
@@ -53,6 +62,9 @@ export interface ITimelineClipSubdoc {
   transitionIn?: IClipTransitionSubdoc;
   transitionOut?: IClipTransitionSubdoc;
   effects?: IClipVisualEffectsSubdoc;
+  overlayTransform?: IOverlayTransformSubdoc;
+  sourceWidth?: number;
+  sourceHeight?: number;
   sourceName?: string;
   sourceSizeBytes?: number;
   sourceMimeType?: string;
@@ -150,6 +162,18 @@ const ClipVisualEffectsSchema = new Schema<IClipVisualEffectsSubdoc>(
   { _id: false }
 );
 
+const OverlayTransformSchema = new Schema<IOverlayTransformSubdoc>(
+  {
+    x: { type: Number, default: 50, min: 0, max: 100 },
+    y: { type: Number, default: 50, min: 0, max: 100 },
+    widthPct: { type: Number, default: 100, min: 5, max: 100 },
+    heightPct: { type: Number, default: 100, min: 5, max: 100 },
+    scale: { type: Number, default: 1, min: 0.1, max: 2 },
+    lockAspectRatio: { type: Boolean, default: true },
+  },
+  { _id: false }
+);
+
 const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
   {
     id: { type: String, required: true },
@@ -172,6 +196,9 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
     transitionIn: { type: ClipTransitionSchema, required: false },
     transitionOut: { type: ClipTransitionSchema, required: false },
     effects: { type: ClipVisualEffectsSchema, required: false },
+    overlayTransform: { type: OverlayTransformSchema, required: false },
+    sourceWidth: { type: Number },
+    sourceHeight: { type: Number },
     sourceName: { type: String },
     sourceSizeBytes: { type: Number },
     sourceMimeType: { type: String },
