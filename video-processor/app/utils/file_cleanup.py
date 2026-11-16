@@ -29,8 +29,17 @@ ALLOWED_AUDIO_EXTENSIONS = {
     ".flac",
 }
 
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+}
+
 ALLOWED_VIDEO_MIME_PREFIXES = ("video/",)
 ALLOWED_AUDIO_MIME_PREFIXES = ("audio/",)
+ALLOWED_IMAGE_MIME_PREFIXES = ("image/",)
 ALLOWED_EXACT_MIMES = {"application/octet-stream", "application/mp4"}
 
 
@@ -53,14 +62,16 @@ def validate_upload_headers(
     content_type: str | None,
     *,
     allow_audio: bool = False,
+    allow_images: bool = False,
 ) -> str:
     safe_name = sanitize_filename(filename)
     ext = Path(safe_name).suffix.lower()
-    allowed_exts = (
-        ALLOWED_VIDEO_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS
-        if allow_audio
-        else ALLOWED_VIDEO_EXTENSIONS
-    )
+    allowed_exts = set(ALLOWED_VIDEO_EXTENSIONS)
+    if allow_audio:
+        allowed_exts |= ALLOWED_AUDIO_EXTENSIONS
+    if allow_images:
+        allowed_exts |= ALLOWED_IMAGE_EXTENSIONS
+
     if ext and ext not in allowed_exts:
         raise FileValidationError(
             f"Unsupported media file extension '{ext}'. Allowed: {', '.join(sorted(allowed_exts))}.",
@@ -69,11 +80,12 @@ def validate_upload_headers(
 
     if content_type:
         mime = content_type.split(";")[0].strip().lower()
-        allowed_prefixes = (
-            ALLOWED_VIDEO_MIME_PREFIXES + ALLOWED_AUDIO_MIME_PREFIXES
-            if allow_audio
-            else ALLOWED_VIDEO_MIME_PREFIXES
-        )
+        allowed_prefixes: tuple[str, ...] = ALLOWED_VIDEO_MIME_PREFIXES
+        if allow_audio:
+            allowed_prefixes = allowed_prefixes + ALLOWED_AUDIO_MIME_PREFIXES
+        if allow_images:
+            allowed_prefixes = allowed_prefixes + ALLOWED_IMAGE_MIME_PREFIXES
+
         allowed_exact = (
             ALLOWED_EXACT_MIMES | {"application/x-m4a"}
             if allow_audio
@@ -83,7 +95,12 @@ def validate_upload_headers(
             mime.startswith(prefix) for prefix in allowed_prefixes
         )
         if not is_allowed:
-            expected_label = "video/* or audio/*" if allow_audio else "video/*"
+            expected_parts = ["video/*"]
+            if allow_audio:
+                expected_parts.append("audio/*")
+            if allow_images:
+                expected_parts.append("image/*")
+            expected_label = " or ".join(expected_parts)
             raise FileValidationError(
                 f"Unsupported MIME type '{mime}'. Expected a {expected_label} upload.",
                 status_code=400,

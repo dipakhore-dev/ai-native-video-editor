@@ -43,7 +43,15 @@ const ALLOWED_AUDIO_EXTENSIONS = new Set([
   ".flac",
 ]);
 
-function createMulterInstance(maxFiles = 1, allowAudio = false) {
+const ALLOWED_IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+]);
+
+function createMulterInstance(maxFiles = 1, allowExtraMedia = false) {
   const { videoUploadMaxMb } = getEnvConfig();
   return multer({
     dest: uploadTempDir,
@@ -59,11 +67,13 @@ function createMulterInstance(maxFiles = 1, allowAudio = false) {
         mime === "application/octet-stream" ||
         mime === "application/mp4";
       const isAudioMime =
-        allowAudio &&
+        allowExtraMedia &&
         (mime.startsWith("audio/") || mime === "application/x-m4a");
+      const isImageMime = allowExtraMedia && mime.startsWith("image/");
 
       const isVideoExt = !ext || ALLOWED_VIDEO_EXTENSIONS.has(ext);
-      const isAudioExt = allowAudio && (!ext || ALLOWED_AUDIO_EXTENSIONS.has(ext));
+      const isAudioExt = allowExtraMedia && (!ext || ALLOWED_AUDIO_EXTENSIONS.has(ext));
+      const isImageExt = allowExtraMedia && (!ext || ALLOWED_IMAGE_EXTENSIONS.has(ext));
 
       if (isVideoMime && isVideoExt) {
         cb(null, true);
@@ -73,15 +83,19 @@ function createMulterInstance(maxFiles = 1, allowAudio = false) {
         cb(null, true);
         return;
       }
-      if (allowAudio && mime === "video/mp4" && ext === ".m4a") {
+      if (isImageMime && isImageExt) {
+        cb(null, true);
+        return;
+      }
+      if (allowExtraMedia && mime === "video/mp4" && ext === ".m4a") {
         cb(null, true);
         return;
       }
 
       cb(
         new Error(
-          allowAudio
-            ? "Unsupported file type. Upload valid video (mp4, mov, webm, mkv) or audio (mp3, wav, m4a) files."
+          allowExtraMedia
+            ? "Unsupported file type. Upload valid video (mp4, mov, webm, mkv), audio (mp3, wav, m4a), or image (png, jpg, webp) files."
             : "Unsupported file type. Upload a valid video file (mp4, mov, webm, mkv)."
         )
       );
@@ -112,10 +126,10 @@ function handleUploadMiddleware(fieldName: string, maxFiles = 1) {
 }
 
 function handleExportUploadMiddleware() {
-  const upload = createMulterInstance(16, true);
+  const upload = createMulterInstance(24, true);
   const runner = upload.fields([
     { name: "video", maxCount: 1 },
-    { name: "videos", maxCount: 16 },
+    { name: "videos", maxCount: 24 },
   ]);
 
   return (req: Request, res: Response, next: NextFunction): void => {

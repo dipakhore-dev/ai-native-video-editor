@@ -12,6 +12,7 @@ import {
   clampFadeSeconds,
   clampVolume,
 } from "./audio";
+import { hasCustomEffects, normalizeEffects, normalizeTransition } from "./effects";
 
 export function createDefaultTracks(): TimelineTrack[] {
   return [
@@ -55,11 +56,21 @@ export function splitClipAtTimestamp(
       ? 0
       : Number((target.inPoint + leftDuration * target.speed).toFixed(2));
 
+  const leftTransitionIn = target.transitionIn
+    ? normalizeTransition(target.transitionIn, leftDuration)
+    : undefined;
+  const rightTransitionOut = target.transitionOut
+    ? normalizeTransition(target.transitionOut, rightDuration)
+    : undefined;
+
   const leftClip: TimelineClip = {
     ...target,
     duration: leftDuration,
     fadeInSec: clampFadeSeconds(target.fadeInSec, leftDuration),
     fadeOutSec: 0,
+    ...(leftTransitionIn ? { transitionIn: leftTransitionIn } : {}),
+    transitionOut: undefined,
+    effects: target.effects ? { ...target.effects } : undefined,
   };
 
   const rightClip: TimelineClip = {
@@ -70,6 +81,9 @@ export function splitClipAtTimestamp(
     inPoint: rightInPoint,
     fadeInSec: 0,
     fadeOutSec: clampFadeSeconds(target.fadeOutSec, rightDuration),
+    transitionIn: undefined,
+    ...(rightTransitionOut ? { transitionOut: rightTransitionOut } : {}),
+    effects: target.effects ? { ...target.effects } : undefined,
     textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
@@ -317,6 +331,9 @@ export function duplicateClipWithoutOverlap(
     ...target,
     id: copyId,
     startTime: copyStart,
+    transitionIn: target.transitionIn ? { ...target.transitionIn } : undefined,
+    transitionOut: target.transitionOut ? { ...target.transitionOut } : undefined,
+    effects: target.effects ? { ...target.effects } : undefined,
     textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
@@ -462,6 +479,9 @@ export function buildStructuredTimelineSpec(
     tracks: project.tracks.map((t) => ({ ...t })),
     clips: sortedClips.map((c) => {
       const dur = Number(c.duration.toFixed(2));
+      const tIn = normalizeTransition(c.transitionIn, dur);
+      const tOut = normalizeTransition(c.transitionOut, dur);
+      const normEffects = normalizeEffects(c.effects);
       return {
         id: c.id,
         trackId: c.trackId,
@@ -487,6 +507,9 @@ export function buildStructuredTimelineSpec(
             }
           : {}),
         opacity: c.opacity,
+        ...(tIn.type !== "none" ? { transitionIn: tIn } : {}),
+        ...(tOut.type !== "none" ? { transitionOut: tOut } : {}),
+        ...(hasCustomEffects(normEffects) ? { effects: normEffects } : {}),
         ...(c.textStyle ? { textStyle: { ...c.textStyle } } : {}),
       };
     }),

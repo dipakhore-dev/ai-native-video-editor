@@ -50,26 +50,32 @@ function validateTimelineForLocalMp4(
   }
 
   if (project.clips.length === 0) {
-    return "Timeline is empty. Add at least one video clip to track V1 before exporting.";
+    return "Timeline is empty. Add at least one video or image clip to track V1 before exporting.";
   }
 
-  if (project.clips.length > 16) {
-    return "Synchronous local MP4 export supports up to 16 clips (up to 8 V1 video + 8 A1 audio clips).";
+  if (project.clips.length > 24) {
+    return "Synchronous local MP4 export supports up to 24 clips (up to 8 per track).";
   }
 
-  const videoClips = [];
-  const audioClips = [];
+  const v1Clips = [];
+  const v2Clips = [];
+  const t1Clips = [];
+  const a1Clips = [];
 
   for (const clip of project.clips) {
-    if (clip.kind === "video" && clip.trackId === "track_v1") {
-      videoClips.push(clip);
+    if ((clip.kind === "video" || clip.kind === "image") && clip.trackId === "track_v1") {
+      v1Clips.push(clip);
+    } else if ((clip.kind === "image" || clip.kind === "video") && clip.trackId === "track_v2") {
+      v2Clips.push(clip);
+    } else if (clip.kind === "text" && clip.trackId === "track_t1") {
+      t1Clips.push(clip);
     } else if (clip.kind === "audio" && clip.trackId === "track_a1") {
-      audioClips.push(clip);
+      a1Clips.push(clip);
     } else {
-      return `Clip '${clip.name}' (${clip.kind} on '${clip.trackId}') is not supported in FFmpeg MP4 export yet. Phase 2 supports V1 video clips and A1 audio clips (text overlays and V2 overlays are planned for Phase 3).`;
+      return `Clip '${clip.name}' (${clip.kind} on '${clip.trackId}') is not a supported track/type combination for MP4 export.`;
     }
 
-    if (clip.needsRelink) {
+    if (clip.kind !== "text" && clip.needsRelink) {
       return `Clip '${clip.name}' is missing from local IndexedDB storage. Use "Re-link File" before exporting.`;
     }
     if (Math.abs(clip.speed - 1) > 0.01) {
@@ -83,19 +89,36 @@ function validateTimelineForLocalMp4(
     if (fadeIn < 0 || fadeIn > 30 || fadeOut < 0 || fadeOut > 30) {
       return `Clip '${clip.name}' fade-in/fade-out durations must be between 0s and 30s.`;
     }
-    if (clip.kind === "video" && Math.abs(clip.opacity - 1) > 0.01) {
-      return `Clip '${clip.name}' uses ${Math.round(clip.opacity * 100)}% opacity. Clip opacity changes are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
+    if (!Number.isFinite(clip.opacity) || clip.opacity < 0 || clip.opacity > 1) {
+      return `Clip '${clip.name}' opacity (${Math.round(clip.opacity * 100)}%) must be between 0% and 100%.`;
+    }
+    for (const [label, tr] of [
+      ["Transition In", clip.transitionIn],
+      ["Transition Out", clip.transitionOut],
+    ] as const) {
+      if (
+        tr &&
+        tr.type !== "none" &&
+        (!Number.isFinite(tr.durationSec) || tr.durationSec < 0.2 || tr.durationSec > 2.0)
+      ) {
+        return `Clip '${clip.name}' ${label} duration must be between 0.2s and 2.0s.`;
+      }
     }
   }
 
-  if (videoClips.length === 0) {
-    return "Timeline must include at least one video clip on track V1 before exporting MP4.";
+  if (v1Clips.length === 0) {
+    return "Timeline must include at least one video or image clip on track V1 before exporting MP4.";
   }
-  if (videoClips.length > 8 || audioClips.length > 8) {
-    return "Synchronous local MP4 export supports up to 8 V1 video clips and 8 A1 audio clips.";
+  if (
+    v1Clips.length > 8 ||
+    v2Clips.length > 8 ||
+    t1Clips.length > 8 ||
+    a1Clips.length > 8
+  ) {
+    return "Synchronous local MP4 export supports up to 8 clips per track.";
   }
 
-  const sortedV1 = [...videoClips].sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+  const sortedV1 = [...v1Clips].sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
   if (sortedV1[0].startTime > 0.15) {
     return "Timeline starts with an empty gap before the first V1 clip. Move the first clip to 00:00 before exporting.";
   }
@@ -202,6 +225,9 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       const clipFileIndexById: Record<string, number> = {};
 
       for (const clip of sortedClips) {
+        if (clip.kind === "text") {
+          continue;
+        }
         const key = clip.assetId || clip.objectUrl || clip.id;
         let idx = sourceKeyToIndex.get(key);
         if (idx === undefined) {
@@ -222,10 +248,15 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           ...structuredSpec.project,
           resolution: resolutionPreset,
         },
-        clips: structuredSpec.clips.map((c) => ({
-          ...c,
-          fileIndex: clipFileIndexById[c.id] ?? 0,
-        })),
+        clips: structuredSpec.clips.map((c) => {
+          if (c.kind === "text") {
+            return c;
+          }
+          return {
+            ...c,
+            fileIndex: clipFileIndexById[c.id] ?? 0,
+          };
+        }),
         ...(shouldBurnSubtitles
           ? {
               burnSubtitles: true,
@@ -458,7 +489,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           </label>
 
           <p className="text-[11px] text-zinc-500 leading-relaxed">
-            Uploads local V1 video and A1 audio clips to the local FFmpeg processor for clip trimming, audio mixing (0–200% volume, fades, mute, speech ducking), and {project.aspectRatio} MP4 rendering.
+            Renders V1 video/images, V2 overlays, T1 text titles, clip transitions, color grading &amp; blur effects, opacity, A1 audio mixing, and optional burned subtitles into {project.aspectRatio} MP4 via local FFmpeg.
           </p>
 
           {feedback && (

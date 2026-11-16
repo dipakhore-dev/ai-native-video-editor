@@ -217,8 +217,8 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             "fileIndex": 0,
         }
 
-        # Text overlay unsupported
-        with self.assertRaises(VideoProcessingError) as ctx_text:
+        # Invalid track/kind combination unsupported (audio on track_v1)
+        with self.assertRaises(VideoProcessingError) as ctx_bad_track:
             export_timeline_mp4(
                 [clip],
                 out,
@@ -230,15 +230,15 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
                         base_clip,
                         {
                             **base_clip,
-                            "id": "t1",
-                            "trackId": "track_t1",
-                            "kind": "text",
-                            "sourceName": "Title",
+                            "id": "bad_a_on_v1",
+                            "trackId": "track_v1",
+                            "kind": "audio",
+                            "sourceName": "Invalid",
                         },
                     ],
                 },
             )
-        self.assertEqual(ctx_text.exception.status_code, 400)
+        self.assertEqual(ctx_bad_track.exception.status_code, 400)
 
         # Speed != 1.0 unsupported
         with self.assertRaises(VideoProcessingError):
@@ -849,6 +849,291 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         )
         self.assertTrue(out_sidechain.exists())
         self.assertTrue(sc_meta["has_audio"])
+
+    def _extract_rgb24_frame(self, mp4_path: Path, timestamp_sec: float = 0.5) -> bytes:
+        raw_out = self.test_root / f"frame_{mp4_path.stem}_{timestamp_sec:.2f}.rgb"
+        proc = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-ss",
+                f"{timestamp_sec:.3f}",
+                "-i",
+                str(mp4_path),
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                str(raw_out),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return raw_out.read_bytes()
+
+    def test_phase3_effects_bw_brightness_blur_and_opacity(self) -> None:
+        src = self._make_clip("fx_src.mp4", duration=1.6, size="640x360", with_audio=False)
+        out_plain = self.test_root / "fx_plain.mp4"
+        out_bw_blur = self.test_root / "fx_bw_blur.mp4"
+        out_dim = self.test_root / "fx_dim.mp4"
+
+        def build_spec(effects: dict | None = None, opacity: float = 1.0) -> dict:
+            return {
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False}
+                ],
+                "clips": [
+                    {
+                        "id": "v1",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "fx_src.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 1.6,
+                        "durationSec": 1.6,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 1.6,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": opacity,
+                        **({"effects": effects} if effects else {}),
+                        "fileIndex": 0,
+                    }
+                ],
+            }
+
+        export_timeline_mp4([src], out_plain, timeline_spec=build_spec())
+        export_timeline_mp4(
+            [src],
+            out_bw_blur,
+            timeline_spec=build_spec(
+                effects={
+                    "preset": "bw",
+                    "brightness": 0.15,
+                    "contrast": 1.2,
+                    "saturation": 1.0,
+                    "blur": 3.0,
+                },
+                opacity=1.0,
+            ),
+        )
+        export_timeline_mp4(
+            [src],
+            out_dim,
+            timeline_spec=build_spec(opacity=0.4),
+        )
+
+        rgb_plain = self._extract_rgb24_frame(out_plain, 0.6)
+        rgb_bw = self._extract_rgb24_frame(out_bw_blur, 0.6)
+        rgb_dim = self._extract_rgb24_frame(out_dim, 0.6)
+
+        self.assertNotEqual(rgb_plain, rgb_bw)
+        self.assertNotEqual(rgb_plain, rgb_dim)
+
+        # In B&W output, every sampled pixel must have R ~= G ~= B
+        max_chroma_diff = 0
+        for offset in range(0, min(len(rgb_bw), 1280 * 720 * 3), 97 * 3):
+            r, g, b = rgb_bw[offset], rgb_bw[offset + 1], rgb_bw[offset + 2]
+            max_chroma_diff = max(max_chroma_diff, max(r, g, b) - min(r, g, b))
+        self.assertLessEqual(max_chroma_diff, 4)
+
+        # 40% opacity over black must have strictly lower average luma than 100% opacity
+        avg_plain = sum(rgb_plain[::31]) / max(1, len(rgb_plain[::31]))
+        avg_dim = sum(rgb_dim[::31]) / max(1, len(rgb_dim[::31]))
+        self.assertLess(avg_dim, avg_plain * 0.65)
+
+    def test_phase3_xfade_transitions_and_audio_sync(self) -> None:
+        clip1 = self._make_clip("tr1.mp4", duration=2.0, with_audio=True)
+        clip2 = self._make_clip("tr2.mp4", duration=2.0, with_audio=True)
+        out_xfade = self.test_root / "xfade_out.mp4"
+
+        meta = export_timeline_mp4(
+            [clip1, clip2],
+            out_xfade,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False}
+                ],
+                "clips": [
+                    {
+                        "id": "v1_a",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "tr1.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "transitionOut": {"type": "dissolve", "durationSec": 0.6},
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "v1_b",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "tr2.mp4",
+                        "timelineStartSec": 2.0,
+                        "timelineEndSec": 4.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "transitionIn": {"type": "wipeleft", "durationSec": 0.6},
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_xfade.exists())
+        self.assertTrue(meta["has_audio"])
+        # Seam xfade overlaps two 2.0s clips by 0.6s -> ~3.4s total
+        self.assertAlmostEqual(meta["duration_seconds"], 3.4, delta=0.35)
+        seam_rms = self._measure_pcm_rms(out_xfade, 1.4, 0.8)
+        self.assertGreater(seam_rms, 0.05)
+
+    def test_phase3_v2_image_overlay_and_t1_text_with_bengali(self) -> None:
+        bg_clip = self.test_root / "blue_bg.mp4"
+        proc_bg = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=640x360:d=2.2:r=24",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(bg_clip),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_bg.returncode, 0, proc_bg.stderr)
+
+        red_png = self.test_root / "red_overlay.png"
+        proc_png = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x180",
+                "-frames:v",
+                "1",
+                str(red_png),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_png.returncode, 0, proc_png.stderr)
+
+        out_comp = self.test_root / "composited.mp4"
+        meta = export_timeline_mp4(
+            [bg_clip, red_png],
+            out_comp,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_v2", "name": "V2 Overlay", "type": "overlay", "muted": False, "locked": False},
+                    {"id": "track_t1", "name": "T1 Text", "type": "text", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_bg",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "blue_bg.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.2,
+                        "durationSec": 2.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.2,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "v2_img",
+                        "trackId": "track_v2",
+                        "kind": "image",
+                        "sourceName": "red_overlay.png",
+                        "timelineStartSec": 0.6,
+                        "timelineEndSec": 1.8,
+                        "durationSec": 1.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 1.2,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 0.8,
+                        "transitionIn": {"type": "fade", "durationSec": 0.25},
+                        "transitionOut": {"type": "fade", "durationSec": 0.25},
+                        "fileIndex": 1,
+                    },
+                    {
+                        "id": "t1_bn",
+                        "trackId": "track_t1",
+                        "kind": "text",
+                        "sourceName": "বাংলা টাইটেল",
+                        "timelineStartSec": 0.5,
+                        "timelineEndSec": 1.9,
+                        "durationSec": 1.4,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 1.4,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 0.95,
+                        "transitionIn": {"type": "fade", "durationSec": 0.25},
+                        "textStyle": {
+                            "text": "বাংলা টাইটেল",
+                            "fontSize": 36,
+                            "color": "#FFFFFF",
+                            "backgroundOpacity": 0.75,
+                            "x": 50,
+                            "y": 25,
+                            "align": "center",
+                        },
+                    },
+                ],
+                "burnSubtitles": True,
+                "subtitles": [{"id": "s1", "start": 0.4, "end": 1.9, "text": "সাবটাইটেল পরীক্ষা"}],
+            },
+        )
+        self.assertTrue(out_comp.exists())
+        self.assertEqual(meta["video"]["width"], 1280)
+        self.assertEqual(meta["video"]["height"], 720)
+
+        # At t=0.1s neither V2 overlay nor T1/subtitle is active (blue frame)
+        # At t=1.1s V2 red overlay + T1 Bengali text + subtitle are all active
+        rgb_before = self._extract_rgb24_frame(out_comp, 0.1)
+        rgb_during = self._extract_rgb24_frame(out_comp, 1.1)
+        self.assertNotEqual(rgb_before, rgb_during)
+
+        # Verify red channel increased significantly at t=1.1s vs blue background at t=0.1s
+        avg_red_before = sum(rgb_before[0::3][::41]) / max(1, len(rgb_before[0::3][::41]))
+        avg_red_during = sum(rgb_during[0::3][::41]) / max(1, len(rgb_during[0::3][::41]))
+        self.assertGreater(avg_red_during, avg_red_before + 40)
 
 
 if __name__ == "__main__":

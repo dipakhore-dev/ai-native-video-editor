@@ -19,6 +19,21 @@ export const TimelineTrackSchema = z.object({
   locked: z.boolean().default(false),
 });
 
+export const ClipTransitionSchema = z.object({
+  type: z
+    .enum(["none", "fade", "dissolve", "wipeleft", "wiperight", "slideleft", "slideright", "zoomin"])
+    .default("none"),
+  durationSec: z.number().min(0.2).max(2).default(0.6),
+});
+
+export const ClipVisualEffectsSchema = z.object({
+  preset: z.enum(["none", "cinematic", "bw", "vintage", "warm", "cool", "vivid"]).default("none"),
+  brightness: z.number().min(-0.5).max(0.5).default(0),
+  contrast: z.number().min(0.5).max(1.8).default(1),
+  saturation: z.number().min(0).max(2).default(1),
+  blur: z.number().min(0).max(10).default(0),
+});
+
 export const TimelineClipSchema = z.object({
   id: z.string().min(1),
   assetId: z.string().min(1),
@@ -37,6 +52,9 @@ export const TimelineClipSchema = z.object({
   duckingAmount: z.number().min(0).max(0.95).optional().default(0.6),
   speed: z.number().min(0.25).max(4).default(1),
   opacity: z.number().min(0).max(1).default(1),
+  transitionIn: ClipTransitionSchema.optional(),
+  transitionOut: ClipTransitionSchema.optional(),
+  effects: ClipVisualEffectsSchema.optional(),
   sourceName: z.string().optional(),
   sourceSizeBytes: z.number().min(0).optional(),
   sourceMimeType: z.string().optional(),

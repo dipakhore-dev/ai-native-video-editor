@@ -23,6 +23,12 @@ import {
 import { useStudio } from "../../context/StudioContext";
 import type { MediaKind, Project, TimelineClip, TrackType } from "../../types/studio";
 import { computeEffectiveFadeDurations, sliceWaveformPeaksForClip } from "../../utils/audio";
+import {
+  EFFECT_PRESETS,
+  hasCustomEffects,
+  normalizeEffects,
+  normalizeTransition,
+} from "../../utils/effects";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 
@@ -41,6 +47,17 @@ function isAssetKindCompatibleWithTrack(kind: MediaKind, trackType: TrackType): 
   if (kind === "audio") return trackType === "audio";
   if (kind === "text") return trackType === "text";
   return trackType === "video" || trackType === "overlay";
+}
+
+function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
+  return {
+    ...c,
+    waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
+    textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+    transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
+    transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
+    effects: c.effects ? normalizeEffects(c.effects) : undefined,
+  };
 }
 
 export function MultitrackTimeline({
@@ -157,19 +174,12 @@ export function MultitrackTimeline({
       return;
     }
 
-    const initialClips = project.clips.map((c) => ({
-      ...c,
-      textStyle: c.textStyle ? { ...c.textStyle } : undefined,
-    }));
+    const initialClips = project.clips.map(cloneClipForSnapshot);
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: initialClips.map((c) => ({
-        ...c,
-        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
-        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
-      })),
+      clips: initialClips.map(cloneClipForSnapshot),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
       subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
       subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
@@ -220,17 +230,13 @@ export function MultitrackTimeline({
     onSelectClip(clip.id);
     if (trackLocked) return;
 
-    const initialClip = { ...clip };
+    const initialClip = cloneClipForSnapshot(clip);
     const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({
-        ...c,
-        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
-        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
-      })),
+      clips: project.clips.map(cloneClipForSnapshot),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
       subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
       subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
@@ -272,17 +278,13 @@ export function MultitrackTimeline({
     onSelectClip(clip.id);
     if (trackLocked) return;
 
-    const initialClip = { ...clip };
+    const initialClip = cloneClipForSnapshot(clip);
     const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
     const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
     const beforeSnapshot: Project = {
       ...project,
       tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map((c) => ({
-        ...c,
-        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
-        textStyle: c.textStyle ? { ...c.textStyle } : undefined,
-      })),
+      clips: project.clips.map(cloneClipForSnapshot),
       subtitles: initialSubtitles.map((s) => ({ ...s })),
       subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
       subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
@@ -717,6 +719,31 @@ export function MultitrackTimeline({
                     const fadeOutPct = clip.duration > 0 ? Math.min(100, (fadeOut / clip.duration) * 100) : 0;
                     const gainScale = isClipMuted ? 0.14 : Math.max(0.18, Math.min(1.65, clip.volume));
 
+                    const trIn =
+                      clip.kind !== "audio"
+                        ? normalizeTransition(clip.transitionIn, clip.duration)
+                        : null;
+                    const trOut =
+                      clip.kind !== "audio"
+                        ? normalizeTransition(clip.transitionOut, clip.duration)
+                        : null;
+                    const trInPct =
+                      trIn && trIn.type !== "none" && clip.duration > 0
+                        ? Math.min(45, (trIn.durationSec / clip.duration) * 100)
+                        : 0;
+                    const trOutPct =
+                      trOut && trOut.type !== "none" && clip.duration > 0
+                        ? Math.min(45, (trOut.durationSec / clip.duration) * 100)
+                        : 0;
+
+                    const effCustomized =
+                      (clip.kind === "video" || clip.kind === "image") &&
+                      hasCustomEffects(clip.effects);
+                    const effPresetLabel =
+                      effCustomized && clip.effects?.preset && clip.effects.preset !== "none"
+                        ? EFFECT_PRESETS.find((p) => p.value === clip.effects?.preset)?.label ?? "FX"
+                        : "FX";
+
                     const colorClasses =
                       clip.kind === "text"
                         ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-100"
@@ -777,7 +804,7 @@ export function MultitrackTimeline({
                           </div>
                         )}
 
-                        {/* Visual Fade-In / Fade-Out Envelopes */}
+                        {/* Visual Fade-In / Fade-Out Envelopes (Audio) */}
                         {fadeInPct > 0.5 && (
                           <svg
                             viewBox="0 0 100 100"
@@ -817,6 +844,46 @@ export function MultitrackTimeline({
                           </svg>
                         )}
 
+                        {/* Visual Transition Edge Wedges (V1/V2/T1) */}
+                        {trInPct > 0.5 && (
+                          <svg
+                            viewBox="0 0 100 100"
+                            preserveAspectRatio="none"
+                            style={{ width: `${trInPct}%` }}
+                            className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
+                            aria-hidden="true"
+                          >
+                            <polygon points="0,0 100,0 0,100" fill="rgba(245,158,11,0.34)" />
+                            <line
+                              x1="0"
+                              y1="100"
+                              x2="100"
+                              y2="0"
+                              stroke="rgba(251,191,36,0.85)"
+                              strokeWidth="2"
+                            />
+                          </svg>
+                        )}
+                        {trOutPct > 0.5 && (
+                          <svg
+                            viewBox="0 0 100 100"
+                            preserveAspectRatio="none"
+                            style={{ width: `${trOutPct}%` }}
+                            className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
+                            aria-hidden="true"
+                          >
+                            <polygon points="0,0 100,0 100,100" fill="rgba(245,158,11,0.34)" />
+                            <line
+                              x1="0"
+                              y1="0"
+                              x2="100"
+                              y2="100"
+                              stroke="rgba(251,191,36,0.85)"
+                              strokeWidth="2"
+                            />
+                          </svg>
+                        )}
+
                         {/* Left Trim Handle */}
                         {!track.locked && (
                           <div
@@ -845,18 +912,28 @@ export function MultitrackTimeline({
                               {clip.kind === "text" ? clip.textStyle?.text || clip.name : clip.name}
                             </p>
                           </div>
-                          <div className="flex items-center gap-1.5 text-[10px] font-mono opacity-85 tabular-nums">
+                          <div className="flex items-center gap-1.5 text-[10px] font-mono opacity-85 tabular-nums truncate">
                             <span>{formatTimecode(clip.duration)}</span>
                             {(clip.kind === "audio" || clip.kind === "video") &&
                               !isClipMuted &&
                               Math.abs(clip.volume - 1) > 0.02 && (
-                                <span className="rounded bg-black/40 px-1 text-[9px] text-sky-200">
+                                <span className="text-sky-200">
                                   {Math.round(clip.volume * 100)}%
                                 </span>
                               )}
                             {clip.kind === "audio" && clip.duckingEnabled && widthPx > 96 && (
-                              <span className="rounded bg-amber-500/25 px-1 text-[9px] text-amber-200">
+                              <span className="text-amber-200">
                                 Duck
+                              </span>
+                            )}
+                            {effCustomized && widthPx > 88 && (
+                              <span className="text-amber-300">
+                                {effPresetLabel}
+                              </span>
+                            )}
+                            {clip.kind !== "audio" && clip.opacity < 0.99 && widthPx > 96 && (
+                              <span className="text-zinc-300">
+                                {Math.round(clip.opacity * 100)}%
                               </span>
                             )}
                           </div>

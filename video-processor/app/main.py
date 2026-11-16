@@ -116,9 +116,13 @@ async def _save_single_upload(
     max_bytes: int,
     prefix: str = "input_",
     allow_audio: bool = False,
+    allow_images: bool = False,
 ) -> tuple[str, Path]:
     safe_name = validate_upload_headers(
-        file.filename, file.content_type, allow_audio=allow_audio
+        file.filename,
+        file.content_type,
+        allow_audio=allow_audio,
+        allow_images=allow_images,
     )
     target_path = dest_dir / f"{prefix}{safe_name}"
     file.file.seek(0)
@@ -414,6 +418,7 @@ async def export_mp4_endpoint(
                 settings.max_upload_bytes,
                 prefix=f"clip_{idx}_",
                 allow_audio=True,
+                allow_images=True,
             )
             if idx == 0:
                 first_stem = Path(safe_name).stem or "sequence"

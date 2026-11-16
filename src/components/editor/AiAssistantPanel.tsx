@@ -25,6 +25,14 @@ import {
   clampFadeSeconds,
   clampVolume,
 } from "../../utils/audio";
+import {
+  DEFAULT_CLIP_EFFECTS,
+  EFFECT_PRESETS,
+  TRANSITION_OPTIONS,
+  hasCustomEffects,
+  normalizeEffects,
+  normalizeTransition,
+} from "../../utils/effects";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import { SubtitlesPanel } from "./SubtitlesPanel";
@@ -677,9 +685,304 @@ export function AiAssistantPanel({
                       updateClip(selectedClip.id, { opacity: Number(e.target.value) })
                     }
                     className="w-full accent-blue-500"
+                    aria-label="Clip opacity"
                   />
                 </div>
               )}
+
+              {(selectedClip.kind === "video" || selectedClip.kind === "image") && (() => {
+                const eff = normalizeEffects(selectedClip.effects);
+                const customized = hasCustomEffects(eff);
+                return (
+                  <div className="space-y-3 pt-2 border-t border-zinc-800/80">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-medium text-zinc-300">
+                        Color &amp; Effects
+                      </span>
+                      {customized && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateClip(selectedClip.id, { effects: { ...DEFAULT_CLIP_EFFECTS } })
+                          }
+                          className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:text-white"
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-1">
+                      {EFFECT_PRESETS.map((preset) => {
+                        const isActive = eff.preset === preset.value;
+                        return (
+                          <button
+                            key={preset.value}
+                            type="button"
+                            onClick={() =>
+                              updateClip(selectedClip.id, {
+                                effects: { ...eff, preset: preset.value },
+                              })
+                            }
+                            className={`rounded-md py-1 px-1 text-[10px] font-medium border truncate transition-colors ${
+                              isActive
+                                ? "border-violet-500 bg-violet-500/15 text-white"
+                                : "border-zinc-800 bg-[#09090B] text-zinc-400 hover:text-zinc-200"
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="flex items-center justify-between text-[11px] mb-1">
+                          <span className="text-zinc-400">Brightness</span>
+                          <span className="font-mono text-zinc-300 tabular-nums">
+                            {eff.brightness > 0 ? `+${eff.brightness.toFixed(2)}` : eff.brightness.toFixed(2)}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-0.5}
+                          max={0.5}
+                          step={0.05}
+                          value={eff.brightness}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              effects: normalizeEffects({
+                                ...eff,
+                                brightness: Number(e.target.value),
+                              }),
+                            })
+                          }
+                          className="w-full accent-violet-500"
+                          aria-label="Clip brightness"
+                        />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between text-[11px] mb-1">
+                          <span className="text-zinc-400">Contrast</span>
+                          <span className="font-mono text-zinc-300 tabular-nums">
+                            {Math.round(eff.contrast * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={1.8}
+                          step={0.05}
+                          value={eff.contrast}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              effects: normalizeEffects({
+                                ...eff,
+                                contrast: Number(e.target.value),
+                              }),
+                            })
+                          }
+                          className="w-full accent-violet-500"
+                          aria-label="Clip contrast"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="flex items-center justify-between text-[11px] mb-1">
+                          <span className="text-zinc-400">Saturation</span>
+                          <span className="font-mono text-zinc-300 tabular-nums">
+                            {Math.round(eff.saturation * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={2}
+                          step={0.05}
+                          value={eff.saturation}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              effects: normalizeEffects({
+                                ...eff,
+                                saturation: Number(e.target.value),
+                              }),
+                            })
+                          }
+                          className="w-full accent-blue-500"
+                          aria-label="Clip saturation"
+                        />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between text-[11px] mb-1">
+                          <span className="text-zinc-400">Blur</span>
+                          <span className="font-mono text-zinc-300 tabular-nums">
+                            {eff.blur.toFixed(1)}px
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={10}
+                          step={0.5}
+                          value={eff.blur}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              effects: normalizeEffects({
+                                ...eff,
+                                blur: Number(e.target.value),
+                              }),
+                            })
+                          }
+                          className="w-full accent-blue-500"
+                          aria-label="Clip blur"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {selectedClip.kind !== "audio" && (() => {
+                const trIn = normalizeTransition(selectedClip.transitionIn, selectedClip.duration);
+                const trOut = normalizeTransition(selectedClip.transitionOut, selectedClip.duration);
+                const availableOptions =
+                  selectedClip.kind === "text"
+                    ? TRANSITION_OPTIONS.filter(
+                        (opt) =>
+                          opt.value === "none" ||
+                          opt.value === "fade" ||
+                          opt.value === "dissolve"
+                      )
+                    : TRANSITION_OPTIONS;
+                const maxDur = Math.max(
+                  0.2,
+                  Math.min(2.0, Number((selectedClip.duration * 0.45).toFixed(1)))
+                );
+
+                return (
+                  <div className="space-y-3 pt-2 border-t border-zinc-800/80">
+                    <span className="block text-[11px] font-medium text-zinc-300">
+                      Transitions
+                    </span>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] text-zinc-400">
+                          Transition In
+                        </label>
+                        <select
+                          value={trIn.type}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              transitionIn: normalizeTransition(
+                                {
+                                  type: e.target.value as typeof trIn.type,
+                                  durationSec: trIn.durationSec,
+                                },
+                                selectedClip.duration
+                              ),
+                            })
+                          }
+                          className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2 py-1.5 text-[11px] text-zinc-100 focus:border-violet-500 focus:outline-none"
+                          aria-label="Transition in type"
+                        >
+                          {availableOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                        {trIn.type !== "none" && (
+                          <div>
+                            <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400 tabular-nums">
+                              <span>Duration</span>
+                              <span>{trIn.durationSec.toFixed(1)}s</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0.2}
+                              max={maxDur}
+                              step={0.1}
+                              value={Math.min(maxDur, trIn.durationSec)}
+                              onChange={(e) =>
+                                updateClip(selectedClip.id, {
+                                  transitionIn: normalizeTransition(
+                                    {
+                                      type: trIn.type,
+                                      durationSec: Number(e.target.value),
+                                    },
+                                    selectedClip.duration
+                                  ),
+                                })
+                              }
+                              className="w-full accent-amber-400"
+                              aria-label="Transition in duration"
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="block text-[11px] text-zinc-400">
+                          Transition Out
+                        </label>
+                        <select
+                          value={trOut.type}
+                          onChange={(e) =>
+                            updateClip(selectedClip.id, {
+                              transitionOut: normalizeTransition(
+                                {
+                                  type: e.target.value as typeof trOut.type,
+                                  durationSec: trOut.durationSec,
+                                },
+                                selectedClip.duration
+                              ),
+                            })
+                          }
+                          className="w-full rounded-md border border-zinc-800 bg-[#09090B] px-2 py-1.5 text-[11px] text-zinc-100 focus:border-violet-500 focus:outline-none"
+                          aria-label="Transition out type"
+                        >
+                          {availableOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                        {trOut.type !== "none" && (
+                          <div>
+                            <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400 tabular-nums">
+                              <span>Duration</span>
+                              <span>{trOut.durationSec.toFixed(1)}s</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0.2}
+                              max={maxDur}
+                              step={0.1}
+                              value={Math.min(maxDur, trOut.durationSec)}
+                              onChange={(e) =>
+                                updateClip(selectedClip.id, {
+                                  transitionOut: normalizeTransition(
+                                    {
+                                      type: trOut.type,
+                                      durationSec: Number(e.target.value),
+                                    },
+                                    selectedClip.duration
+                                  ),
+                                })
+                              }
+                              className="w-full accent-amber-400"
+                              aria-label="Transition out duration"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {selectedClip.kind === "video" && (
                 <div>

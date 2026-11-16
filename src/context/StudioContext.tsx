@@ -207,6 +207,9 @@ function cloneProject(project: Project): Project {
     clips: project.clips.map((c) => ({
       ...c,
       waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
+      transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
+      transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
+      effects: c.effects ? { ...c.effects } : undefined,
       textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     })),
     subtitles: project.subtitles ? project.subtitles.map((s) => ({ ...s })) : [],
@@ -628,6 +631,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         return {
           ...c,
           id: nextClipId,
+          transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
+          transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
+          effects: c.effects ? { ...c.effects } : undefined,
           textStyle: c.textStyle ? { ...c.textStyle } : undefined,
         };
       });

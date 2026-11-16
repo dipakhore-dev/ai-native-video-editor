@@ -48,6 +48,38 @@ export interface TextOverlayStyle {
   align: "left" | "center" | "right";
 }
 
+export type TransitionType =
+  | "none"
+  | "fade"
+  | "dissolve"
+  | "wipeleft"
+  | "wiperight"
+  | "slideleft"
+  | "slideright"
+  | "zoomin";
+
+export interface ClipTransition {
+  type: TransitionType;
+  durationSec: number; // 0.2 to 2.0
+}
+
+export type EffectPreset =
+  | "none"
+  | "cinematic"
+  | "bw"
+  | "vintage"
+  | "warm"
+  | "cool"
+  | "vivid";
+
+export interface ClipVisualEffects {
+  preset: EffectPreset;
+  brightness: number; // -0.5 to 0.5 (default 0)
+  contrast: number; // 0.5 to 1.8 (default 1)
+  saturation: number; // 0 to 2 (default 1)
+  blur: number; // 0 to 10 (default 0)
+}
+
 export interface TimelineClip {
   id: string;
   assetId: string;
@@ -66,6 +98,9 @@ export interface TimelineClip {
   duckingAmount?: number; // 0 to 0.95 (fraction attenuated during speech)
   speed: number; // 0.5 to 2
   opacity: number; // 0 to 1
+  transitionIn?: ClipTransition;
+  transitionOut?: ClipTransition;
+  effects?: ClipVisualEffects;
   thumbnailUrl?: string;
   waveformPeaks?: number[];
   objectUrl: string;
@@ -144,6 +179,9 @@ export interface RenderTimelineClipSpec {
   duckingEnabled?: boolean;
   duckingAmount?: number;
   opacity: number;
+  transitionIn?: ClipTransition;
+  transitionOut?: ClipTransition;
+  effects?: ClipVisualEffects;
   fileIndex?: number;
   textStyle?: TextOverlayStyle;
 }

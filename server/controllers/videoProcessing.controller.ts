@@ -398,6 +398,25 @@ interface ParsedTimelineExportSpec {
     duckingEnabled?: boolean;
     duckingAmount?: number;
     opacity?: number;
+    transitionIn?: { type?: string; durationSec?: number };
+    transitionOut?: { type?: string; durationSec?: number };
+    effects?: {
+      preset?: string;
+      brightness?: number;
+      contrast?: number;
+      saturation?: number;
+      blur?: number;
+    };
+    textStyle?: {
+      text?: string;
+      fontSize?: number;
+      color?: string;
+      backgroundColor?: string;
+      backgroundOpacity?: number;
+      x?: number;
+      y?: number;
+      align?: string;
+    };
     fileIndex?: number;
   }>;
   speechIntervals?: Array<{ start?: number; end?: number }>;
@@ -418,6 +437,27 @@ interface ParsedTimelineExportSpec {
     backgroundOpacity?: number;
   };
 }
+
+const VALID_TRANSITION_TYPES = new Set([
+  "none",
+  "fade",
+  "dissolve",
+  "wipeleft",
+  "wiperight",
+  "slideleft",
+  "slideright",
+  "zoomin",
+]);
+
+const VALID_EFFECT_PRESETS = new Set([
+  "none",
+  "cinematic",
+  "bw",
+  "vintage",
+  "warm",
+  "cool",
+  "vivid",
+]);
 
 function validateTimelineExportSpec(
   spec: ParsedTimelineExportSpec,
@@ -453,11 +493,13 @@ function validateTimelineExportSpec(
   if (!Array.isArray(clips) || clips.length === 0) {
     return "Timeline contains no clips to export.";
   }
-  if (clips.length > 16) {
-    return "Synchronous local MP4 export supports up to 16 clips (up to 8 V1 video + 8 A1 audio clips).";
+  if (clips.length > 24) {
+    return "Synchronous local MP4 export supports up to 24 timeline clips.";
   }
 
-  const videoClips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
+  const v1Clips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
+  const v2Clips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
+  const textClips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
   const audioClips: NonNullable<ParsedTimelineExportSpec["clips"]> = [];
 
   for (const clip of clips) {
@@ -465,12 +507,16 @@ function validateTimelineExportSpec(
     const trackId = String(clip.trackId || "");
     const kind = String(clip.kind || "");
 
-    if (kind === "video" && trackId === "track_v1") {
-      videoClips.push(clip);
+    if ((kind === "video" || kind === "image") && trackId === "track_v1") {
+      v1Clips.push(clip);
+    } else if ((kind === "image" || kind === "video") && trackId === "track_v2") {
+      v2Clips.push(clip);
+    } else if (kind === "text" && trackId === "track_t1") {
+      textClips.push(clip);
     } else if (kind === "audio" && trackId === "track_a1") {
       audioClips.push(clip);
     } else {
-      return `Timeline clip '${name}' (${kind} on '${trackId}') is not supported in MP4 export yet. Only V1 video clips and A1 audio clips are supported in Phase 2.`;
+      return `Timeline clip '${name}' (${kind} on '${trackId}') is not supported on this track.`;
     }
 
     const speed = Number(clip.speed ?? 1);
@@ -485,7 +531,14 @@ function validateTimelineExportSpec(
 
     const fadeIn = Number(clip.fadeInSec ?? 0);
     const fadeOut = Number(clip.fadeOutSec ?? 0);
-    if (!Number.isFinite(fadeIn) || fadeIn < 0 || fadeIn > 30 || !Number.isFinite(fadeOut) || fadeOut < 0 || fadeOut > 30) {
+    if (
+      !Number.isFinite(fadeIn) ||
+      fadeIn < 0 ||
+      fadeIn > 30 ||
+      !Number.isFinite(fadeOut) ||
+      fadeOut < 0 ||
+      fadeOut > 30
+    ) {
       return `Clip '${name}' fade durations must be between 0s and 30s.`;
     }
 
@@ -496,32 +549,83 @@ function validateTimelineExportSpec(
       }
     }
 
-    if (kind === "video") {
-      const opacity = Number(clip.opacity ?? 1);
-      if (Math.abs(opacity - 1) > 0.01) {
-        return `Clip '${name}' uses ${Math.round(opacity * 100)}% opacity. Opacity adjustments are not supported in FFmpeg MP4 export yet; set opacity to 100%.`;
+    const opacity = Number(clip.opacity ?? 1);
+    if (!Number.isFinite(opacity) || opacity < 0 || opacity > 1) {
+      return `Clip '${name}' opacity must be between 0% and 100%.`;
+    }
+
+    for (const [label, tr] of [
+      ["transitionIn", clip.transitionIn],
+      ["transitionOut", clip.transitionOut],
+    ] as const) {
+      if (!tr) continue;
+      if (tr.type && !VALID_TRANSITION_TYPES.has(tr.type)) {
+        return `Clip '${name}' has unsupported ${label} type '${tr.type}'.`;
+      }
+      if (
+        tr.durationSec !== undefined &&
+        (!Number.isFinite(Number(tr.durationSec)) ||
+          Number(tr.durationSec) < 0.2 ||
+          Number(tr.durationSec) > 2.0)
+      ) {
+        return `Clip '${name}' ${label} duration must be between 0.2s and 2.0s.`;
       }
     }
 
-    if (clip.fileIndex === undefined) {
-      if (uploadedFileCount > 1) {
-        return `Clip '${name}' must specify fileIndex when multiple source files are uploaded.`;
+    if (clip.effects) {
+      const fx = clip.effects;
+      if (fx.preset && !VALID_EFFECT_PRESETS.has(fx.preset)) {
+        return `Clip '${name}' has unsupported effect preset '${fx.preset}'.`;
       }
-    } else if (
-      !Number.isInteger(clip.fileIndex) ||
-      clip.fileIndex < 0 ||
-      clip.fileIndex >= uploadedFileCount
-    ) {
-      return `Clip '${name}' references missing uploaded file index ${clip.fileIndex}.`;
+      if (
+        fx.brightness !== undefined &&
+        (!Number.isFinite(Number(fx.brightness)) || Number(fx.brightness) < -0.5 || Number(fx.brightness) > 0.5)
+      ) {
+        return `Clip '${name}' brightness must be between -0.5 and 0.5.`;
+      }
+      if (
+        fx.contrast !== undefined &&
+        (!Number.isFinite(Number(fx.contrast)) || Number(fx.contrast) < 0.5 || Number(fx.contrast) > 1.8)
+      ) {
+        return `Clip '${name}' contrast must be between 0.5 and 1.8.`;
+      }
+      if (
+        fx.saturation !== undefined &&
+        (!Number.isFinite(Number(fx.saturation)) || Number(fx.saturation) < 0 || Number(fx.saturation) > 2)
+      ) {
+        return `Clip '${name}' saturation must be between 0 and 2.`;
+      }
+      if (
+        fx.blur !== undefined &&
+        (!Number.isFinite(Number(fx.blur)) || Number(fx.blur) < 0 || Number(fx.blur) > 10)
+      ) {
+        return `Clip '${name}' blur must be between 0 and 10.`;
+      }
+    }
+
+    if (kind !== "text") {
+      if (clip.fileIndex === undefined) {
+        if (uploadedFileCount > 1) {
+          return `Clip '${name}' must specify fileIndex when multiple source files are uploaded.`;
+        }
+      } else if (
+        !Number.isInteger(clip.fileIndex) ||
+        clip.fileIndex < 0 ||
+        clip.fileIndex >= uploadedFileCount
+      ) {
+        return `Clip '${name}' references missing uploaded file index ${clip.fileIndex}.`;
+      }
     }
   }
 
-  if (videoClips.length === 0) {
-    return "Timeline must include at least one video clip on track V1 before exporting MP4.";
+  if (v1Clips.length === 0) {
+    return "Timeline must include at least one video or image clip on track V1 before exporting MP4.";
   }
-  if (videoClips.length > 8 || audioClips.length > 8) {
-    return "Synchronous local MP4 export supports up to 8 V1 video clips and 8 A1 audio clips.";
+  if (v1Clips.length > 8 || v2Clips.length > 8 || textClips.length > 8 || audioClips.length > 8) {
+    return "Synchronous local MP4 export supports up to 8 clips per track.";
   }
+
+  const videoClips = v1Clips;
 
   const sortedV1 = [...videoClips].sort(
     (a, b) => Number(a.timelineStartSec ?? 0) - Number(b.timelineStartSec ?? 0)

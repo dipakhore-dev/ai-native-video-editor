@@ -19,6 +19,19 @@ export interface ITextOverlayStyleSubdoc {
   align: "left" | "center" | "right";
 }
 
+export interface IClipTransitionSubdoc {
+  type: "none" | "fade" | "dissolve" | "wipeleft" | "wiperight" | "slideleft" | "slideright" | "zoomin";
+  durationSec: number;
+}
+
+export interface IClipVisualEffectsSubdoc {
+  preset: "none" | "cinematic" | "bw" | "vintage" | "warm" | "cool" | "vivid";
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  blur: number;
+}
+
 export interface ITimelineClipSubdoc {
   id: string;
   assetId: string;
@@ -37,6 +50,9 @@ export interface ITimelineClipSubdoc {
   duckingAmount?: number;
   speed: number;
   opacity: number;
+  transitionIn?: IClipTransitionSubdoc;
+  transitionOut?: IClipTransitionSubdoc;
+  effects?: IClipVisualEffectsSubdoc;
   sourceName?: string;
   sourceSizeBytes?: number;
   sourceMimeType?: string;
@@ -107,6 +123,33 @@ const TimelineTrackSchema = new Schema<ITimelineTrackSubdoc>(
   { _id: false }
 );
 
+const ClipTransitionSchema = new Schema<IClipTransitionSubdoc>(
+  {
+    type: {
+      type: String,
+      enum: ["none", "fade", "dissolve", "wipeleft", "wiperight", "slideleft", "slideright", "zoomin"],
+      default: "none",
+    },
+    durationSec: { type: Number, default: 0.6, min: 0.2, max: 2 },
+  },
+  { _id: false }
+);
+
+const ClipVisualEffectsSchema = new Schema<IClipVisualEffectsSubdoc>(
+  {
+    preset: {
+      type: String,
+      enum: ["none", "cinematic", "bw", "vintage", "warm", "cool", "vivid"],
+      default: "none",
+    },
+    brightness: { type: Number, default: 0, min: -0.5, max: 0.5 },
+    contrast: { type: Number, default: 1, min: 0.5, max: 1.8 },
+    saturation: { type: Number, default: 1, min: 0, max: 2 },
+    blur: { type: Number, default: 0, min: 0, max: 10 },
+  },
+  { _id: false }
+);
+
 const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
   {
     id: { type: String, required: true },
@@ -126,6 +169,9 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
     duckingAmount: { type: Number, default: 0.6, min: 0, max: 0.95 },
     speed: { type: Number, default: 1, min: 0.25, max: 4 },
     opacity: { type: Number, default: 1, min: 0, max: 1 },
+    transitionIn: { type: ClipTransitionSchema, required: false },
+    transitionOut: { type: ClipTransitionSchema, required: false },
+    effects: { type: ClipVisualEffectsSchema, required: false },
     sourceName: { type: String },
     sourceSizeBytes: { type: Number },
     sourceMimeType: { type: String },

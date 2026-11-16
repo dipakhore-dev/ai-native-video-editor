@@ -31,6 +31,12 @@ import { ExportModal } from "../components/editor/ExportModal";
 import { useStudio } from "../context/StudioContext";
 import type { MediaAsset, MediaKind, Project, TimelineClip } from "../types/studio";
 import { buildSpeechIntervals, computeEffectiveClipGain } from "../utils/audio";
+import {
+  buildPreviewCssFilter,
+  computeClipTransitionStyle,
+  normalizeEffects,
+  normalizeTransition,
+} from "../utils/effects";
 import { formatBytes, formatTimecode } from "../utils/media";
 import { getSubtitleStyle, hexToRgba } from "../utils/subtitles";
 
@@ -259,6 +265,49 @@ export function EditorPage() {
   const primaryVisualClip = activeV1Clip ?? activeV2Clip;
   const primaryTrackMuted =
     primaryVisualClip?.trackId === "track_v2" ? Boolean(v2Track?.muted) : Boolean(v1Track?.muted);
+
+  const prevAdjacentV1Clip = useMemo<TimelineClip | null>(() => {
+    if (!activeProject || !primaryVisualClip || primaryVisualClip.trackId !== "track_v1") {
+      return null;
+    }
+    const candidates = activeProject.clips
+      .filter(
+        (c) =>
+          c.trackId === "track_v1" &&
+          c.id !== primaryVisualClip.id &&
+          c.startTime + c.duration <= primaryVisualClip.startTime + 0.15 &&
+          Math.abs(primaryVisualClip.startTime - (c.startTime + c.duration)) <= 0.15
+      )
+      .sort((a, b) => b.startTime + b.duration - (a.startTime + a.duration));
+    return candidates[0] ?? null;
+  }, [activeProject, primaryVisualClip]);
+
+  const primaryPreviewStyle = useMemo(() => {
+    if (!primaryVisualClip) return {};
+    const filter = buildPreviewCssFilter(primaryVisualClip.effects);
+    const transStyle = computeClipTransitionStyle(
+      primaryVisualClip,
+      playheadTime,
+      prevAdjacentV1Clip
+    );
+    return {
+      ...transStyle,
+      ...(filter !== "none" ? { filter } : {}),
+    };
+  }, [primaryVisualClip, playheadTime, prevAdjacentV1Clip]);
+
+  const activeTransitionBackdropUrl = useMemo(() => {
+    if (!primaryVisualClip || !prevAdjacentV1Clip?.thumbnailUrl) return null;
+    const elapsed = Math.max(0, playheadTime - primaryVisualClip.startTime);
+    const inTrans = normalizeTransition(primaryVisualClip.transitionIn, primaryVisualClip.duration);
+    const prevOut = normalizeTransition(
+      prevAdjacentV1Clip.transitionOut,
+      prevAdjacentV1Clip.duration
+    );
+    const effective = inTrans.type !== "none" ? inTrans : prevOut;
+    if (effective.type === "none" || elapsed >= effective.durationSec) return null;
+    return prevAdjacentV1Clip.thumbnailUrl;
+  }, [primaryVisualClip, prevAdjacentV1Clip, playheadTime]);
 
   const syncVideoElement = useCallback(() => {
     const vid = videoRef.current;
@@ -583,7 +632,11 @@ export function EditorPage() {
       tracks: activeProject.tracks.map((t) => ({ ...t })),
       clips: activeProject.clips.map((c) => ({
         ...c,
+        waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
+        transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
+        transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
+        effects: c.effects ? normalizeEffects(c.effects) : undefined,
       })),
     };
 
@@ -1003,6 +1056,21 @@ export function EditorPage() {
                 >
                   {primaryVisualClip && !primaryVisualClip.needsRelink && primaryVisualClip.objectUrl ? (
                     <>
+                      {activeTransitionBackdropUrl && (
+                        <img
+                          src={activeTransitionBackdropUrl}
+                          alt=""
+                          aria-hidden="true"
+                          style={{
+                            ...(prevAdjacentV1Clip?.effects &&
+                            buildPreviewCssFilter(prevAdjacentV1Clip.effects) !== "none"
+                              ? { filter: buildPreviewCssFilter(prevAdjacentV1Clip.effects) }
+                              : {}),
+                            opacity: prevAdjacentV1Clip?.opacity ?? 1,
+                          }}
+                          className="absolute inset-0 h-full w-full object-contain pointer-events-none"
+                        />
+                      )}
                       {primaryVisualClip.kind === "video" ? (
                         <video
                           ref={videoRef}
@@ -1010,15 +1078,15 @@ export function EditorPage() {
                           onLoadedMetadata={syncVideoElement}
                           onCanPlay={syncVideoElement}
                           playsInline
-                          style={{ opacity: primaryVisualClip.opacity }}
-                          className="h-full w-full object-contain"
+                          style={primaryPreviewStyle}
+                          className="relative h-full w-full object-contain"
                         />
                       ) : (
                         <img
                           src={primaryVisualClip.objectUrl}
                           alt={primaryVisualClip.name}
-                          style={{ opacity: primaryVisualClip.opacity }}
-                          className="h-full w-full object-contain"
+                          style={primaryPreviewStyle}
+                          className="relative h-full w-full object-contain"
                         />
                       )}
                     </>
@@ -1051,11 +1119,18 @@ export function EditorPage() {
                   {activeV1Clip &&
                     activeV2Clip &&
                     activeV2Clip.kind === "image" &&
-                    !activeV2Clip.needsRelink && (
+                    !v2Track?.muted &&
+                    !activeV2Clip.needsRelink &&
+                    activeV2Clip.objectUrl && (
                       <img
                         src={activeV2Clip.objectUrl}
                         alt={activeV2Clip.name}
-                        style={{ opacity: activeV2Clip.opacity }}
+                        style={{
+                          ...computeClipTransitionStyle(activeV2Clip, playheadTime),
+                          ...(buildPreviewCssFilter(activeV2Clip.effects) !== "none"
+                            ? { filter: buildPreviewCssFilter(activeV2Clip.effects) }
+                            : {}),
+                        }}
                         className="absolute inset-0 h-full w-full object-contain pointer-events-none"
                       />
                     )}
@@ -1065,6 +1140,7 @@ export function EditorPage() {
                     const style = textClip.textStyle;
                     if (!style) return null;
                     const isSelected = textClip.id === selectedClipId;
+                    const transStyle = computeClipTransitionStyle(textClip, playheadTime);
                     return (
                       <div
                         key={textClip.id}
@@ -1072,11 +1148,14 @@ export function EditorPage() {
                         style={{
                           left: `${style.x}%`,
                           top: `${style.y}%`,
-                          transform: "translate(-50%, -50%)",
+                          transform: transStyle.transform
+                            ? `translate(-50%, -50%) ${transStyle.transform}`
+                            : "translate(-50%, -50%)",
                           fontSize: `${Math.max(12, Math.round(style.fontSize * 0.65))}px`,
                           color: style.color,
                           backgroundColor: `rgba(9, 9, 11, ${style.backgroundOpacity})`,
-                          opacity: textClip.opacity,
+                          opacity: transStyle.opacity ?? textClip.opacity,
+                          ...(transStyle.clipPath ? { clipPath: transStyle.clipPath } : {}),
                           textAlign: style.align,
                         }}
                         className={`absolute px-3 py-1.5 rounded-md font-display font-semibold cursor-move select-none max-w-[85%] whitespace-pre-wrap leading-tight ${
