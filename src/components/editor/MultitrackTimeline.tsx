@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   MousePointer2,
   Scissors,
@@ -61,6 +61,243 @@ function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
   };
 }
 
+interface TimelineClipItemProps {
+  clip: TimelineClip;
+  trackLocked: boolean;
+  trackMuted: boolean;
+  trackType: TrackType;
+  zoomPxPerSec: number;
+  isSelected: boolean;
+  isDragging: boolean;
+  activeTool: "select" | "razor";
+  onClipMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
+  onTrimLeftMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
+  onTrimRightMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
+}
+
+const TimelineClipItem = React.memo(function TimelineClipItem({
+  clip,
+  trackLocked,
+  trackMuted,
+  trackType,
+  zoomPxPerSec,
+  isSelected,
+  isDragging,
+  activeTool,
+  onClipMouseDown,
+  onTrimLeftMouseDown,
+  onTrimRightMouseDown,
+}: TimelineClipItemProps) {
+  const leftPx = clip.startTime * zoomPxPerSec;
+  const widthPx = Math.max(28, clip.duration * zoomPxPerSec);
+  const isClipMuted = Boolean(clip.muted || trackMuted || clip.volume <= 0.001);
+  const targetBars = Math.max(14, Math.min(140, Math.round(widthPx / 3.5)));
+
+  const waveformBars = useMemo(
+    () =>
+      clip.waveformPeaks?.length
+        ? sliceWaveformPeaksForClip(clip.waveformPeaks, clip, targetBars)
+        : [],
+    [clip.waveformPeaks, clip.inPoint, clip.duration, clip.sourceDuration, clip.speed, targetBars]
+  );
+
+  const { fadeIn, fadeOut } = computeEffectiveFadeDurations(
+    clip.duration,
+    clip.fadeInSec,
+    clip.fadeOutSec
+  );
+  const fadeInPct = clip.duration > 0 ? Math.min(100, (fadeIn / clip.duration) * 100) : 0;
+  const fadeOutPct = clip.duration > 0 ? Math.min(100, (fadeOut / clip.duration) * 100) : 0;
+  const gainScale = isClipMuted ? 0.14 : Math.max(0.18, Math.min(1.65, clip.volume));
+
+  const trIn =
+    clip.kind !== "audio" ? normalizeTransition(clip.transitionIn, clip.duration) : null;
+  const trOut =
+    clip.kind !== "audio" ? normalizeTransition(clip.transitionOut, clip.duration) : null;
+  const trInPct =
+    trIn && trIn.type !== "none" && clip.duration > 0
+      ? Math.min(45, (trIn.durationSec / clip.duration) * 100)
+      : 0;
+  const trOutPct =
+    trOut && trOut.type !== "none" && clip.duration > 0
+      ? Math.min(45, (trOut.durationSec / clip.duration) * 100)
+      : 0;
+
+  const effCustomized =
+    (clip.kind === "video" || clip.kind === "image") && hasCustomEffects(clip.effects);
+  const effPresetLabel =
+    effCustomized && clip.effects?.preset && clip.effects.preset !== "none"
+      ? EFFECT_PRESETS.find((p) => p.value === clip.effects?.preset)?.label ?? "FX"
+      : "FX";
+
+  const colorClasses =
+    clip.kind === "text"
+      ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-100"
+      : clip.kind === "audio"
+        ? isClipMuted
+          ? "bg-zinc-800/50 border-zinc-600/60 text-zinc-400"
+          : "bg-blue-600/25 border-blue-500/50 text-blue-100"
+        : trackType === "overlay"
+          ? "bg-indigo-600/25 border-indigo-400/50 text-indigo-100"
+          : "bg-violet-600/25 border-violet-500/50 text-violet-100";
+
+  return (
+    <div
+      onMouseDown={(e) => onClipMouseDown(e, clip, trackLocked)}
+      style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
+      className={`group/clip absolute top-1.5 bottom-1.5 rounded-md border overflow-hidden flex items-center px-2.5 gap-2 ${
+        activeTool === "razor"
+          ? "cursor-crosshair"
+          : "cursor-grab active:cursor-grabbing"
+      } ${colorClasses} ${
+        isDragging
+          ? "ring-2 ring-cyan-400 opacity-90 z-20"
+          : isSelected
+            ? "ring-2 ring-white/90 z-10"
+            : "hover:brightness-110"
+      }`}
+    >
+      {/* Real Audio PCM Waveform Backdrop */}
+      {waveformBars.length > 0 && (
+        <div
+          aria-hidden="true"
+          className={`absolute inset-0 flex pointer-events-none px-0.5 ${
+            clip.kind === "audio"
+              ? "items-center gap-[1px]"
+              : "items-end pb-0.5 gap-[1px] opacity-40"
+          }`}
+        >
+          {waveformBars.map((amp, idx) => {
+            const barHeightPct = Math.max(8, Math.min(92, Math.round(amp * 88 * gainScale)));
+            return (
+              <span
+                key={idx}
+                style={{
+                  height: `${clip.kind === "audio" ? barHeightPct : Math.round(barHeightPct * 0.48)}%`,
+                }}
+                className={`flex-1 rounded-[1px] ${
+                  clip.kind === "audio"
+                    ? isClipMuted
+                      ? "bg-zinc-500/45"
+                      : "bg-sky-300/45"
+                    : "bg-violet-200/45"
+                }`}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {/* Visual Fade-In / Fade-Out Envelopes (Audio) */}
+      {fadeInPct > 0.5 && (
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{ width: `${fadeInPct}%` }}
+          className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
+          aria-hidden="true"
+        >
+          <polygon points="0,0 100,0 0,100" fill="rgba(9,9,11,0.58)" />
+          <line x1="0" y1="100" x2="100" y2="0" stroke="rgba(125,211,252,0.75)" strokeWidth="2" />
+        </svg>
+      )}
+      {fadeOutPct > 0.5 && (
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{ width: `${fadeOutPct}%` }}
+          className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
+          aria-hidden="true"
+        >
+          <polygon points="0,0 100,0 100,100" fill="rgba(9,9,11,0.58)" />
+          <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(125,211,252,0.75)" strokeWidth="2" />
+        </svg>
+      )}
+
+      {/* Visual Transition Edge Wedges (V1/V2/T1) */}
+      {trInPct > 0.5 && (
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{ width: `${trInPct}%` }}
+          className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
+          aria-hidden="true"
+        >
+          <polygon points="0,0 100,0 0,100" fill="rgba(245,158,11,0.34)" />
+          <line x1="0" y1="100" x2="100" y2="0" stroke="rgba(251,191,36,0.85)" strokeWidth="2" />
+        </svg>
+      )}
+      {trOutPct > 0.5 && (
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style={{ width: `${trOutPct}%` }}
+          className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
+          aria-hidden="true"
+        >
+          <polygon points="0,0 100,0 100,100" fill="rgba(245,158,11,0.34)" />
+          <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(251,191,36,0.85)" strokeWidth="2" />
+        </svg>
+      )}
+
+      {/* Left Trim Handle */}
+      {!trackLocked && (
+        <div
+          onMouseDown={(e) => onTrimLeftMouseDown(e, clip, trackLocked)}
+          className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/40 z-10"
+          title="Drag to trim clip start"
+        />
+      )}
+
+      {clip.thumbnailUrl && widthPx > 56 && (
+        <img
+          src={clip.thumbnailUrl}
+          alt=""
+          className="relative z-[1] h-7 w-10 rounded object-cover shrink-0 pointer-events-none"
+        />
+      )}
+      <div className="relative z-[1] min-w-0 flex-1 pointer-events-none">
+        <div className="flex items-center gap-1">
+          {clip.needsRelink && <AlertTriangle className="h-3 w-3 text-amber-400 shrink-0" />}
+          {isClipMuted && (clip.kind === "audio" || clip.kind === "video") && (
+            <VolumeX className="h-3 w-3 text-rose-300 shrink-0" />
+          )}
+          <p className="text-[11px] font-medium truncate drop-shadow-sm">
+            {clip.kind === "text" ? clip.textStyle?.text || clip.name : clip.name}
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px] font-mono opacity-85 tabular-nums truncate">
+          <span>{formatTimecode(clip.duration)}</span>
+          {Math.abs(clip.speed - 1) > 0.01 && (
+            <span className="text-cyan-200">{Number(clip.speed.toFixed(2))}x</span>
+          )}
+          {(clip.kind === "audio" || clip.kind === "video") &&
+            !isClipMuted &&
+            Math.abs(clip.volume - 1) > 0.02 && (
+              <span className="text-sky-200">{Math.round(clip.volume * 100)}%</span>
+            )}
+          {clip.kind === "audio" && clip.duckingEnabled && widthPx > 96 && (
+            <span className="text-amber-200">Duck</span>
+          )}
+          {effCustomized && widthPx > 88 && <span className="text-amber-300">{effPresetLabel}</span>}
+          {clip.kind !== "audio" && clip.opacity < 0.99 && widthPx > 96 && (
+            <span className="text-zinc-300">{Math.round(clip.opacity * 100)}%</span>
+          )}
+        </div>
+      </div>
+
+      {/* Right Trim Handle */}
+      {!trackLocked && (
+        <div
+          onMouseDown={(e) => onTrimRightMouseDown(e, clip, trackLocked)}
+          className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/40 z-10"
+          title="Drag to trim clip end"
+        />
+      )}
+    </div>
+  );
+});
+
 export function MultitrackTimeline({
   project,
   playheadTime,
@@ -100,9 +337,24 @@ export function MultitrackTimeline({
   } | null>(null);
   const tracksAreaRef = useRef<HTMLDivElement | null>(null);
   const trackRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const projectRef = useRef(project);
+  projectRef.current = project;
 
   const timelineSeconds = Math.max(30, Math.ceil(totalDuration + 10));
   const timelineWidth = timelineSeconds * zoomPxPerSec;
+
+  const clipsByTrack = useMemo(() => {
+    const grouped = new Map<string, TimelineClip[]>();
+    for (const clip of project.clips) {
+      const list = grouped.get(clip.trackId);
+      if (list) {
+        list.push(clip);
+      } else {
+        grouped.set(clip.trackId, [clip]);
+      }
+    }
+    return grouped;
+  }, [project.clips]);
 
   // Keep playhead in view during playback
   useEffect(() => {
@@ -116,18 +368,24 @@ export function MultitrackTimeline({
     }
   }, [playheadTime, zoomPxPerSec]);
 
-  const snapTime = (t: number): number => {
-    if (!snapEnabled) return Math.max(0, Number(t.toFixed(2)));
-    const grid = 0.25;
-    return Math.max(0, Number((Math.round(t / grid) * grid).toFixed(2)));
-  };
+  const snapTime = useCallback(
+    (t: number): number => {
+      if (!snapEnabled) return Math.max(0, Number(t.toFixed(2)));
+      const grid = 0.25;
+      return Math.max(0, Number((Math.round(t / grid) * grid).toFixed(2)));
+    },
+    [snapEnabled]
+  );
 
-  const clientXToTime = (clientX: number): number => {
-    if (!tracksAreaRef.current) return 0;
-    const rect = tracksAreaRef.current.getBoundingClientRect();
-    const x = clientX - rect.left + tracksAreaRef.current.scrollLeft;
-    return Math.max(0, Number((x / zoomPxPerSec).toFixed(2)));
-  };
+  const clientXToTime = useCallback(
+    (clientX: number): number => {
+      if (!tracksAreaRef.current) return 0;
+      const rect = tracksAreaRef.current.getBoundingClientRect();
+      const x = clientX - rect.left + tracksAreaRef.current.scrollLeft;
+      return Math.max(0, Number((x / zoomPxPerSec).toFixed(2)));
+    },
+    [zoomPxPerSec]
+  );
 
   const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const startT = clientXToTime(e.clientX);
@@ -144,180 +402,193 @@ export function MultitrackTimeline({
     window.addEventListener("mouseup", onUp);
   };
 
-  const resolveCompatibleTrackAtY = (clientY: number, clipKind: MediaKind, fallbackTrackId: string): string => {
-    for (const track of project.tracks) {
-      const rowEl = trackRowRefs.current[track.id];
-      if (!rowEl) continue;
-      const rect = rowEl.getBoundingClientRect();
-      if (clientY >= rect.top && clientY <= rect.bottom) {
-        if (!track.locked && isAssetKindCompatibleWithTrack(clipKind, track.type)) {
-          return track.id;
+  const resolveCompatibleTrackAtY = useCallback(
+    (clientY: number, clipKind: MediaKind, fallbackTrackId: string): string => {
+      for (const track of projectRef.current.tracks) {
+        const rowEl = trackRowRefs.current[track.id];
+        if (!rowEl) continue;
+        const rect = rowEl.getBoundingClientRect();
+        if (clientY >= rect.top && clientY <= rect.bottom) {
+          if (!track.locked && isAssetKindCompatibleWithTrack(clipKind, track.type)) {
+            return track.id;
+          }
+          return fallbackTrackId;
         }
-        return fallbackTrackId;
       }
-    }
-    return fallbackTrackId;
-  };
+      return fallbackTrackId;
+    },
+    []
+  );
 
-  const handleClipMouseDown = (
-    e: React.MouseEvent<HTMLDivElement>,
-    clip: TimelineClip,
-    trackLocked: boolean
-  ) => {
-    e.stopPropagation();
-    onSelectClip(clip.id);
+  const handleClipMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => {
+      e.stopPropagation();
+      onSelectClip(clip.id);
 
-    if (trackLocked) return;
+      if (trackLocked) return;
 
-    if (activeTool === "razor") {
-      const clickTime = clientXToTime(e.clientX);
-      splitClipAtTime(clip.id, clickTime);
-      return;
-    }
-
-    const initialClips = project.clips.map(cloneClipForSnapshot);
-    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
-    const beforeSnapshot: Project = {
-      ...project,
-      tracks: project.tracks.map((t) => ({ ...t })),
-      clips: initialClips.map(cloneClipForSnapshot),
-      subtitles: initialSubtitles.map((s) => ({ ...s })),
-      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
-      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
-    };
-
-    const initialX = e.clientX;
-    const initialStart = clip.startTime;
-    let moved = false;
-    setDraggingClipId(clip.id);
-
-    const onMove = (moveEv: MouseEvent) => {
-      const deltaPx = moveEv.clientX - initialX;
-      const targetTrackId = resolveCompatibleTrackAtY(
-        moveEv.clientY,
-        clip.kind,
-        clip.trackId
-      );
-      if (Math.abs(deltaPx) > 2 || targetTrackId !== clip.trackId) {
-        moved = true;
+      if (activeTool === "razor") {
+        const clickTime = clientXToTime(e.clientX);
+        splitClipAtTime(clip.id, clickTime);
+        return;
       }
-      const deltaSec = deltaPx / zoomPxPerSec;
-      const nextStart = snapTime(initialStart + deltaSec);
-      moveClipOnTimeline(clip.id, nextStart, targetTrackId, false, {
-        clips: initialClips,
-        subtitles: initialSubtitles,
-      });
-    };
 
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      setDraggingClipId(null);
-      if (moved) {
-        commitProjectSnapshot(beforeSnapshot);
-      }
-    };
+      const curProj = projectRef.current;
+      const initialClips = curProj.clips.map(cloneClipForSnapshot);
+      const initialSubtitles = (curProj.subtitles ?? []).map((s) => ({ ...s }));
+      const beforeSnapshot: Project = {
+        ...curProj,
+        tracks: curProj.tracks.map((t) => ({ ...t })),
+        clips: initialClips.map(cloneClipForSnapshot),
+        subtitles: initialSubtitles.map((s) => ({ ...s })),
+        subtitleStyle: curProj.subtitleStyle ? { ...curProj.subtitleStyle } : undefined,
+        subtitleMeta: curProj.subtitleMeta ? { ...curProj.subtitleMeta } : undefined,
+      };
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
+      const initialX = e.clientX;
+      const initialStart = clip.startTime;
+      let moved = false;
+      setDraggingClipId(clip.id);
 
-  const handleTrimLeftMouseDown = (
-    e: React.MouseEvent<HTMLDivElement>,
-    clip: TimelineClip,
-    trackLocked: boolean
-  ) => {
-    e.stopPropagation();
-    onSelectClip(clip.id);
-    if (trackLocked) return;
+      const onMove = (moveEv: MouseEvent) => {
+        const deltaPx = moveEv.clientX - initialX;
+        const targetTrackId = resolveCompatibleTrackAtY(
+          moveEv.clientY,
+          clip.kind,
+          clip.trackId
+        );
+        if (Math.abs(deltaPx) > 2 || targetTrackId !== clip.trackId) {
+          moved = true;
+        }
+        const deltaSec = deltaPx / zoomPxPerSec;
+        const nextStart = snapTime(initialStart + deltaSec);
+        moveClipOnTimeline(clip.id, nextStart, targetTrackId, false, {
+          clips: initialClips,
+          subtitles: initialSubtitles,
+        });
+      };
 
-    const initialClip = cloneClipForSnapshot(clip);
-    const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
-    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
-    const beforeSnapshot: Project = {
-      ...project,
-      tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map(cloneClipForSnapshot),
-      subtitles: initialSubtitles.map((s) => ({ ...s })),
-      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
-      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
-    };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        setDraggingClipId(null);
+        if (moved) {
+          commitProjectSnapshot(beforeSnapshot);
+        }
+      };
 
-    const initialX = e.clientX;
-    let moved = false;
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [
+      activeTool,
+      clientXToTime,
+      commitProjectSnapshot,
+      moveClipOnTimeline,
+      onSelectClip,
+      resolveCompatibleTrackAtY,
+      snapTime,
+      splitClipAtTime,
+      zoomPxPerSec,
+    ]
+  );
 
-    const onMove = (moveEv: MouseEvent) => {
-      const deltaPx = moveEv.clientX - initialX;
-      if (Math.abs(deltaPx) > 1) moved = true;
-      const deltaSec = deltaPx / zoomPxPerSec;
-      const desiredStart = snapTime(initialClip.startTime + deltaSec);
-      const patch = trimClipStart(initialClip, desiredStart, initialTrackClips);
-      updateClip(clip.id, patch, false, {
-        clip: initialClip,
-        subtitles: initialSubtitles,
-      });
-    };
+  const handleTrimLeftMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => {
+      e.stopPropagation();
+      onSelectClip(clip.id);
+      if (trackLocked) return;
 
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      if (moved) {
-        commitProjectSnapshot(beforeSnapshot);
-      }
-    };
+      const curProj = projectRef.current;
+      const initialClip = cloneClipForSnapshot(clip);
+      const initialTrackClips = curProj.clips.filter((c) => c.trackId === clip.trackId);
+      const initialSubtitles = (curProj.subtitles ?? []).map((s) => ({ ...s }));
+      const beforeSnapshot: Project = {
+        ...curProj,
+        tracks: curProj.tracks.map((t) => ({ ...t })),
+        clips: curProj.clips.map(cloneClipForSnapshot),
+        subtitles: initialSubtitles.map((s) => ({ ...s })),
+        subtitleStyle: curProj.subtitleStyle ? { ...curProj.subtitleStyle } : undefined,
+        subtitleMeta: curProj.subtitleMeta ? { ...curProj.subtitleMeta } : undefined,
+      };
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
+      const initialX = e.clientX;
+      let moved = false;
 
-  const handleTrimRightMouseDown = (
-    e: React.MouseEvent<HTMLDivElement>,
-    clip: TimelineClip,
-    trackLocked: boolean
-  ) => {
-    e.stopPropagation();
-    onSelectClip(clip.id);
-    if (trackLocked) return;
+      const onMove = (moveEv: MouseEvent) => {
+        const deltaPx = moveEv.clientX - initialX;
+        if (Math.abs(deltaPx) > 1) moved = true;
+        const deltaSec = deltaPx / zoomPxPerSec;
+        const desiredStart = snapTime(initialClip.startTime + deltaSec);
+        const patch = trimClipStart(initialClip, desiredStart, initialTrackClips);
+        updateClip(clip.id, patch, false, {
+          clip: initialClip,
+          subtitles: initialSubtitles,
+        });
+      };
 
-    const initialClip = cloneClipForSnapshot(clip);
-    const initialTrackClips = project.clips.filter((c) => c.trackId === clip.trackId);
-    const initialSubtitles = (project.subtitles ?? []).map((s) => ({ ...s }));
-    const beforeSnapshot: Project = {
-      ...project,
-      tracks: project.tracks.map((t) => ({ ...t })),
-      clips: project.clips.map(cloneClipForSnapshot),
-      subtitles: initialSubtitles.map((s) => ({ ...s })),
-      subtitleStyle: project.subtitleStyle ? { ...project.subtitleStyle } : undefined,
-      subtitleMeta: project.subtitleMeta ? { ...project.subtitleMeta } : undefined,
-    };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (moved) {
+          commitProjectSnapshot(beforeSnapshot);
+        }
+      };
 
-    const initialX = e.clientX;
-    const initialDur = clip.duration;
-    let moved = false;
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [commitProjectSnapshot, onSelectClip, snapTime, updateClip, zoomPxPerSec]
+  );
 
-    const onMove = (moveEv: MouseEvent) => {
-      const deltaPx = moveEv.clientX - initialX;
-      if (Math.abs(deltaPx) > 1) moved = true;
-      const deltaSec = deltaPx / zoomPxPerSec;
-      const desiredDur = snapTime(initialDur + deltaSec);
-      const patch = trimClipEnd(initialClip, desiredDur, initialTrackClips);
-      updateClip(clip.id, patch, false, {
-        clip: initialClip,
-        subtitles: initialSubtitles,
-      });
-    };
+  const handleTrimRightMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => {
+      e.stopPropagation();
+      onSelectClip(clip.id);
+      if (trackLocked) return;
 
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      if (moved) {
-        commitProjectSnapshot(beforeSnapshot);
-      }
-    };
+      const curProj = projectRef.current;
+      const initialClip = cloneClipForSnapshot(clip);
+      const initialTrackClips = curProj.clips.filter((c) => c.trackId === clip.trackId);
+      const initialSubtitles = (curProj.subtitles ?? []).map((s) => ({ ...s }));
+      const beforeSnapshot: Project = {
+        ...curProj,
+        tracks: curProj.tracks.map((t) => ({ ...t })),
+        clips: curProj.clips.map(cloneClipForSnapshot),
+        subtitles: initialSubtitles.map((s) => ({ ...s })),
+        subtitleStyle: curProj.subtitleStyle ? { ...curProj.subtitleStyle } : undefined,
+        subtitleMeta: curProj.subtitleMeta ? { ...curProj.subtitleMeta } : undefined,
+      };
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
+      const initialX = e.clientX;
+      const initialDur = clip.duration;
+      let moved = false;
+
+      const onMove = (moveEv: MouseEvent) => {
+        const deltaPx = moveEv.clientX - initialX;
+        if (Math.abs(deltaPx) > 1) moved = true;
+        const deltaSec = deltaPx / zoomPxPerSec;
+        const desiredDur = snapTime(initialDur + deltaSec);
+        const patch = trimClipEnd(initialClip, desiredDur, initialTrackClips);
+        updateClip(clip.id, patch, false, {
+          clip: initialClip,
+          subtitles: initialSubtitles,
+        });
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (moved) {
+          commitProjectSnapshot(beforeSnapshot);
+        }
+      };
+
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [commitProjectSnapshot, onSelectClip, snapTime, updateClip, zoomPxPerSec]
+  );
 
   // Find a clip to split: either the selected clip (if playhead is inside it) or any clip under playhead
   const splittableClip = (() => {
@@ -631,7 +902,7 @@ export function MultitrackTimeline({
 
             {/* Track Lanes */}
             {project.tracks.map((track) => {
-              const trackClips = project.clips.filter((c) => c.trackId === track.id);
+              const trackClips = clipsByTrack.get(track.id) ?? [];
               const isDropTarget = dropIndicator?.trackId === track.id;
               return (
                 <div
@@ -701,256 +972,22 @@ export function MultitrackTimeline({
                     </div>
                   )}
 
-                  {trackClips.map((clip) => {
-                    const isSelected = clip.id === selectedClipId;
-                    const isDragging = clip.id === draggingClipId;
-                    const leftPx = clip.startTime * zoomPxPerSec;
-                    const widthPx = Math.max(28, clip.duration * zoomPxPerSec);
-                    const isClipMuted = Boolean(clip.muted || track.muted || clip.volume <= 0.001);
-                    const targetBars = Math.max(14, Math.min(140, Math.round(widthPx / 3.5)));
-                    const waveformBars = clip.waveformPeaks?.length
-                      ? sliceWaveformPeaksForClip(clip.waveformPeaks, clip, targetBars)
-                      : [];
-                    const { fadeIn, fadeOut } = computeEffectiveFadeDurations(
-                      clip.duration,
-                      clip.fadeInSec,
-                      clip.fadeOutSec
-                    );
-                    const fadeInPct = clip.duration > 0 ? Math.min(100, (fadeIn / clip.duration) * 100) : 0;
-                    const fadeOutPct = clip.duration > 0 ? Math.min(100, (fadeOut / clip.duration) * 100) : 0;
-                    const gainScale = isClipMuted ? 0.14 : Math.max(0.18, Math.min(1.65, clip.volume));
-
-                    const trIn =
-                      clip.kind !== "audio"
-                        ? normalizeTransition(clip.transitionIn, clip.duration)
-                        : null;
-                    const trOut =
-                      clip.kind !== "audio"
-                        ? normalizeTransition(clip.transitionOut, clip.duration)
-                        : null;
-                    const trInPct =
-                      trIn && trIn.type !== "none" && clip.duration > 0
-                        ? Math.min(45, (trIn.durationSec / clip.duration) * 100)
-                        : 0;
-                    const trOutPct =
-                      trOut && trOut.type !== "none" && clip.duration > 0
-                        ? Math.min(45, (trOut.durationSec / clip.duration) * 100)
-                        : 0;
-
-                    const effCustomized =
-                      (clip.kind === "video" || clip.kind === "image") &&
-                      hasCustomEffects(clip.effects);
-                    const effPresetLabel =
-                      effCustomized && clip.effects?.preset && clip.effects.preset !== "none"
-                        ? EFFECT_PRESETS.find((p) => p.value === clip.effects?.preset)?.label ?? "FX"
-                        : "FX";
-
-                    const colorClasses =
-                      clip.kind === "text"
-                        ? "bg-emerald-600/20 border-emerald-500/50 text-emerald-100"
-                        : clip.kind === "audio"
-                        ? isClipMuted
-                          ? "bg-zinc-800/50 border-zinc-600/60 text-zinc-400"
-                          : "bg-blue-600/25 border-blue-500/50 text-blue-100"
-                        : track.type === "overlay"
-                        ? "bg-indigo-600/25 border-indigo-400/50 text-indigo-100"
-                        : "bg-violet-600/25 border-violet-500/50 text-violet-100";
-
-                    return (
-                      <div
-                        key={clip.id}
-                        onMouseDown={(e) => handleClipMouseDown(e, clip, track.locked)}
-                        style={{ left: `${leftPx}px`, width: `${widthPx}px` }}
-                        className={`group/clip absolute top-1.5 bottom-1.5 rounded-md border overflow-hidden flex items-center px-2.5 gap-2 ${
-                          activeTool === "razor"
-                            ? "cursor-crosshair"
-                            : "cursor-grab active:cursor-grabbing"
-                        } ${colorClasses} ${
-                          isDragging
-                            ? "ring-2 ring-cyan-400 opacity-90 z-20"
-                            : isSelected
-                              ? "ring-2 ring-white/90 z-10"
-                              : "hover:brightness-110"
-                        }`}
-                      >
-                        {/* Real Audio PCM Waveform Backdrop */}
-                        {waveformBars.length > 0 && (
-                          <div
-                            aria-hidden="true"
-                            className={`absolute inset-0 flex pointer-events-none px-0.5 ${
-                              clip.kind === "audio"
-                                ? "items-center gap-[1px]"
-                                : "items-end pb-0.5 gap-[1px] opacity-40"
-                            }`}
-                          >
-                            {waveformBars.map((amp, idx) => {
-                              const barHeightPct = Math.max(
-                                8,
-                                Math.min(92, Math.round(amp * 88 * gainScale))
-                              );
-                              return (
-                                <span
-                                  key={idx}
-                                  style={{ height: `${clip.kind === "audio" ? barHeightPct : Math.round(barHeightPct * 0.48)}%` }}
-                                  className={`flex-1 rounded-[1px] ${
-                                    clip.kind === "audio"
-                                      ? isClipMuted
-                                        ? "bg-zinc-500/45"
-                                        : "bg-sky-300/45"
-                                      : "bg-violet-200/45"
-                                  }`}
-                                />
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        {/* Visual Fade-In / Fade-Out Envelopes (Audio) */}
-                        {fadeInPct > 0.5 && (
-                          <svg
-                            viewBox="0 0 100 100"
-                            preserveAspectRatio="none"
-                            style={{ width: `${fadeInPct}%` }}
-                            className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
-                            aria-hidden="true"
-                          >
-                            <polygon points="0,0 100,0 0,100" fill="rgba(9,9,11,0.58)" />
-                            <line
-                              x1="0"
-                              y1="100"
-                              x2="100"
-                              y2="0"
-                              stroke="rgba(125,211,252,0.75)"
-                              strokeWidth="2"
-                            />
-                          </svg>
-                        )}
-                        {fadeOutPct > 0.5 && (
-                          <svg
-                            viewBox="0 0 100 100"
-                            preserveAspectRatio="none"
-                            style={{ width: `${fadeOutPct}%` }}
-                            className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
-                            aria-hidden="true"
-                          >
-                            <polygon points="0,0 100,0 100,100" fill="rgba(9,9,11,0.58)" />
-                            <line
-                              x1="0"
-                              y1="0"
-                              x2="100"
-                              y2="100"
-                              stroke="rgba(125,211,252,0.75)"
-                              strokeWidth="2"
-                            />
-                          </svg>
-                        )}
-
-                        {/* Visual Transition Edge Wedges (V1/V2/T1) */}
-                        {trInPct > 0.5 && (
-                          <svg
-                            viewBox="0 0 100 100"
-                            preserveAspectRatio="none"
-                            style={{ width: `${trInPct}%` }}
-                            className="absolute left-0 top-0 bottom-0 h-full pointer-events-none"
-                            aria-hidden="true"
-                          >
-                            <polygon points="0,0 100,0 0,100" fill="rgba(245,158,11,0.34)" />
-                            <line
-                              x1="0"
-                              y1="100"
-                              x2="100"
-                              y2="0"
-                              stroke="rgba(251,191,36,0.85)"
-                              strokeWidth="2"
-                            />
-                          </svg>
-                        )}
-                        {trOutPct > 0.5 && (
-                          <svg
-                            viewBox="0 0 100 100"
-                            preserveAspectRatio="none"
-                            style={{ width: `${trOutPct}%` }}
-                            className="absolute right-0 top-0 bottom-0 h-full pointer-events-none"
-                            aria-hidden="true"
-                          >
-                            <polygon points="0,0 100,0 100,100" fill="rgba(245,158,11,0.34)" />
-                            <line
-                              x1="0"
-                              y1="0"
-                              x2="100"
-                              y2="100"
-                              stroke="rgba(251,191,36,0.85)"
-                              strokeWidth="2"
-                            />
-                          </svg>
-                        )}
-
-                        {/* Left Trim Handle */}
-                        {!track.locked && (
-                          <div
-                            onMouseDown={(e) => handleTrimLeftMouseDown(e, clip, track.locked)}
-                            className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/40 z-10"
-                            title="Drag to trim clip start"
-                          />
-                        )}
-
-                        {clip.thumbnailUrl && widthPx > 56 && (
-                          <img
-                            src={clip.thumbnailUrl}
-                            alt=""
-                            className="relative z-[1] h-7 w-10 rounded object-cover shrink-0 pointer-events-none"
-                          />
-                        )}
-                        <div className="relative z-[1] min-w-0 flex-1 pointer-events-none">
-                          <div className="flex items-center gap-1">
-                            {clip.needsRelink && (
-                              <AlertTriangle className="h-3 w-3 text-amber-400 shrink-0" />
-                            )}
-                            {isClipMuted && (clip.kind === "audio" || clip.kind === "video") && (
-                              <VolumeX className="h-3 w-3 text-rose-300 shrink-0" />
-                            )}
-                            <p className="text-[11px] font-medium truncate drop-shadow-sm">
-                              {clip.kind === "text" ? clip.textStyle?.text || clip.name : clip.name}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-1.5 text-[10px] font-mono opacity-85 tabular-nums truncate">
-                            <span>{formatTimecode(clip.duration)}</span>
-                            {(clip.kind === "audio" || clip.kind === "video") &&
-                              !isClipMuted &&
-                              Math.abs(clip.volume - 1) > 0.02 && (
-                                <span className="text-sky-200">
-                                  {Math.round(clip.volume * 100)}%
-                                </span>
-                              )}
-                            {clip.kind === "audio" && clip.duckingEnabled && widthPx > 96 && (
-                              <span className="text-amber-200">
-                                Duck
-                              </span>
-                            )}
-                            {effCustomized && widthPx > 88 && (
-                              <span className="text-amber-300">
-                                {effPresetLabel}
-                              </span>
-                            )}
-                            {clip.kind !== "audio" && clip.opacity < 0.99 && widthPx > 96 && (
-                              <span className="text-zinc-300">
-                                {Math.round(clip.opacity * 100)}%
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Right Trim Handle */}
-                        {!track.locked && (
-                          <div
-                            onMouseDown={(e) => handleTrimRightMouseDown(e, clip, track.locked)}
-                            className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-white/40 z-10"
-                            title="Drag to trim clip end"
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
+                  {trackClips.map((clip) => (
+                    <TimelineClipItem
+                      key={clip.id}
+                      clip={clip}
+                      trackLocked={track.locked}
+                      trackMuted={track.muted}
+                      trackType={track.type}
+                      zoomPxPerSec={zoomPxPerSec}
+                      isSelected={clip.id === selectedClipId}
+                      isDragging={clip.id === draggingClipId}
+                      activeTool={activeTool}
+                      onClipMouseDown={handleClipMouseDown}
+                      onTrimLeftMouseDown={handleTrimLeftMouseDown}
+                      onTrimRightMouseDown={handleTrimRightMouseDown}
+                    />
+                  ))}
                 </div>
               );
             })}

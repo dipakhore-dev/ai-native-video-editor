@@ -16,6 +16,7 @@ export interface ApiResult<T> {
   data?: T;
   error?: string;
   integrationPoint?: string;
+  cancelled?: boolean;
 }
 
 async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiResult<T>> {
@@ -179,61 +180,171 @@ export interface ExportMp4BinaryResult {
   jobId: string;
 }
 
-export async function exportTimelineMp4(
-  formData: FormData
-): Promise<ApiResult<ExportMp4BinaryResult>> {
-  try {
-    const res = await fetch("/api/video/export-mp4", {
-      method: "POST",
-      credentials: "include",
-      body: formData,
-    });
+export interface ExportProgressSnapshot {
+  jobId: string;
+  status: "queued" | "processing" | "completed" | "failed" | "cancelled";
+  stage: string;
+  stageLabel: string;
+  progress: number;
+  measurable: boolean;
+  elapsedMs: number;
+  cancelled: boolean;
+  error: string | null;
+}
 
-    if (!res.ok) {
-      const errBody = (await res.json().catch(() => ({}))) as {
-        error?: string;
-        message?: string;
-        integrationPoint?: string;
-      };
-      return {
-        ok: false,
-        status: res.status,
-        error: errBody.error || errBody.message || `MP4 export failed (${res.status}).`,
-        integrationPoint: errBody.integrationPoint,
-      };
-    }
-
-    const blob = await res.blob();
-    if (blob.size === 0) {
-      return {
-        ok: false,
-        status: 502,
-        error: "Server returned an empty MP4 file.",
-      };
-    }
-
-    const disposition = res.headers.get("content-disposition") || "";
-    const match = /filename="?([^";]+)"?/i.exec(disposition);
-    const filename = match?.[1] || "export.mp4";
-    const jobId = res.headers.get("x-video-job-id") || "";
-
-    return {
-      ok: true,
-      status: res.status,
-      data: {
-        blob,
-        filename,
-        sizeBytes: blob.size,
-        jobId,
-      },
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      status: 0,
-      error: err instanceof Error ? err.message : "Network error during MP4 export.",
-    };
+export function exportTimelineMp4(
+  formData: FormData,
+  options?: {
+    onUploadProgress?: (pct: number | null) => void;
+    onUploadComplete?: () => void;
+    signal?: AbortSignal;
   }
+): Promise<ApiResult<ExportMp4BinaryResult>> {
+  return new Promise((resolve) => {
+    if (options?.signal?.aborted) {
+      resolve({
+        ok: false,
+        status: 499,
+        cancelled: true,
+        error: "Export cancelled by user.",
+      });
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/video/export-mp4");
+    xhr.withCredentials = true;
+    xhr.responseType = "blob";
+
+    let settled = false;
+    const finish = (result: ApiResult<ExportMp4BinaryResult>) => {
+      if (settled) return;
+      settled = true;
+      options?.signal?.removeEventListener("abort", onAbortSignal);
+      resolve(result);
+    };
+
+    const onAbortSignal = () => {
+      try {
+        xhr.abort();
+      } catch {
+        // Ignore abort errors
+      }
+      finish({
+        ok: false,
+        status: 499,
+        cancelled: true,
+        error: "Export cancelled by user.",
+      });
+    };
+
+    options?.signal?.addEventListener("abort", onAbortSignal, { once: true });
+
+    xhr.upload.onprogress = (event) => {
+      if (!options?.onUploadProgress) return;
+      if (event.lengthComputable && event.total > 0) {
+        const pct = Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100)));
+        options.onUploadProgress(pct);
+      } else {
+        options.onUploadProgress(null);
+      }
+    };
+
+    xhr.upload.onload = () => {
+      options?.onUploadComplete?.();
+    };
+
+    xhr.onabort = () => {
+      finish({
+        ok: false,
+        status: 499,
+        cancelled: true,
+        error: "Export cancelled by user.",
+      });
+    };
+
+    xhr.onerror = () => {
+      finish({
+        ok: false,
+        status: 0,
+        error: "Network error during MP4 export. Check that the local server is running.",
+      });
+    };
+
+    xhr.onload = async () => {
+      const responseBlob = xhr.response instanceof Blob ? xhr.response : null;
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let errBody: {
+          error?: string;
+          message?: string;
+          integrationPoint?: string;
+          cancelled?: boolean;
+        } = {};
+        if (responseBlob) {
+          try {
+            const text = await responseBlob.text();
+            errBody = JSON.parse(text) as typeof errBody;
+          } catch {
+            // Non-JSON error body
+          }
+        }
+        const isCancelled = xhr.status === 499 || Boolean(errBody.cancelled);
+        finish({
+          ok: false,
+          status: xhr.status,
+          cancelled: isCancelled,
+          error:
+            errBody.error ||
+            errBody.message ||
+            (isCancelled ? "Export cancelled by user." : `MP4 export failed (${xhr.status}).`),
+          integrationPoint: errBody.integrationPoint,
+        });
+        return;
+      }
+
+      if (!responseBlob || responseBlob.size === 0) {
+        finish({
+          ok: false,
+          status: 502,
+          error: "Server returned an empty MP4 file.",
+        });
+        return;
+      }
+
+      const disposition = xhr.getResponseHeader("content-disposition") || "";
+      const match = /filename="?([^";]+)"?/i.exec(disposition);
+      const filename = match?.[1] || "export.mp4";
+      const jobId = xhr.getResponseHeader("x-video-job-id") || "";
+
+      finish({
+        ok: true,
+        status: xhr.status,
+        data: {
+          blob: responseBlob,
+          filename,
+          sizeBytes: responseBlob.size,
+          jobId,
+        },
+      });
+    };
+
+    xhr.send(formData);
+  });
+}
+
+export async function fetchExportProgress(
+  jobId: string
+): Promise<ApiResult<{ status: string; progress: ExportProgressSnapshot }>> {
+  return requestJson(`/api/video/export-progress/${encodeURIComponent(jobId)}`);
+}
+
+export async function cancelExportMp4(
+  jobId: string
+): Promise<ApiResult<{ status: string; progress: ExportProgressSnapshot }>> {
+  return requestJson(`/api/video/export-cancel/${encodeURIComponent(jobId)}`, {
+    method: "POST",
+  });
 }
 
 export interface GeneratedSubtitlesResponse {

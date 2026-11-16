@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
@@ -8,6 +9,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .config import ProcessorSettings, get_settings
 from .schemas import (
@@ -17,6 +19,7 @@ from .schemas import (
     VideoMetadataResponse,
 )
 from .services.ffmpeg_service import (
+    VideoProcessingCancelledError,
     VideoProcessingError,
     export_mp4,
     export_timeline_mp4,
@@ -66,6 +69,11 @@ async def handle_metadata_error(_request, exc: VideoMetadataError) -> JSONRespon
     return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
 
 
+@app.exception_handler(VideoProcessingCancelledError)
+async def handle_cancelled_error(_request, exc: VideoProcessingCancelledError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"error": str(exc), "cancelled": True})
+
+
 @app.exception_handler(VideoProcessingError)
 async def handle_processing_error(_request, exc: VideoProcessingError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
@@ -99,6 +107,18 @@ def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthRespons
 )
 def get_job_status(job_id: str) -> JobStatusResponse:
     job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Processing job not found.")
+    return JobStatusResponse(**job)
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/cancel",
+    response_model=JobStatusResponse,
+    dependencies=[Depends(verify_processor_key)],
+)
+def cancel_job(job_id: str) -> JobStatusResponse:
+    job = job_store.request_cancel(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Processing job not found.")
     return JobStatusResponse(**job)
@@ -367,6 +387,9 @@ async def merge_endpoint(
             await upload.close()
 
 
+_CLIENT_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
 @app.post(
     "/api/v1/export-mp4",
     dependencies=[Depends(verify_processor_key)],
@@ -378,14 +401,27 @@ async def export_mp4_endpoint(
     fps: int = Form(default=30),
     aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None),
     timeline_spec: Optional[str] = Form(default=None),
+    client_job_id: Optional[str] = Form(default=None),
     settings: ProcessorSettings = Depends(get_settings),
 ) -> FileResponse:
-    job_id = uuid.uuid4().hex
-    job_store.create(job_id, operation="export_mp4")
+    raw_cid = (client_job_id or "").strip()
+    job_id = raw_cid if _CLIENT_JOB_ID_RE.match(raw_cid) else uuid.uuid4().hex
+    job_store.create(
+        job_id,
+        operation="export_mp4",
+        stage="uploading",
+        stage_label="Receiving uploaded media",
+        measurable=False,
+    )
     job_dir = _prepare_job_dir(settings, job_id)
+    job_store.register_job_dir(job_id, job_dir)
+    cancel_event = job_store.get_cancel_event(job_id)
     uploads = [*(files or []), *([file] if file is not None else [])]
 
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
+
         if not uploads:
             raise FileValidationError(
                 'Upload at least one video file using form field "files" or "file".',
@@ -408,10 +444,19 @@ async def export_mp4_endpoint(
                 )
             parsed_spec = loaded
 
-        job_store.update(job_id, status="processing", progress=20)
+        job_store.update(
+            job_id,
+            status="processing",
+            progress=5,
+            stage="uploading",
+            stage_label="Staging uploaded media",
+            measurable=False,
+        )
         saved_paths: list[Path] = []
         first_stem = "sequence"
         for idx, upload in enumerate(uploads):
+            if cancel_event is not None and cancel_event.is_set():
+                raise VideoProcessingCancelledError()
             safe_name, saved_path = await _save_single_upload(
                 upload,
                 job_dir,
@@ -435,7 +480,21 @@ async def export_mp4_endpoint(
         )
         output_path = job_dir / f"{safe_project_stem}_export.mp4"
 
-        out_meta = export_timeline_mp4(
+        def _on_stage_progress(stage: str, label: str, pct: int, measurable: bool) -> None:
+            job_store.update(
+                job_id,
+                status="processing",
+                progress=pct,
+                stage=stage,
+                stage_label=label,
+                measurable=measurable,
+            )
+
+        def _on_process_attach(proc) -> None:
+            job_store.attach_process(job_id, proc)
+
+        out_meta = await run_in_threadpool(
+            export_timeline_mp4,
             saved_paths,
             output_path,
             timeline_spec=parsed_spec,
@@ -446,8 +505,19 @@ async def export_mp4_endpoint(
             ffprobe_bin=settings.ffprobe_bin,
             timeout_sec=settings.ffmpeg_timeout_sec,
             max_duration_sec=settings.max_short_video_sec,
+            progress_cb=_on_stage_progress,
+            cancel_event=cancel_event,
+            process_cb=_on_process_attach,
         )
-        job_store.update(job_id, status="completed", progress=100, result=out_meta)
+        job_store.update(
+            job_id,
+            status="completed",
+            progress=100,
+            stage="completed",
+            stage_label="Export complete",
+            measurable=True,
+            result=out_meta,
+        )
         return FileResponse(
             path=output_path,
             media_type="video/mp4",
@@ -455,9 +525,41 @@ async def export_mp4_endpoint(
             headers={"X-Processor-Job-Id": job_id},
             background=BackgroundTask(cleanup_path, job_dir),
         )
+    except VideoProcessingCancelledError as exc:
+        cleanup_path(job_dir)
+        job_store.update(
+            job_id,
+            status="cancelled",
+            cancelled=True,
+            stage="cancelled",
+            stage_label="Export cancelled",
+            measurable=False,
+            error=str(exc),
+        )
+        raise
     except Exception as exc:
         cleanup_path(job_dir)
-        job_store.update(job_id, status="failed", progress=100, error=str(exc))
+        if cancel_event is not None and cancel_event.is_set():
+            cancel_exc = VideoProcessingCancelledError()
+            job_store.update(
+                job_id,
+                status="cancelled",
+                cancelled=True,
+                stage="cancelled",
+                stage_label="Export cancelled",
+                measurable=False,
+                error=str(cancel_exc),
+            )
+            raise cancel_exc from exc
+        job_store.update(
+            job_id,
+            status="failed",
+            progress=100,
+            stage="failed",
+            stage_label="Export failed",
+            measurable=False,
+            error=str(exc),
+        )
         raise
     finally:
         for upload in uploads:

@@ -4,8 +4,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Optional, Sequence
 
 from .ffprobe_service import check_binary, extract_audio_metadata, extract_video_metadata
 
@@ -14,6 +16,10 @@ AspectRatioTarget = Literal["16:9", "9:16", "1:1"]
 FitMode = Literal["crop", "pad"]
 ResolutionTarget = Literal["720p", "1080p"]
 
+StageProgressCallback = Callable[[str, str, int, bool], None]
+SubprocessProgressCallback = Callable[[float, bool], None]
+ProcessAttachCallback = Callable[[Optional[subprocess.Popen[str]]], None]
+
 
 class VideoProcessingError(Exception):
     """Raised when FFmpeg validation or video processing fails."""
@@ -21,6 +27,13 @@ class VideoProcessingError(Exception):
     def __init__(self, message: str, status_code: int = 422) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class VideoProcessingCancelledError(VideoProcessingError):
+    """Raised when a user cancels an active FFmpeg processing job."""
+
+    def __init__(self, message: str = "Export cancelled by user.") -> None:
+        super().__init__(message, status_code=499)
 
 
 def _require_ffmpeg(ffmpeg_bin: str) -> str:
@@ -33,28 +46,189 @@ def _require_ffmpeg(ffmpeg_bin: str) -> str:
     return resolved
 
 
-def _run_ffmpeg(cmd: list[str], timeout_sec: int, *, cwd: Path | None = None) -> None:
+def _parse_ffmpeg_time_line(key: str, val: str) -> Optional[float]:
     try:
-        proc = subprocess.run(
-            cmd,
+        if key in ("out_time_us", "out_time_ms"):
+            us = int(val)
+            if us >= 0:
+                return us / 1_000_000.0
+        elif key == "out_time":
+            parts = val.strip().split(":")
+            if len(parts) == 3:
+                hrs = float(parts[0])
+                mins = float(parts[1])
+                secs = float(parts[2])
+                return max(0.0, hrs * 3600.0 + mins * 60.0 + secs)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    timeout_sec: int,
+    *,
+    cwd: Path | None = None,
+    expected_duration_sec: float | None = None,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoProcessingCancelledError()
+
+    if len(cmd) >= 2:
+        progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    else:
+        progress_cmd = list(cmd)
+
+    try:
+        proc = subprocess.Popen(
+            progress_cmd,
             cwd=str(cwd) if cwd is not None else None,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_sec,
-            check=False,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise VideoProcessingError(
-            f"FFmpeg timed out after {timeout_sec}s while processing video.",
-            status_code=504,
-        ) from exc
     except OSError as exc:
         raise VideoProcessingError(f"Failed to execute ffmpeg: {exc}", status_code=500) from exc
 
+    if process_cb is not None:
+        process_cb(proc)
+
+    stderr_lines: list[str] = []
+    last_reported_frac = -1.0
+    measurable = bool(expected_duration_sec is not None and expected_duration_sec > 0.05)
+
+    def _consume_stderr() -> None:
+        if not proc.stderr:
+            return
+        try:
+            for line in proc.stderr:
+                stripped = line.strip()
+                if stripped:
+                    stderr_lines.append(stripped)
+                    if len(stderr_lines) > 120:
+                        del stderr_lines[: len(stderr_lines) - 120]
+        except Exception:
+            pass
+
+    def _consume_stdout() -> None:
+        nonlocal last_reported_frac
+        if not proc.stdout:
+            return
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+
+                if key in ("out_time_us", "out_time_ms", "out_time"):
+                    sec = _parse_ffmpeg_time_line(key, val)
+                    if sec is not None and progress_cb is not None:
+                        if measurable and expected_duration_sec:
+                            frac = max(0.0, min(0.99, sec / expected_duration_sec))
+                            if frac >= last_reported_frac + 0.005 or last_reported_frac < 0:
+                                last_reported_frac = frac
+                                progress_cb(frac, True)
+                        elif last_reported_frac < 0:
+                            last_reported_frac = 0.0
+                            progress_cb(0.0, False)
+                elif key == "progress" and val == "end" and progress_cb is not None:
+                    last_reported_frac = 1.0
+                    progress_cb(1.0, measurable)
+        except Exception:
+            pass
+
+    out_thread = threading.Thread(target=_consume_stdout, daemon=True)
+    err_thread = threading.Thread(target=_consume_stderr, daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    start_mono = time.monotonic()
+    timed_out = False
+    cancelled = False
+
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            if time.monotonic() - start_mono > timeout_sec:
+                timed_out = True
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            time.sleep(0.08)
+
+        out_thread.join(timeout=2.0)
+        err_thread.join(timeout=2.0)
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        if process_cb is not None:
+            process_cb(None)
+
+    if cancelled or (cancel_event is not None and cancel_event.is_set()):
+        raise VideoProcessingCancelledError()
+
+    if timed_out:
+        raise VideoProcessingError(
+            f"FFmpeg timed out after {timeout_sec}s while processing video.",
+            status_code=504,
+        )
+
     if proc.returncode != 0:
-        detail = (proc.stderr or "").strip().splitlines()
-        tail = detail[-1] if detail else "Unknown FFmpeg error."
+        tail = stderr_lines[-1] if stderr_lines else "Unknown FFmpeg error."
         raise VideoProcessingError(f"FFmpeg processing failed: {tail}", status_code=422)
+
+
+def _run_ffmpeg(
+    cmd: list[str],
+    timeout_sec: int,
+    *,
+    cwd: Path | None = None,
+    expected_duration_sec: float | None = None,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
+) -> None:
+    _run_ffmpeg_with_progress(
+        cmd,
+        timeout_sec,
+        cwd=cwd,
+        expected_duration_sec=expected_duration_sec,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
 
 
 def _assert_short_video_limit(
@@ -146,6 +320,9 @@ def trim_video(
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 180,
     max_duration_sec: float = 300.0,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     meta = _assert_short_video_limit(
@@ -191,7 +368,14 @@ def trim_video(
         cmd.append("-an")
     cmd.extend(["-movflags", "+faststart", str(output_path)])
 
-    _run_ffmpeg(cmd, timeout_sec)
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        expected_duration_sec=clip_duration,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
     out_meta = extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
     return out_meta
 
@@ -362,12 +546,21 @@ def export_mp4(
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 240,
     max_duration_sec: float = 300.0,
+    progress_cb: Optional[StageProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoProcessingCancelledError()
+    if progress_cb is not None:
+        progress_cb("probing", "Inspecting media streams", 5, False)
+
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     meta = _assert_short_video_limit(
         input_path, ffprobe_bin=ffprobe_bin, max_duration_sec=max_duration_sec
     )
     safe_fps = fps if fps in (24, 30, 60) else 30
+    dur_sec = float(meta.get("duration_seconds") or 0.0)
 
     if aspect_ratio == "9:16":
         dims = (1080, 1920) if resolution == "1080p" else (720, 1280)
@@ -413,7 +606,24 @@ def export_mp4(
         cmd.append("-an")
     cmd.extend(["-movflags", "+faststart", str(output_path)])
 
-    _run_ffmpeg(cmd, timeout_sec)
+    def _on_sub_progress(frac: float, measurable: bool) -> None:
+        if progress_cb is not None:
+            pct = 10 + int(round(frac * 85)) if measurable else 15
+            progress_cb("rendering_v1", "Rendering MP4 video", pct, measurable)
+
+    if progress_cb is not None:
+        progress_cb("rendering_v1", "Rendering MP4 video", 10, dur_sec > 0.05)
+
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        expected_duration_sec=dur_sec if dur_sec > 0.05 else None,
+        progress_cb=_on_sub_progress,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
+    if progress_cb is not None:
+        progress_cb("finalizing", "Finalizing MP4 metadata", 98, False)
     return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
 
 
@@ -608,6 +818,23 @@ def _build_visual_effects_filter_steps(
     return steps
 
 
+def _build_atempo_filters(speed: float) -> list[str]:
+    safe = max(0.25, min(4.0, float(speed)))
+    if abs(safe - 1.0) <= 0.005:
+        return []
+    steps: list[str] = []
+    remaining = safe
+    while remaining > 2.0:
+        steps.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        steps.append("atempo=0.5")
+        remaining /= 0.5
+    if abs(remaining - 1.0) > 0.005:
+        steps.append(f"atempo={remaining:.5f}")
+    return steps
+
+
 def _build_audio_clip_chain(
     input_label: str,
     *,
@@ -616,13 +843,17 @@ def _build_audio_clip_chain(
     volume: float,
     fade_in: float,
     fade_out: float,
+    speed: float = 1.0,
 ) -> str:
-    seg_dur = max(0.05, src_out - src_in)
+    safe_speed = max(0.5, min(2.0, float(speed or 1.0)))
+    src_span = max(0.05, src_out - src_in)
+    seg_dur = max(0.05, src_span / safe_speed)
     eff_in, eff_out = _resolve_effective_fades(seg_dur, fade_in, fade_out)
     filters = [
         f"atrim=start={src_in:.3f}:end={src_out:.3f}",
         "asetpts=PTS-STARTPTS",
         "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+        *_build_atempo_filters(safe_speed),
         f"volume={max(0.0, min(2.0, volume)):.4f}",
     ]
     if eff_in > 0.01:
@@ -643,6 +874,9 @@ def _render_v1_visual_mp4(
     ffmpeg_bin: str,
     ffprobe_bin: str,
     timeout_sec: int,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> tuple[dict, list[float]]:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     target_w, target_h = _resolve_export_dimensions(resolution, aspect_ratio)
@@ -678,6 +912,7 @@ def _render_v1_visual_mp4(
     for idx, seg in enumerate(v1_segments):
         seg_path = seg["visual_path"]
         seg_dur = float(seg["seg_dur"])
+        seg_speed = max(0.5, min(2.0, float(seg.get("speed", 1.0) or 1.0)))
         if seg["is_image"]:
             cmd.extend(["-loop", "1", "-t", f"{seg_dur:.3f}", "-i", str(seg_path)])
         else:
@@ -693,7 +928,10 @@ def _render_v1_visual_mp4(
                 f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease",
                 f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black",
             ]
-        chain_steps.extend(["setsar=1", f"fps={safe_fps}"])
+        chain_steps.append("setsar=1")
+        if not seg["is_image"] and abs(seg_speed - 1.0) > 0.005:
+            chain_steps.append(f"setpts=(PTS-STARTPTS)/{seg_speed:.6f}")
+        chain_steps.append(f"fps={safe_fps}")
         chain_steps.extend(
             _build_visual_effects_filter_steps(
                 seg.get("effects"),
@@ -765,8 +1003,19 @@ def _render_v1_visual_mp4(
         "+faststart",
         str(output_path),
     ])
-    _run_ffmpeg(cmd, timeout_sec)
     seam_overlaps = [d if t != "none" else 0.0 for t, d in seam_transitions]
+    expected_v1_dur = max(
+        0.1,
+        sum(float(s["seg_dur"]) for s in v1_segments) - sum(seam_overlaps),
+    )
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        expected_duration_sec=expected_v1_dur,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
     return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin), seam_overlaps
 
 
@@ -820,6 +1069,9 @@ def _composite_v2_overlays_mp4(
     ffmpeg_bin: str,
     ffprobe_bin: str,
     timeout_sec: int,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     cmd = [ffmpeg_path, "-y", "-i", str(base_video_path)]
@@ -831,13 +1083,17 @@ def _composite_v2_overlays_mp4(
         tl_start = max(0.0, float(ov["tl_start"]))
         tl_end = min(rendered_duration, float(ov["tl_end"]))
         clip_dur = max(0.1, tl_end - tl_start)
+        ov_speed = max(0.5, min(2.0, float(ov.get("speed", 1.0) or 1.0)))
 
         if ov["is_image"]:
             cmd.extend(["-loop", "1", "-t", f"{clip_dur:.3f}", "-i", str(ov["src_path"])])
-            ov_steps = []
+            ov_steps = [f"setpts=PTS-STARTPTS+{tl_start:.3f}/TB"]
         else:
             cmd.extend(["-i", str(ov["src_path"])])
-            ov_steps = [f"trim=start={ov['src_in']:.3f}:end={ov['src_out']:.3f}"]
+            ov_steps = [
+                f"trim=start={ov['src_in']:.3f}:end={ov['src_out']:.3f}",
+                f"setpts=(PTS-STARTPTS)/{ov_speed:.6f}+{tl_start:.3f}/TB",
+            ]
 
         x_frac, y_frac, box_w, box_h, lock_aspect = _normalize_overlay_transform(
             ov.get("overlay_transform"),
@@ -850,7 +1106,6 @@ def _composite_v2_overlays_mp4(
             scale_step = f"scale={box_w}:{box_h},setsar=1"
 
         ov_steps.extend([
-            f"setpts=PTS-STARTPTS+{tl_start:.3f}/TB",
             scale_step,
             f"fps={fps}",
         ])
@@ -897,7 +1152,14 @@ def _composite_v2_overlays_mp4(
         "+faststart",
         str(output_path),
     ])
-    _run_ffmpeg(cmd, timeout_sec)
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        expected_duration_sec=rendered_duration,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
     return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
 
 
@@ -913,7 +1175,13 @@ def export_timeline_mp4(
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 240,
     max_duration_sec: float = 300.0,
+    progress_cb: Optional[StageProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoProcessingCancelledError()
+
     if not uploaded_files:
         raise VideoProcessingError("Upload at least one video file to export.", status_code=400)
 
@@ -928,7 +1196,13 @@ def export_timeline_mp4(
             ffprobe_bin=ffprobe_bin,
             timeout_sec=timeout_sec,
             max_duration_sec=max_duration_sec,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            process_cb=process_cb,
         )
+
+    if progress_cb is not None:
+        progress_cb("probing", "Inspecting media streams", 5, False)
 
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     project_meta = timeline_spec.get("project") if isinstance(timeline_spec.get("project"), dict) else {}
@@ -1017,10 +1291,16 @@ def export_timeline_mp4(
                 status_code=400,
             )
 
-        speed = float(clip.get("speed", 1.0))
-        if abs(speed - 1.0) > 0.01:
+        try:
+            speed = float(clip.get("speed", 1.0))
+        except (TypeError, ValueError) as exc:
             raise VideoProcessingError(
-                f"Clip '{name}' uses {speed}x speed. Variable playback speed is not supported in FFmpeg MP4 export yet; set speed to 1.0x.",
+                f"Clip '{name}' has invalid playback speed '{clip.get('speed')}'.",
+                status_code=400,
+            ) from exc
+        if speed < 0.5 or speed > 2.0:
+            raise VideoProcessingError(
+                f"Clip '{name}' playback speed ({speed}x) must be between 0.5x and 2.0x.",
                 status_code=400,
             )
 
@@ -1171,6 +1451,7 @@ def export_timeline_mp4(
         src_path = uploaded_files[f_idx]
         src_meta = v1_source_metas[f_idx]
         is_image = bool(src_meta.get("is_image"))
+        clip_speed = 1.0 if is_image else max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
 
         if is_image:
             seg_dur = max(0.2, min(60.0, float(clip.get("durationSec", 5.0))))
@@ -1180,7 +1461,7 @@ def export_timeline_mp4(
             src_duration = float(src_meta["duration_seconds"])
             src_in = float(clip.get("sourceInSec", 0.0))
             default_out = (
-                src_in + float(clip["durationSec"])
+                src_in + float(clip["durationSec"]) * clip_speed
                 if "durationSec" in clip
                 else src_duration
             )
@@ -1196,7 +1477,10 @@ def export_timeline_mp4(
                     status_code=400,
                 )
             effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
-            seg_dur = effective_out - src_in
+            src_span = effective_out - src_in
+            if src_span < 0.08:
+                raise VideoProcessingError("Clip source range must be at least 0.1 seconds.", status_code=400)
+            seg_dur = src_span / clip_speed
             if seg_dur < 0.1:
                 raise VideoProcessingError("Clip duration must be at least 0.1 seconds.", status_code=400)
 
@@ -1208,6 +1492,7 @@ def export_timeline_mp4(
             "src_in": src_in,
             "src_out": effective_out,
             "seg_dur": seg_dur,
+            "speed": clip_speed,
             "volume": float(clip.get("volume", 1.0)),
             "muted": bool(clip.get("muted", False)) or ("track_v1" in muted_tracks) or is_image,
             "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
@@ -1224,11 +1509,55 @@ def export_timeline_mp4(
             status_code=400,
         )
 
+    # Plan active multi-pass progress slices cleanly in [10, 96]
+    v2_track_muted = "track_v2" in muted_tracks
+    has_potential_v2 = (not v2_track_muted) and any(
+        float(c.get("opacity", 1.0)) > 0.005 for c in sorted_v2
+    )
+    t1_track_muted = "track_t1" in muted_tracks
+    has_potential_t1 = (not t1_track_muted) and len(sorted_t1) > 0
+    burn_subs = bool(timeline_spec.get("burnSubtitles"))
+    has_potential_ass = burn_subs or has_potential_t1
+    a1_track_muted = "track_a1" in muted_tracks
+    has_potential_a1 = (not a1_track_muted) and any(
+        (not bool(c.get("muted", False))) and float(c.get("volume", 1.0)) > 0.001
+        for c in sorted_a1
+    )
+    has_potential_v1_audio = any(
+        bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
+        for item in v1_prepared_clips
+    )
+    has_potential_audio = has_potential_v1_audio or has_potential_a1 or has_potential_v2
+
+    stage_weights: list[tuple[str, float]] = [("v1", 45.0)]
+    if has_potential_v2:
+        stage_weights.append(("v2", 25.0))
+    if has_potential_audio:
+        stage_weights.append(("audio", 15.0))
+    if has_potential_ass:
+        stage_weights.append(("ass", 25.0))
+    total_weight = sum(w for _, w in stage_weights) or 1.0
+    stage_ranges: dict[str, tuple[int, int]] = {}
+    cursor_pct = 10.0
+    for key, w in stage_weights:
+        span = (w / total_weight) * 86.0
+        stage_ranges[key] = (int(round(cursor_pct)), int(round(cursor_pct + span)))
+        cursor_pct += span
+
+    def _emit_stage_progress(key: str, stage: str, label: str, frac: float, measurable: bool) -> None:
+        if progress_cb is None:
+            return
+        start_p, end_p = stage_ranges.get(key, (10, 96))
+        pct = start_p + int(round(max(0.0, min(1.0, frac)) * max(1, end_p - start_p))) if measurable else start_p
+        progress_cb(stage, label, pct, measurable)
+
     work_dir = output_path.parent / "_timeline_work"
     work_dir.mkdir(parents=True, exist_ok=True)
     v1_visual_segments: list[dict] = []
 
     for idx, item in enumerate(v1_prepared_clips):
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
         src_path = item["src_path"]
         is_image = bool(item["is_image"])
         if is_image:
@@ -1250,6 +1579,8 @@ def export_timeline_mp4(
                     ffprobe_bin=ffprobe_bin,
                     timeout_sec=timeout_sec,
                     max_duration_sec=max_duration_sec,
+                    cancel_event=cancel_event,
+                    process_cb=process_cb,
                 )
                 visual_path = trimmed_path
             else:
@@ -1259,14 +1590,16 @@ def export_timeline_mp4(
             "visual_path": visual_path,
             "is_image": is_image,
             "seg_dur": item["seg_dur"],
+            "speed": item["speed"],
             "opacity": item["opacity"],
             "transition_in": item["transition_in"],
             "transition_out": item["transition_out"],
             "effects": item["effects"],
         })
 
-    # Render V1 visual frames (with effects, opacity & xfade transitions)
+    # Render V1 visual frames (with speed, effects, opacity & xfade transitions)
     v1_visual_mp4 = work_dir / "v1_visual_only.mp4"
+    _emit_stage_progress("v1", "rendering_v1", "Rendering V1 timeline & effects", 0.0, True)
     visual_meta, seam_overlaps = _render_v1_visual_mp4(
         v1_visual_segments,
         v1_visual_mp4,
@@ -1276,13 +1609,17 @@ def export_timeline_mp4(
         ffmpeg_bin=ffmpeg_bin,
         ffprobe_bin=ffprobe_bin,
         timeout_sec=timeout_sec,
+        progress_cb=lambda frac, m: _emit_stage_progress(
+            "v1", "rendering_v1", "Rendering V1 timeline & effects", frac, m
+        ),
+        cancel_event=cancel_event,
+        process_cb=process_cb,
     )
     rendered_duration = float(visual_meta["duration_seconds"]) or total_v1_duration
     out_w = int(visual_meta["video"]["width"])
     out_h = int(visual_meta["video"]["height"])
 
     # Composite active V2 overlays onto visual track
-    v2_track_muted = "track_v2" in muted_tracks
     active_v2_overlays: list[dict] = []
     if not v2_track_muted:
         for idx, clip in enumerate(sorted_v2):
@@ -1299,13 +1636,15 @@ def export_timeline_mp4(
             src_path = uploaded_files[f_idx]
             src_meta = v2_source_metas[f_idx]
             is_image = bool(src_meta.get("is_image"))
+            ov_speed = 1.0 if is_image else max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
             src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
             src_dur = float(src_meta.get("duration_seconds", 0.0))
-            src_out = src_in + (tl_end - tl_start)
+            src_out = src_in + (tl_end - tl_start) * ov_speed
             if not is_image and src_dur > 0:
                 src_out = min(src_out, src_dur)
                 if src_out <= src_in + 0.05:
                     continue
+                tl_end = min(rendered_duration, tl_start + (src_out - src_in) / ov_speed)
 
             active_v2_overlays.append({
                 "src_path": src_path,
@@ -1315,6 +1654,7 @@ def export_timeline_mp4(
                 "tl_end": tl_end,
                 "src_in": src_in,
                 "src_out": src_out,
+                "speed": ov_speed,
                 "opacity": opacity,
                 "volume": float(clip.get("volume", 1.0)),
                 "muted": bool(clip.get("muted", False)) or v2_track_muted or is_image,
@@ -1328,6 +1668,7 @@ def export_timeline_mp4(
 
     if active_v2_overlays:
         visual_only_mp4 = work_dir / "v1_v2_composited.mp4"
+        _emit_stage_progress("v2", "compositing_v2", "Compositing V2 overlays", 0.0, True)
         visual_meta = _composite_v2_overlays_mp4(
             v1_visual_mp4,
             active_v2_overlays,
@@ -1339,6 +1680,11 @@ def export_timeline_mp4(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
             timeout_sec=timeout_sec,
+            progress_cb=lambda frac, m: _emit_stage_progress(
+                "v2", "compositing_v2", "Compositing V2 overlays", frac, m
+            ),
+            cancel_event=cancel_event,
+            process_cb=process_cb,
         )
     else:
         visual_only_mp4 = v1_visual_mp4
@@ -1370,7 +1716,6 @@ def export_timeline_mp4(
             })
 
     # Prepare A1 active audio clips
-    a1_track_muted = "track_a1" in muted_tracks
     active_a1_clips: list[dict] = []
     for idx, clip in enumerate(sorted_a1):
         if a1_track_muted or bool(clip.get("muted", False)):
@@ -1386,9 +1731,10 @@ def export_timeline_mp4(
         src_path = uploaded_files[f_idx]
         src_meta = a1_source_metas[f_idx]
         src_duration = float(src_meta["duration_seconds"])
+        a1_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
         src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
         default_out = (
-            src_in + float(clip["durationSec"])
+            src_in + float(clip["durationSec"]) * a1_speed
             if "durationSec" in clip
             else src_duration
         )
@@ -1406,6 +1752,7 @@ def export_timeline_mp4(
             "src_in": src_in,
             "src_out": effective_out,
             "tl_start": tl_start,
+            "speed": a1_speed,
             "volume": vol,
             "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
             "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
@@ -1429,7 +1776,6 @@ def export_timeline_mp4(
         timeline_spec.get("subtitles"),
     )
 
-    burn_subs = bool(timeline_spec.get("burnSubtitles"))
     if burn_subs:
         subtitles = timeline_spec.get("subtitles")
         if not isinstance(subtitles, list) or len(subtitles) == 0:
@@ -1459,6 +1805,7 @@ def export_timeline_mp4(
         shutil.copy2(visual_only_mp4, raw_export_path)
         rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
     else:
+        _emit_stage_progress("audio", "mixing_audio", "Mixing audio tracks & fades", 0.0, True)
         audio_cmd = [ffmpeg_path, "-y"]
         audio_filters: list[str] = []
         input_idx = 0
@@ -1486,6 +1833,7 @@ def export_timeline_mp4(
                         volume=item["volume"],
                         fade_in=item["fade_in"],
                         fade_out=item["fade_out"],
+                        speed=item["speed"],
                     )
                     audio_filters.append(f"{chain}[v1a_{s_idx}]")
                 v1_seg_labels.append(f"[v1a_{s_idx}]")
@@ -1557,6 +1905,7 @@ def export_timeline_mp4(
                 volume=item["volume"],
                 fade_in=item["fade_in"],
                 fade_out=item["fade_out"],
+                speed=item["speed"],
             )
             cur_label = f"[a1_base_{a_idx}]"
             audio_filters.append(f"{base_chain}{cur_label}")
@@ -1607,6 +1956,7 @@ def export_timeline_mp4(
                 volume=item["volume"],
                 fade_in=item["fade_in"],
                 fade_out=item["fade_out"],
+                speed=item["speed"],
             )
             cur_label = f"[v2a_base_{v2_idx}]"
             audio_filters.append(f"{base_chain}{cur_label}")
@@ -1670,7 +2020,16 @@ def export_timeline_mp4(
             "2",
             str(mixed_audio_wav),
         ])
-        _run_ffmpeg(audio_cmd, timeout_sec)
+        _run_ffmpeg(
+            audio_cmd,
+            timeout_sec,
+            expected_duration_sec=rendered_duration,
+            progress_cb=lambda frac, m: _emit_stage_progress(
+                "audio", "mixing_audio", "Mixing audio tracks & fades", frac * 0.75, m
+            ),
+            cancel_event=cancel_event,
+            process_cb=process_cb,
+        )
 
         mux_cmd = [
             ffmpeg_path,
@@ -1694,7 +2053,16 @@ def export_timeline_mp4(
             "+faststart",
             str(raw_export_path),
         ]
-        _run_ffmpeg(mux_cmd, timeout_sec)
+        _run_ffmpeg(
+            mux_cmd,
+            timeout_sec,
+            expected_duration_sec=rendered_duration,
+            progress_cb=lambda frac, m: _emit_stage_progress(
+                "audio", "mixing_audio", "Muxing mixed audio stream", 0.75 + frac * 0.25, m
+            ),
+            cancel_event=cancel_event,
+            process_cb=process_cb,
+        )
         rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
 
     if needs_ass_pass:
@@ -1714,7 +2082,8 @@ def export_timeline_mp4(
             height=final_h,
             text_overlays=active_t1_overlays,
         )
-        return burn_subtitles_into_mp4(
+        _emit_stage_progress("ass", "burning_subtitles", "Burning subtitles & titles", 0.0, True)
+        rendered_meta = burn_subtitles_into_mp4(
             raw_export_path,
             output_path,
             ass_path,
@@ -1722,7 +2091,16 @@ def export_timeline_mp4(
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
             timeout_sec=timeout_sec,
+            expected_duration_sec=rendered_duration,
+            progress_cb=lambda frac, m: _emit_stage_progress(
+                "ass", "burning_subtitles", "Burning subtitles & titles", frac, m
+            ),
+            cancel_event=cancel_event,
+            process_cb=process_cb,
         )
+
+    if progress_cb is not None:
+        progress_cb("finalizing", "Finalizing MP4 metadata", 98, False)
 
     return rendered_meta
 
@@ -1985,6 +2363,10 @@ def burn_subtitles_into_mp4(
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 240,
+    expected_duration_sec: float | None = None,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     resolved_in = input_path.resolve()
@@ -2014,6 +2396,14 @@ def burn_subtitles_into_mp4(
         cmd.append("-an")
     cmd.extend(["-movflags", "+faststart", str(resolved_out)])
 
-    _run_ffmpeg(cmd, timeout_sec, cwd=resolved_ass.parent)
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        cwd=resolved_ass.parent,
+        expected_duration_sec=expected_duration_sec,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
     return extract_video_metadata(resolved_out, ffprobe_bin=ffprobe_bin)
 

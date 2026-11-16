@@ -49,6 +49,7 @@ import {
   type StoredMediaRecord,
 } from "../utils/mediaStorage";
 import {
+  applyClipSpeedOnTimeline,
   createDefaultTracks,
   duplicateClipWithoutOverlap,
   ensureProjectTracks,
@@ -125,6 +126,7 @@ interface StudioContextValue {
     recordHistory?: boolean,
     syncBase?: { clip: TimelineClip; subtitles?: SubtitleSegment[] }
   ) => void;
+  setClipSpeed: (clipId: string, speed: number) => boolean;
   updateTextStyle: (
     clipId: string,
     patch: Partial<TextOverlayStyle>,
@@ -1240,6 +1242,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       mutateActiveProject((proj) => {
         const beforeClip = proj.clips.find((c) => c.id === clipId);
         if (!beforeClip) return proj;
+        const track = proj.tracks.find((t) => t.id === beforeClip.trackId);
+        if (patch.speed !== undefined && !syncBase && track?.locked) {
+          return proj;
+        }
+        if (patch.speed !== undefined && !syncBase && patch.duration === undefined) {
+          const { speed, ...restPatch } = patch;
+          const patchedClip: TimelineClip = { ...beforeClip, ...restPatch };
+          const patchedClips = proj.clips.map((c) => (c.id === clipId ? patchedClip : c));
+          const speedResult = applyClipSpeedOnTimeline(patchedClips, clipId, speed);
+          const nextProj = {
+            ...proj,
+            clips: speedResult.clips,
+          };
+          return {
+            ...nextProj,
+            subtitles: syncSubtitlesForProjectClips(proj, nextProj),
+          };
+        }
         const afterClip = { ...beforeClip, ...patch };
         const nextClips = proj.clips.map((c) => (c.id === clipId ? afterClip : c));
         const nextSubtitles = syncSubtitlesForClipUpdate(
@@ -1253,6 +1273,34 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           subtitles: nextSubtitles,
         };
       }, recordHistory);
+    },
+    [mutateActiveProject]
+  );
+
+  const setClipSpeed = useCallback(
+    (clipId: string, speed: number): boolean => {
+      let didUpdate = false;
+      mutateActiveProject((proj) => {
+        const beforeClip = proj.clips.find((c) => c.id === clipId);
+        if (!beforeClip) return proj;
+        const track = proj.tracks.find((t) => t.id === beforeClip.trackId);
+        if (track?.locked) return proj;
+        if (beforeClip.kind !== "video" && beforeClip.kind !== "audio") return proj;
+
+        const speedResult = applyClipSpeedOnTimeline(proj.clips, clipId, speed);
+        if (!speedResult.updatedClip) return proj;
+        didUpdate = true;
+
+        const nextProj = {
+          ...proj,
+          clips: speedResult.clips,
+        };
+        return {
+          ...nextProj,
+          subtitles: syncSubtitlesForProjectClips(proj, nextProj),
+        };
+      }, true);
+      return didUpdate;
     },
     [mutateActiveProject]
   );
@@ -1835,6 +1883,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     addClipToTimeline,
     addTextOverlay,
     updateClip,
+    setClipSpeed,
     updateTextStyle,
     commitProjectSnapshot,
     splitClipAtTime,

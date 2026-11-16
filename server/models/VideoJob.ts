@@ -15,6 +15,7 @@ export type VideoJobStatus =
   | "processing"
   | "completed"
   | "failed"
+  | "cancelled"
   | "integration_required";
 
 export interface IVideoJob extends Document {
@@ -74,7 +75,7 @@ const VideoJobSchema = new Schema<IVideoJob>(
     },
     status: {
       type: String,
-      enum: ["queued", "processing", "completed", "failed", "integration_required"],
+      enum: ["queued", "processing", "completed", "failed", "cancelled", "integration_required"],
       default: "queued",
       index: true,
     },

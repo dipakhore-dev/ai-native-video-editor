@@ -88,6 +88,7 @@ export function AiAssistantPanel({
 }: AiAssistantPanelProps) {
   const {
     updateClip,
+    setClipSpeed,
     moveClipOnTimeline,
     updateTextStyle,
     deleteClip,
@@ -1255,17 +1256,22 @@ export function AiAssistantPanel({
                 );
               })()}
 
-              {selectedClip.kind === "video" && (
-                <div>
-                  <label className="block text-[11px] text-zinc-400 mb-1.5">Playback Speed</label>
+              {(selectedClip.kind === "video" || selectedClip.kind === "audio") && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-zinc-400">Playback Speed</span>
+                    <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                      {formatTimecode(selectedClip.duration)} · Pitch preserved
+                    </span>
+                  </div>
                   <div className="grid grid-cols-4 gap-1">
                     {[0.5, 1, 1.5, 2].map((spd) => (
                       <button
                         key={spd}
                         type="button"
-                        onClick={() => updateClip(selectedClip.id, { speed: spd })}
+                        onClick={() => setClipSpeed(selectedClip.id, spd)}
                         className={`rounded-md py-1 text-[11px] font-mono tabular-nums border transition-colors ${
-                          selectedClip.speed === spd
+                          Math.abs(selectedClip.speed - spd) < 0.01
                             ? "border-violet-500 bg-violet-500/15 text-white"
                             : "border-zinc-800 bg-[#09090B] text-zinc-400 hover:text-white"
                         }`}

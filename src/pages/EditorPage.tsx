@@ -88,6 +88,10 @@ export function EditorPage() {
   const lastSyncedVideoClipIdRef = useRef<string | null>(null);
   const lastSyncedV2ClipIdRef = useRef<string | null>(null);
   const lastSyncedAudioMapRef = useRef<Map<string, boolean>>(new Map());
+  const lastGainMapRef = useRef<WeakMap<HTMLMediaElement, { gain: number; muted: boolean }>>(
+    new WeakMap()
+  );
+  const pendingSeekMapRef = useRef<WeakMap<HTMLMediaElement, number>>(new WeakMap());
 
   const [playheadTime, setPlayheadTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -101,6 +105,7 @@ export function EditorPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const [saveFlash, setSaveFlash] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<EditorPanelTab>("assistant");
+  const [previewMediaError, setPreviewMediaError] = useState<string | null>(null);
 
   const totalDuration = useMemo(() => {
     if (!activeProject || activeProject.clips.length === 0) return 0;
@@ -230,16 +235,72 @@ export function EditorPage() {
     }
   }, []);
 
+  const applyPitchPreservation = useCallback((el: HTMLMediaElement, rate: number) => {
+    const pitchEl = el as HTMLMediaElement & {
+      preservesPitch?: boolean;
+      webkitPreservesPitch?: boolean;
+      mozPreservesPitch?: boolean;
+    };
+    if (pitchEl.preservesPitch !== true) {
+      pitchEl.preservesPitch = true;
+    }
+    if (pitchEl.webkitPreservesPitch !== true) {
+      pitchEl.webkitPreservesPitch = true;
+    }
+    if (pitchEl.mozPreservesPitch !== true) {
+      pitchEl.mozPreservesPitch = true;
+    }
+    if (Math.abs(el.playbackRate - rate) > 0.005) {
+      el.playbackRate = rate;
+    }
+  }, []);
+
+  const seekMediaSafely = useCallback((el: HTMLMediaElement, targetTime: number) => {
+    const durationLimit = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : targetTime;
+    const clamped = Math.max(0, Math.min(durationLimit, targetTime));
+    if (el.seeking) {
+      pendingSeekMapRef.current.set(el, clamped);
+      return;
+    }
+    try {
+      pendingSeekMapRef.current.delete(el);
+      el.currentTime = clamped;
+    } catch {
+      // Ignore seek errors while media decodes
+    }
+  }, []);
+
+  const flushPendingSeek = useCallback((el: HTMLMediaElement) => {
+    const pending = pendingSeekMapRef.current.get(el);
+    if (pending === undefined) return;
+    pendingSeekMapRef.current.delete(el);
+    if (Math.abs(el.currentTime - pending) > 0.03 && el.readyState >= 1) {
+      try {
+        el.currentTime = pending;
+      } catch {
+        // Ignore queued seek errors
+      }
+    }
+  }, []);
+
   const applyClipAudioGain = useCallback(
     (el: HTMLMediaElement, effectiveGain: number, isMuted: boolean) => {
+      const targetVal = isMuted ? 0 : Math.max(0, Math.min(2, effectiveGain));
+      const prev = lastGainMapRef.current.get(el);
+      if (prev && prev.muted === isMuted && Math.abs(prev.gain - targetVal) < 0.002) {
+        return;
+      }
+      lastGainMapRef.current.set(el, { gain: targetVal, muted: isMuted });
+
       const gainNode = ensureMediaGainNode(el);
-      el.muted = isMuted;
+      if (el.muted !== isMuted) {
+        el.muted = isMuted;
+      }
       if (gainNode && audioCtxRef.current) {
-        el.volume = 1;
-        const targetVal = isMuted ? 0 : Math.max(0, Math.min(2, effectiveGain));
+        if (el.volume !== 1) el.volume = 1;
         gainNode.gain.setTargetAtTime(targetVal, audioCtxRef.current.currentTime, 0.015);
       } else {
-        el.volume = isMuted ? 0 : Math.min(1, Math.max(0, effectiveGain));
+        el.volume = isMuted ? 0 : Math.min(1, Math.max(0, targetVal));
       }
     },
     [ensureMediaGainNode]
@@ -325,7 +386,7 @@ export function EditorPage() {
       primaryVisualClip.inPoint +
       (playheadTime - primaryVisualClip.startTime) * primaryVisualClip.speed;
 
-    vid.playbackRate = playbackRate * primaryVisualClip.speed;
+    applyPitchPreservation(vid, playbackRate * primaryVisualClip.speed);
     const { effectiveGain, isMuted } = computeEffectiveClipGain({
       clip: primaryVisualClip,
       timelineTimeSec: playheadTime,
@@ -337,12 +398,8 @@ export function EditorPage() {
 
     const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
     if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
-      try {
-        vid.currentTime = Math.max(0, Math.min(vid.duration || targetSourceTime, targetSourceTime));
-        lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
-      } catch {
-        // Ignore seek errors while media decodes
-      }
+      seekMediaSafely(vid, targetSourceTime);
+      lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
     } else if (vid.readyState >= 1 && clipChanged) {
       lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
     }
@@ -363,7 +420,9 @@ export function EditorPage() {
     masterMuted,
     masterVolume,
     primaryTrackMuted,
+    applyPitchPreservation,
     applyClipAudioGain,
+    seekMediaSafely,
   ]);
 
   // Playback animation loop
@@ -426,7 +485,7 @@ export function EditorPage() {
     const targetSourceTime =
       activeV2Clip.inPoint + (playheadTime - activeV2Clip.startTime) * activeV2Clip.speed;
 
-    vid.playbackRate = playbackRate * activeV2Clip.speed;
+    applyPitchPreservation(vid, playbackRate * activeV2Clip.speed);
     const { effectiveGain, isMuted } = computeEffectiveClipGain({
       clip: activeV2Clip,
       timelineTimeSec: playheadTime,
@@ -438,12 +497,8 @@ export function EditorPage() {
 
     const tolerance = clipChanged || !isPlaying ? 0.04 : 0.35;
     if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
-      try {
-        vid.currentTime = Math.max(0, Math.min(vid.duration || targetSourceTime, targetSourceTime));
-        lastSyncedV2ClipIdRef.current = activeV2Clip.id;
-      } catch {
-        // Ignore seek errors while media decodes
-      }
+      seekMediaSafely(vid, targetSourceTime);
+      lastSyncedV2ClipIdRef.current = activeV2Clip.id;
     } else if (vid.readyState >= 1 && clipChanged) {
       lastSyncedV2ClipIdRef.current = activeV2Clip.id;
     }
@@ -465,7 +520,9 @@ export function EditorPage() {
     masterMuted,
     masterVolume,
     v2Track?.muted,
+    applyPitchPreservation,
     applyClipAudioGain,
+    seekMediaSafely,
   ]);
 
   useEffect(() => {
@@ -501,7 +558,7 @@ export function EditorPage() {
 
       const targetSourceTime =
         audioClip.inPoint + (playheadTime - audioClip.startTime) * audioClip.speed;
-      aud.playbackRate = playbackRate * audioClip.speed;
+      applyPitchPreservation(aud, playbackRate * audioClip.speed);
 
       const { effectiveGain, isMuted } = computeEffectiveClipGain({
         clip: audioClip,
@@ -516,11 +573,7 @@ export function EditorPage() {
 
       const tolerance = !wasActive || !isPlaying ? 0.04 : 0.32;
       if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > tolerance) {
-        try {
-          aud.currentTime = Math.max(0, Math.min(aud.duration || targetSourceTime, targetSourceTime));
-        } catch {
-          // Ignore seek before metadata loaded
-        }
+        seekMediaSafely(aud, targetSourceTime);
       }
       lastSyncedAudioMapRef.current.set(audioClip.id, true);
 
@@ -543,7 +596,9 @@ export function EditorPage() {
     a1Track?.muted,
     speechIntervals,
     v1AudibleAtTime,
+    applyPitchPreservation,
     applyClipAudioGain,
+    seekMediaSafely,
   ]);
 
   const handleSeek = useCallback(
@@ -950,15 +1005,20 @@ export function EditorPage() {
         </div>
       ) : (
         <div className="flex-1 flex flex-col min-h-0">
-          {mediaError && (
+          {(mediaError || previewMediaError) && (
             <div className="px-4 py-2 border-b border-rose-500/30 bg-rose-500/10 flex items-center justify-between gap-2 text-xs text-rose-200">
               <div className="flex items-center gap-2 min-w-0">
                 <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
-                <span className="truncate" title={mediaError}>{mediaError}</span>
+                <span className="truncate" title={mediaError || previewMediaError || ""}>
+                  {mediaError || previewMediaError}
+                </span>
               </div>
               <button
                 type="button"
-                onClick={clearMediaError}
+                onClick={() => {
+                  clearMediaError();
+                  setPreviewMediaError(null);
+                }}
                 className="rounded p-1 text-rose-200 hover:bg-rose-500/20 hover:text-white shrink-0"
                 aria-label="Dismiss media error"
               >
@@ -1206,8 +1266,17 @@ export function EditorPage() {
                         <video
                           ref={videoRef}
                           src={primaryVisualClip.objectUrl}
-                          onLoadedMetadata={syncVideoElement}
+                          onLoadedMetadata={() => {
+                            setPreviewMediaError(null);
+                            syncVideoElement();
+                          }}
                           onCanPlay={syncVideoElement}
+                          onSeeked={(e) => flushPendingSeek(e.currentTarget)}
+                          onError={() =>
+                            setPreviewMediaError(
+                              `Browser could not decode "${primaryVisualClip.name}". Convert to H.264/AAC MP4 or re-link a valid media file.`
+                            )
+                          }
                           playsInline
                           style={primaryPreviewStyle}
                           className="relative h-full w-full object-contain"
@@ -1277,8 +1346,17 @@ export function EditorPage() {
                             <video
                               ref={v2VideoRef}
                               src={activeV2Clip.objectUrl}
-                              onLoadedMetadata={syncV2VideoElement}
+                              onLoadedMetadata={() => {
+                                setPreviewMediaError(null);
+                                syncV2VideoElement();
+                              }}
                               onCanPlay={syncV2VideoElement}
+                              onSeeked={(e) => flushPendingSeek(e.currentTarget)}
+                              onError={() =>
+                                setPreviewMediaError(
+                                  `Browser could not decode overlay video "${activeV2Clip.name}".`
+                                )
+                              }
                               playsInline
                               style={{
                                 ...v2TransStyle,
@@ -1386,6 +1464,12 @@ export function EditorPage() {
                       }}
                       src={audioClip.objectUrl}
                       preload="auto"
+                      onSeeked={(e) => flushPendingSeek(e.currentTarget)}
+                      onError={() =>
+                        setPreviewMediaError(
+                          `Browser could not decode audio clip "${audioClip.name}". Use MP3, WAV, or AAC M4A.`
+                        )
+                      }
                       className="hidden"
                     />
                   ))}

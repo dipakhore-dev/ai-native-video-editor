@@ -72,8 +72,13 @@ class SubtitleGenerationResponse(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     operation: str
-    status: Literal["queued", "processing", "completed", "failed"]
+    status: Literal["queued", "processing", "completed", "failed", "cancelled"]
     progress: int = Field(ge=0, le=100)
+    stage: str = "processing"
+    stage_label: str = "Processing"
+    measurable: bool = False
+    elapsed_ms: int = Field(default=0, ge=0)
+    cancelled: bool = False
     created_at: str
     updated_at: str
     error: Optional[str] = None

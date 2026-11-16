@@ -1,12 +1,16 @@
+import crypto from "crypto";
 import fs from "fs/promises";
 import type { Response } from "express";
 import type { AuthenticatedRequest } from "../middleware/auth.middleware.ts";
 import { getVideoQueueStatus } from "../queues/videoQueue.ts";
 import {
+  cancelActiveExport,
   checkVideoProcessorHealth,
+  getExportProgressSnapshot,
   getUserVideoJobWithQueueState,
   listUserVideoJobs,
   processVideoMetadataRequest,
+  registerActiveExport,
   runSyncBinaryVideoOperation,
   runSyncSubtitlesGeneration,
 } from "../services/videoProcessor.service.ts";
@@ -57,10 +61,19 @@ function getOptionalProjectId(req: AuthenticatedRequest): string | null {
 }
 
 function sendProcessorError(res: Response, err: unknown, fallbackMessage: string): void {
+  if (res.writableEnded || res.headersSent) {
+    return;
+  }
   const status = (err as { statusCode?: number }).statusCode || 500;
   const integrationPoint = (err as { integrationPoint?: string }).integrationPoint;
+  const isCancelled = status === 499 || Boolean((err as { cancelled?: boolean })?.cancelled);
   res.status(status).json({
-    status: status === 503 ? "integration_required" : "error",
+    status: isCancelled
+      ? "cancelled"
+      : status === 503
+        ? "integration_required"
+        : "error",
+    ...(isCancelled ? { cancelled: true } : {}),
     ...(integrationPoint ? { integrationPoint } : {}),
     error: err instanceof Error ? err.message : fallbackMessage,
   });
@@ -528,8 +541,8 @@ function validateTimelineExportSpec(
     }
 
     const speed = Number(clip.speed ?? 1);
-    if (Math.abs(speed - 1) > 0.01) {
-      return `Clip '${name}' uses ${speed}x speed. Variable playback speed is not supported in FFmpeg MP4 export yet; set speed to 1.0x.`;
+    if (!Number.isFinite(speed) || speed < 0.5 || speed > 2.0) {
+      return `Clip '${name}' uses unsupported ${speed}x speed. Supported playback speed range is 0.5x to 2.0x.`;
     }
 
     const volume = Number(clip.volume ?? 1);
@@ -745,6 +758,8 @@ function validateTimelineExportSpec(
   return null;
 }
 
+const CLIENT_JOB_ID_REGEX = /^[A-Za-z0-9_-]{8,64}$/;
+
 export async function exportMp4VideoController(
   req: AuthenticatedRequest,
   res: Response
@@ -762,6 +777,18 @@ export async function exportMp4VideoController(
       .json({ error: 'Upload at least one video file using form field "videos" or "video".' });
     return;
   }
+
+  const rawClientJobId =
+    typeof req.body?.clientJobId === "string"
+      ? req.body.clientJobId.trim()
+      : typeof req.body?.client_job_id === "string"
+        ? req.body.client_job_id.trim()
+        : "";
+  const clientJobId = CLIENT_JOB_ID_REGEX.test(rawClientJobId)
+    ? rawClientJobId
+    : crypto.randomUUID();
+
+  let detachListeners = () => undefined;
 
   try {
     const rawFormat = typeof req.body?.format === "string" ? req.body.format.trim().toLowerCase() : "mp4";
@@ -833,6 +860,24 @@ export async function exportMp4VideoController(
       normalizedSpecString = JSON.stringify(parsedSpec);
     }
 
+    const abortController = registerActiveExport({
+      jobId: clientJobId,
+      userId: req.userId!,
+      tempFilePaths: files.map((f) => f.path),
+    });
+
+    const onDisconnect = () => {
+      if (!res.writableEnded) {
+        void cancelActiveExport(req.userId!, clientJobId);
+      }
+    };
+    req.on("aborted", onDisconnect);
+    res.on("close", onDisconnect);
+    detachListeners = () => {
+      req.off("aborted", onDisconnect);
+      res.off("close", onDisconnect);
+    };
+
     const result = await runSyncBinaryVideoOperation({
       userId: req.userId!,
       operation: "export_mp4",
@@ -853,17 +898,63 @@ export async function exportMp4VideoController(
       defaultOutputFilename: "export.mp4",
       defaultContentType: "video/mp4",
       projectId: getOptionalProjectId(req),
+      clientJobId,
+      signal: abortController.signal,
     });
+
+    if (res.writableEnded || abortController.signal.aborted) {
+      return;
+    }
 
     res.setHeader("Content-Type", result.contentType);
     res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
+    res.setHeader("X-Export-Client-Job-Id", clientJobId);
     res.send(result.buffer);
   } catch (err) {
     sendProcessorError(res, err, "Failed to export MP4 video.");
   } finally {
+    detachListeners();
     await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => undefined)));
   }
+}
+
+export async function getExportProgressController(
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> {
+  const rawJobId = Array.isArray(req.params.jobId) ? req.params.jobId[0] : req.params.jobId;
+  const jobId = typeof rawJobId === "string" ? rawJobId.trim() : "";
+  if (!CLIENT_JOB_ID_REGEX.test(jobId)) {
+    res.status(400).json({ error: "Invalid export jobId format." });
+    return;
+  }
+
+  const snapshot = await getExportProgressSnapshot(req.userId!, jobId);
+  if (!snapshot) {
+    res.status(404).json({ error: "Active export job not found." });
+    return;
+  }
+  res.json({ status: "ok", progress: snapshot });
+}
+
+export async function cancelExportController(
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> {
+  const rawJobId = Array.isArray(req.params.jobId) ? req.params.jobId[0] : req.params.jobId;
+  const jobId = typeof rawJobId === "string" ? rawJobId.trim() : "";
+  if (!CLIENT_JOB_ID_REGEX.test(jobId)) {
+    res.status(400).json({ error: "Invalid export jobId format." });
+    return;
+  }
+
+  const snapshot = await cancelActiveExport(req.userId!, jobId);
+  if (!snapshot) {
+    res.status(404).json({ error: "Active export job not found." });
+    return;
+  }
+  res.json({ status: "ok", progress: snapshot });
 }
 
 export async function subtitlesVideoController(

@@ -7,6 +7,7 @@ import {
   updateOverlayBoxDimensions,
 } from "./overlays";
 import {
+  applyClipSpeedOnTimeline,
   ensureProjectTracks,
   reorderClipOnTrack,
   splitClipAtTimestamp,
@@ -503,9 +504,14 @@ export function applyAiOperationsToProject(
         skippedMessages.push("No clip found to adjust playback speed.");
         continue;
       }
+      if (target.kind !== "video" && target.kind !== "audio") {
+        skippedMessages.push(`Playback speed only applies to video and audio clips, not "${target.name}".`);
+        continue;
+      }
+      const speedResult = applyClipSpeedOnTimeline(next.clips, target.id, op.speed);
       next = {
         ...next,
-        clips: next.clips.map((c) => (c.id === target.id ? { ...c, speed: op.speed } : c)),
+        clips: speedResult.clips,
       };
       appliedCount++;
       continue;

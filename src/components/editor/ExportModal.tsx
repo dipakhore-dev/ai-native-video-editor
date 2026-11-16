@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   X,
   Download,
@@ -9,9 +9,14 @@ import {
   Loader2,
   LogIn,
   Captions,
+  Ban,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
-import { exportTimelineMp4 } from "../../services/api";
+import {
+  cancelExportMp4,
+  exportTimelineMp4,
+  fetchExportProgress,
+} from "../../services/api";
 import type { Project, RenderTimelinePayload } from "../../types/studio";
 import { formatBytes, formatTimecode, resolveClipSourceFile } from "../../utils/media";
 import { getSubtitleStyle } from "../../utils/subtitles";
@@ -24,11 +29,26 @@ interface ExportModalProps {
 }
 
 interface ExportFeedbackState {
-  kind: "success" | "error" | "integration" | "auth";
+  kind: "success" | "error" | "cancelled" | "integration" | "auth";
   message: string;
   downloadUrl?: string;
   filename?: string;
   sizeBytes?: number;
+}
+
+interface LiveExportProgress {
+  stage: string;
+  stageLabel: string;
+  progress: number;
+  measurable: boolean;
+  elapsedMs: number;
+}
+
+function formatElapsedDuration(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
 function validateTimelineForLocalMp4(
@@ -76,10 +96,10 @@ function validateTimelineForLocalMp4(
     }
 
     if (clip.kind !== "text" && clip.needsRelink) {
-      return `Clip '${clip.name}' is missing from local IndexedDB storage. Use "Re-link File" before exporting.`;
+      return `Clip '${clip.name}' is missing from local IndexedDB storage. Use "Re-link File" in the Media Bin or Timeline before exporting.`;
     }
-    if (Math.abs(clip.speed - 1) > 0.01) {
-      return `Clip '${clip.name}' uses ${clip.speed}x speed. Variable clip speed is not supported in FFmpeg MP4 export yet; reset speed to 1.0x.`;
+    if (!Number.isFinite(clip.speed) || clip.speed < 0.5 || clip.speed > 2.0) {
+      return `Clip '${clip.name}' uses unsupported ${clip.speed}x speed. Supported export speed range is 0.5x to 2.0x.`;
     }
     if (!Number.isFinite(clip.volume) || clip.volume < 0 || clip.volume > 2) {
       return `Clip '${clip.name}' volume (${Math.round(clip.volume * 100)}%) must be between 0% and 200%.`;
@@ -168,7 +188,26 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
   const [fps, setFps] = useState<number>(project.fps);
   const [burnSubtitles, setBurnSubtitles] = useState<boolean>(validSubtitles.length > 0);
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [liveProgress, setLiveProgress] = useState<LiveExportProgress | null>(null);
   const [feedback, setFeedback] = useState<ExportFeedbackState | null>(null);
+
+  const activeJobIdRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
+  const elapsedTimerRef = useRef<number | null>(null);
+  const startedAtRef = useRef<number>(0);
+
+  const stopProgressTimers = () => {
+    if (pollTimerRef.current !== null) {
+      window.clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    if (elapsedTimerRef.current !== null) {
+      window.clearInterval(elapsedTimerRef.current);
+      elapsedTimerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -178,6 +217,18 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
     };
   }, [feedback?.downloadUrl]);
 
+  useEffect(() => {
+    return () => {
+      stopProgressTimers();
+      if (abortControllerRef.current && !abortControllerRef.current.signal.aborted) {
+        abortControllerRef.current.abort();
+        if (activeJobIdRef.current) {
+          void cancelExportMp4(activeJobIdRef.current);
+        }
+      }
+    };
+  }, []);
+
   const structuredSpec = useMemo(
     () => buildStructuredTimelineSpec(project, resolution, fps),
     [project, resolution, fps]
@@ -185,8 +236,30 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
 
   const snapshotJson = useMemo(() => JSON.stringify(structuredSpec, null, 2), [structuredSpec]);
 
+  const handleCancelExport = async () => {
+    if (!submitting || cancelling) return;
+    setCancelling(true);
+    setLiveProgress((prev) =>
+      prev
+        ? { ...prev, stage: "cancelled", stageLabel: "Cancelling export...", measurable: false }
+        : {
+            stage: "cancelled",
+            stageLabel: "Cancelling export...",
+            progress: 0,
+            measurable: false,
+            elapsedMs: Date.now() - startedAtRef.current,
+          }
+    );
+    const jobId = activeJobIdRef.current;
+    abortControllerRef.current?.abort();
+    if (jobId) {
+      await cancelExportMp4(jobId).catch(() => undefined);
+    }
+  };
+
   const handleExportSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitting) return;
     if (feedback?.downloadUrl) {
       URL.revokeObjectURL(feedback.downloadUrl);
     }
@@ -212,7 +285,30 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       return;
     }
 
+    const clientJobId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `exp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const abortController = new AbortController();
+    activeJobIdRef.current = clientJobId;
+    abortControllerRef.current = abortController;
+    startedAtRef.current = Date.now();
+
+    setCancelling(false);
     setSubmitting(true);
+    setLiveProgress({
+      stage: "preparing",
+      stageLabel: "Reading local media assets",
+      progress: 0,
+      measurable: false,
+      elapsedMs: 0,
+    });
+
+    elapsedTimerRef.current = window.setInterval(() => {
+      setLiveProgress((prev) =>
+        prev ? { ...prev, elapsedMs: Date.now() - startedAtRef.current } : prev
+      );
+    }, 250);
 
     try {
       const sortedClips = [...project.clips].sort(
@@ -237,6 +333,18 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           sourceKeyToIndex.set(key, idx);
         }
         clipFileIndexById[clip.id] = idx;
+      }
+
+      if (abortController.signal.aborted) {
+        stopProgressTimers();
+        setSubmitting(false);
+        setCancelling(false);
+        setLiveProgress(null);
+        setFeedback({
+          kind: "cancelled",
+          message: "Export cancelled by user before upload started.",
+        });
+        return;
       }
 
       const resolutionPreset = resolution === "1920x1080" ? "1080p" : "720p";
@@ -275,18 +383,82 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       formData.append("fps", String(fps));
       formData.append("aspectRatio", project.aspectRatio);
       formData.append("timelineSpec", JSON.stringify(exportSpec));
+      formData.append("clientJobId", clientJobId);
       if (/^[a-f\d]{24}$/i.test(project.id)) {
         formData.append("projectId", project.id);
       }
 
-      const res = await exportTimelineMp4(formData);
+      let uploadCompleted = false;
+      setLiveProgress({
+        stage: "uploading",
+        stageLabel: "Uploading media to local processor",
+        progress: 0,
+        measurable: false,
+        elapsedMs: Date.now() - startedAtRef.current,
+      });
+
+      const pollServerProgress = async () => {
+        if (abortController.signal.aborted || !uploadCompleted) return;
+        const snapRes = await fetchExportProgress(clientJobId);
+        if (!snapRes.ok || !snapRes.data?.progress || abortController.signal.aborted) {
+          return;
+        }
+        const snap = snapRes.data.progress;
+        setLiveProgress({
+          stage: snap.stage,
+          stageLabel: snap.stageLabel,
+          progress: snap.progress,
+          measurable: snap.measurable,
+          elapsedMs: Math.max(snap.elapsedMs, Date.now() - startedAtRef.current),
+        });
+      };
+
+      pollTimerRef.current = window.setInterval(() => {
+        void pollServerProgress();
+      }, 450);
+
+      const res = await exportTimelineMp4(formData, {
+        signal: abortController.signal,
+        onUploadProgress: (pct) => {
+          if (abortController.signal.aborted || uploadCompleted) return;
+          setLiveProgress({
+            stage: "uploading",
+            stageLabel:
+              pct !== null
+                ? `Uploading media (${pct}%)`
+                : "Uploading media to local processor",
+            progress: pct ?? 0,
+            measurable: pct !== null,
+            elapsedMs: Date.now() - startedAtRef.current,
+          });
+        },
+        onUploadComplete: () => {
+          uploadCompleted = true;
+          if (abortController.signal.aborted) return;
+          setLiveProgress((prev) => ({
+            stage: "processing",
+            stageLabel: "Starting FFmpeg render pipeline",
+            progress: 5,
+            measurable: false,
+            elapsedMs: prev ? Date.now() - startedAtRef.current : 0,
+          }));
+          void pollServerProgress();
+        },
+      });
+
+      stopProgressTimers();
       setSubmitting(false);
+      setCancelling(false);
+      setLiveProgress(null);
+      activeJobIdRef.current = null;
+      abortControllerRef.current = null;
 
       if (res.ok && res.data) {
         const downloadUrl = URL.createObjectURL(res.data.blob);
         triggerBrowserDownload(downloadUrl, res.data.filename);
 
-        const successMsg = `Exported ${res.data.filename} (${formatBytes(res.data.sizeBytes)}) using FFmpeg.`;
+        const elapsedSec = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
+        const successMsg = `Exported ${res.data.filename} (${formatBytes(res.data.sizeBytes)}) in ${elapsedSec}s using FFmpeg.`;
         setFeedback({
           kind: "success",
           message: successMsg,
@@ -310,6 +482,26 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           timelineSnapshotJson: snapshotJson,
           outputFilename: res.data.filename,
           outputSizeBytes: res.data.sizeBytes,
+        });
+        return;
+      }
+
+      if (res.cancelled || res.status === 499) {
+        const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
+        setFeedback({ kind: "cancelled", message: cancelMsg });
+        recordExportAttempt({
+          id: `exp_${Date.now()}`,
+          projectId: project.id,
+          projectName: project.name,
+          resolution,
+          format,
+          fps,
+          clipCount: project.clips.length,
+          totalDuration,
+          status: "cancelled",
+          message: cancelMsg,
+          requestedAt: new Date().toISOString(),
+          timelineSnapshotJson: snapshotJson,
         });
         return;
       }
@@ -357,7 +549,12 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         timelineSnapshotJson: snapshotJson,
       });
     } catch (err) {
+      stopProgressTimers();
       setSubmitting(false);
+      setCancelling(false);
+      setLiveProgress(null);
+      activeJobIdRef.current = null;
+      abortControllerRef.current = null;
       const errMsg = err instanceof Error ? err.message : "Could not read local video file bytes.";
       setFeedback({ kind: "error", message: errMsg });
       recordExportAttempt({
@@ -489,22 +686,60 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           </label>
 
           <p className="text-[11px] text-zinc-500 leading-relaxed">
-            Renders V1 video/images, V2 overlays, T1 text titles, clip transitions, color grading &amp; blur effects, opacity, A1 audio mixing, and optional burned subtitles into {project.aspectRatio} MP4 via local FFmpeg.
+            Renders V1 video/images, V2 overlays, T1 text titles, playback speed (0.5x–2x with pitch preservation), transitions, color grading &amp; blur effects, opacity, A1 audio mixing, and optional burned subtitles into {project.aspectRatio} MP4 via local FFmpeg.
           </p>
+
+          {submitting && liveProgress && (
+            <div
+              className="rounded-lg border border-violet-500/30 bg-[#09090B] p-3 space-y-2"
+              data-testid="export-progress-panel"
+            >
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-violet-400 shrink-0" />
+                  <span className="font-medium text-zinc-100 truncate">
+                    {liveProgress.stageLabel}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0 font-mono text-[11px] text-zinc-400 tabular-nums">
+                  {liveProgress.measurable && (
+                    <span className="text-violet-300 font-semibold">
+                      {liveProgress.progress}%
+                    </span>
+                  )}
+                  <span>{formatElapsedDuration(liveProgress.elapsedMs)}</span>
+                </div>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                {liveProgress.measurable ? (
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-violet-500 to-blue-500 transition-[width] duration-200"
+                    style={{ width: `${Math.max(2, Math.min(100, liveProgress.progress))}%` }}
+                  />
+                ) : (
+                  <div className="h-full w-1/3 rounded-full bg-gradient-to-r from-violet-500 to-blue-500 animate-pulse" />
+                )}
+              </div>
+            </div>
+          )}
 
           {feedback && (
             <div
               className={`rounded-lg border p-3 text-xs space-y-2 ${
                 feedback.kind === "success"
                   ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-                  : feedback.kind === "integration"
-                    ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
-                    : "border-rose-500/30 bg-rose-500/10 text-rose-200"
+                  : feedback.kind === "cancelled"
+                    ? "border-zinc-700 bg-zinc-900/80 text-zinc-200"
+                    : feedback.kind === "integration"
+                      ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                      : "border-rose-500/30 bg-rose-500/10 text-rose-200"
               }`}
             >
               <div className="flex items-start gap-2">
                 {feedback.kind === "success" ? (
                   <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-emerald-400" />
+                ) : feedback.kind === "cancelled" ? (
+                  <Ban className="h-4 w-4 shrink-0 mt-0.5 text-zinc-400" />
                 ) : (
                   <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
                 )}
@@ -560,23 +795,27 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
               <FileJson className="h-3.5 w-3.5 text-blue-400" />
               <span>Download Render JSON</span>
             </button>
-            <button
-              type="submit"
-              disabled={submitting}
-              className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-2 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500 disabled:opacity-50"
-            >
+            <div className="flex items-center gap-2">
               {submitting ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Rendering MP4...</span>
-                </>
+                <button
+                  type="button"
+                  onClick={handleCancelExport}
+                  disabled={cancelling}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs font-medium text-rose-200 hover:bg-rose-500/20 disabled:opacity-50"
+                >
+                  <Ban className="h-3.5 w-3.5" />
+                  <span>{cancelling ? "Cancelling..." : "Cancel Export"}</span>
+                </button>
               ) : (
-                <>
+                <button
+                  type="submit"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-2 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500"
+                >
                   <Download className="h-3.5 w-3.5" />
                   <span>Export MP4</span>
-                </>
+                </button>
               )}
-            </button>
+            </div>
           </div>
         </form>
       </div>

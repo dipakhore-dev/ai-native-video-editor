@@ -97,6 +97,11 @@ export function ExportsPage() {
                           <XCircle className="h-3.5 w-3.5 shrink-0" />
                           <span>Failed</span>
                         </div>
+                      ) : item.status === "cancelled" ? (
+                        <div className="inline-flex items-center gap-1.5 text-zinc-300 font-medium">
+                          <XCircle className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                          <span>Cancelled</span>
+                        </div>
                       ) : (
                         <div className="inline-flex items-center gap-1.5 text-amber-400 font-medium">
                           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />

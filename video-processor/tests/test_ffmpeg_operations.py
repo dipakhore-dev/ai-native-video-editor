@@ -3,11 +3,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from app.config import get_settings
 from app.services.ffmpeg_service import (
+    VideoProcessingCancelledError,
     VideoProcessingError,
     _resolve_ass_font_name,
     _write_ass_subtitles,
@@ -19,6 +22,7 @@ from app.services.ffmpeg_service import (
     trim_video,
 )
 from app.services.ffprobe_service import check_binary, extract_video_metadata
+from app.services.job_store import job_store
 from app.services.whisper_service import (
     SubtitleGenerationError,
     extract_mono_wav_for_whisper,
@@ -240,18 +244,19 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             )
         self.assertEqual(ctx_bad_track.exception.status_code, 400)
 
-        # Speed != 1.0 unsupported
-        with self.assertRaises(VideoProcessingError):
-            export_timeline_mp4(
-                [clip],
-                out,
-                timeline_spec={
-                    "format": "mp4",
-                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
-                    "tracks": [],
-                    "clips": [{**base_clip, "speed": 1.5}],
-                },
-            )
+        # Out-of-range playback speed (< 0.5 or > 2.0) unsupported
+        for bad_speed in (0.25, 3.0):
+            with self.assertRaises(VideoProcessingError):
+                export_timeline_mp4(
+                    [clip],
+                    out,
+                    timeline_spec={
+                        "format": "mp4",
+                        "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+                        "tracks": [],
+                        "clips": [{**base_clip, "speed": bad_speed}],
+                    },
+                )
 
         # Gap on V1 unsupported
         with self.assertRaises(VideoProcessingError):
@@ -1338,6 +1343,287 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         self.assertGreater(rgb_pip[br_idx + 1], 100)
         self.assertGreater(rgb_pip[tl_idx + 2], 180)
         self.assertGreater(self._measure_pcm_rms(out_pip, 0.4, 0.8), 0.05)
+
+    def test_phase4_playback_speed_video_audio_and_subtitles(self) -> None:
+        clip = self._make_clip("speed_src.mp4", duration=2.0, size="640x360", with_audio=True)
+        bgm = self.test_root / "speed_bgm.wav"
+        proc_bgm = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=330:duration=3.0",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                str(bgm),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_bgm.returncode, 0, proc_bgm.stderr)
+
+        for speed, expected_duration in ((0.5, 4.0), (1.5, 1.33), (2.0, 1.0)):
+            out = self.test_root / f"speed_{str(speed).replace('.', '_')}.mp4"
+            meta = export_timeline_mp4(
+                [clip, bgm],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                        {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_speed",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "speed_src.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": expected_duration,
+                            "durationSec": expected_duration,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 2.0,
+                            "speed": speed,
+                            "volume": 0.8,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        },
+                        {
+                            "id": "a1_speed",
+                            "trackId": "track_a1",
+                            "kind": "audio",
+                            "sourceName": "speed_bgm.wav",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": expected_duration,
+                            "durationSec": expected_duration,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": min(3.0, round(expected_duration * speed, 3)),
+                            "speed": speed,
+                            "volume": 0.6,
+                            "opacity": 1.0,
+                            "fileIndex": 1,
+                        },
+                    ],
+                    "burnSubtitles": True,
+                    "subtitles": [
+                        {
+                            "id": "sub_speed",
+                            "start": 0.1,
+                            "end": min(expected_duration - 0.05, 0.8),
+                            "text": f"Speed {speed}x বাংলা",
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(out.exists())
+            self.assertTrue(meta["has_audio"])
+            self.assertAlmostEqual(meta["duration_seconds"], expected_duration, delta=0.35)
+            self.assertGreater(self._measure_pcm_rms(out, 0.1, min(0.7, expected_duration - 0.1)), 0.03)
+
+    def test_phase4_ffmpeg_progress_reporting(self) -> None:
+        clip = self._make_clip("prog_src.mp4", duration=2.5, size="640x360", with_audio=True)
+        out = self.test_root / "prog_out.mp4"
+        updates: list[tuple[str, str, int, bool]] = []
+
+        def on_progress(stage: str, stage_label: str, pct: int, measurable: bool) -> None:
+            updates.append((stage, stage_label, pct, measurable))
+
+        meta = export_timeline_mp4(
+            [clip],
+            out,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_prog",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "prog_src.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 1.67,
+                        "durationSec": 1.67,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.5,
+                        "speed": 1.5,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    }
+                ],
+            },
+            progress_cb=on_progress,
+        )
+        self.assertTrue(out.exists())
+        self.assertAlmostEqual(meta["duration_seconds"], 1.67, delta=0.35)
+        stages = [u[0] for u in updates]
+        self.assertIn("probing", stages)
+        self.assertIn("rendering_v1", stages)
+        self.assertIn("finalizing", stages)
+        measurable_pcts = [u[2] for u in updates if u[3] and u[0] == "rendering_v1"]
+        self.assertTrue(len(measurable_pcts) >= 1, f"Expected measurable FFmpeg progress updates, got {updates}")
+        self.assertEqual(measurable_pcts, sorted(measurable_pcts))
+        self.assertGreaterEqual(updates[-1][2], 95)
+
+    def test_phase4_export_cancellation_and_temp_cleanup(self) -> None:
+        clip = self._make_clip("cancel_src.mp4", duration=4.0, size="640x360", with_audio=True)
+        job_dir = self.test_root / "job_cancel_test"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "temp_marker.txt").write_text("cleanup-me", encoding="utf-8")
+        out = job_dir / "cancel_out.mp4"
+
+        job_id = "cancel-regression-job-1"
+        job_store.create(job_id, "export-mp4", stage="probing", stage_label="Inspecting sources", measurable=False)
+        job_store.register_job_dir(job_id, job_dir)
+        cancel_event = job_store.get_cancel_event(job_id)
+        self.assertIsNotNone(cancel_event)
+
+        proc_attached = threading.Event()
+        errors: list[Exception] = []
+
+        def attach_proc(proc: subprocess.Popen[str] | None) -> None:
+            job_store.attach_process(job_id, proc)
+            if proc is not None:
+                proc_attached.set()
+
+        def worker() -> None:
+            try:
+                export_timeline_mp4(
+                    [clip],
+                    out,
+                    timeline_spec={
+                        "format": "mp4",
+                        "project": {"aspectRatio": "16:9", "resolution": "1080p", "fps": 30},
+                        "tracks": [
+                            {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                        ],
+                        "clips": [
+                            {
+                                "id": "v1_cancel",
+                                "trackId": "track_v1",
+                                "kind": "video",
+                                "sourceName": "cancel_src.mp4",
+                                "timelineStartSec": 0.0,
+                                "timelineEndSec": 8.0,
+                                "durationSec": 8.0,
+                                "sourceInSec": 0.0,
+                                "sourceOutSec": 4.0,
+                                "speed": 0.5,
+                                "volume": 1.0,
+                                "opacity": 1.0,
+                                "fileIndex": 0,
+                            }
+                        ],
+                    },
+                    cancel_event=cancel_event,
+                    process_cb=attach_proc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        proc_attached.wait(timeout=5.0)
+        time.sleep(0.05)
+        cancelled_record = job_store.request_cancel(job_id)
+        thread.join(timeout=8.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNotNone(cancelled_record)
+        assert cancelled_record is not None
+        self.assertEqual(cancelled_record["status"], "cancelled")
+        self.assertTrue(cancelled_record["cancelled"])
+        self.assertGreaterEqual(cancelled_record["elapsed_ms"], 0)
+        self.assertFalse(job_dir.exists(), "request_cancel must remove temporary job directory")
+        self.assertTrue(any(isinstance(err, VideoProcessingCancelledError) for err in errors), errors)
+
+    def test_phase4_fastapi_cancel_and_speed_endpoints(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+            from app.main import app
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+            return
+
+        client = TestClient(app)
+        # Unknown job returns 404
+        res_missing = client.post("/api/v1/jobs/non-existent-job-xyz/cancel")
+        self.assertEqual(res_missing.status_code, 404)
+
+        # Register queued job + dir and cancel via FastAPI endpoint
+        temp_job_dir = self.test_root / "http_cancel_dir"
+        temp_job_dir.mkdir(parents=True, exist_ok=True)
+        (temp_job_dir / "payload.bin").write_bytes(b"abc")
+        job_id = "http-cancel-job-1"
+        job_store.create(job_id, "export-mp4")
+        job_store.register_job_dir(job_id, temp_job_dir)
+        res_cancel = client.post(f"/api/v1/jobs/{job_id}/cancel")
+        self.assertEqual(res_cancel.status_code, 200)
+        body = res_cancel.json()
+        self.assertEqual(body["status"], "cancelled")
+        self.assertTrue(body["cancelled"])
+        self.assertFalse(temp_job_dir.exists())
+
+        # /api/v1/export-mp4 accepts 1.5x speed and rejects 3.0x speed
+        clip = self._make_clip("http_speed.mp4", duration=1.5, with_audio=True)
+        spec_ok = {
+            "schemaVersion": "1.0",
+            "format": "mp4",
+            "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+            "tracks": [{"id": "track_v1", "name": "V1", "type": "video", "muted": False, "locked": False}],
+            "clips": [
+                {
+                    "id": "v1_http",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "http_speed.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 1.0,
+                    "durationSec": 1.0,
+                    "sourceInSec": 0.0,
+                    "sourceOutSec": 1.5,
+                    "speed": 1.5,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+        import json
+
+        with clip.open("rb") as f:
+            res_ok = client.post(
+                "/api/v1/export-mp4",
+                data={"timelineSpec": json.dumps(spec_ok), "client_job_id": "http-speed-ok-1"},
+                files=[("files", ("http_speed.mp4", f, "video/mp4"))],
+            )
+        self.assertEqual(res_ok.status_code, 200, res_ok.text)
+        res_job = client.get("/api/v1/jobs/http-speed-ok-1")
+        self.assertEqual(res_job.status_code, 200)
+        self.assertEqual(res_job.json()["status"], "completed")
+        self.assertEqual(res_job.json()["progress"], 100)
+
+        spec_bad = {
+            **spec_ok,
+            "clips": [{**spec_ok["clips"][0], "speed": 3.0}],
+        }
+        with clip.open("rb") as f:
+            res_bad = client.post(
+                "/api/v1/export-mp4",
+                data={"timelineSpec": json.dumps(spec_bad)},
+                files=[("files", ("http_speed.mp4", f, "video/mp4"))],
+            )
+        self.assertEqual(res_bad.status_code, 400)
 
 
 if __name__ == "__main__":

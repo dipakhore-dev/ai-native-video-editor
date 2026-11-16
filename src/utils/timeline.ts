@@ -37,6 +37,129 @@ export function getSequenceDuration(project: Project): number {
   return project.clips.reduce((max, c) => Math.max(max, c.startTime + c.duration), 0);
 }
 
+export const SUPPORTED_CLIP_SPEEDS = [0.5, 1, 1.5, 2] as const;
+
+export function clampClipSpeed(speed: number | undefined, fallback = 1): number {
+  const num = Number(speed);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(2, Math.max(0.5, Number(num.toFixed(2))));
+}
+
+/**
+ * Recomputes a clip's timeline duration when changing playback speed (0.5x..2.0x)
+ * while preserving the trimmed source span and clamping fades/transitions to the new duration.
+ */
+export function computeSpeedAdjustedClip(
+  clip: TimelineClip,
+  nextSpeed: number
+): TimelineClip {
+  if (clip.kind !== "video" && clip.kind !== "audio") {
+    return clip;
+  }
+
+  const oldSpeed = clampClipSpeed(clip.speed, 1);
+  const safeNextSpeed = clampClipSpeed(nextSpeed, 1);
+  if (Math.abs(safeNextSpeed - oldSpeed) < 0.005) {
+    return clip;
+  }
+
+  let sourceSpan = Math.max(0.1, clip.duration * oldSpeed);
+  if (clip.sourceDuration > 0) {
+    const maxAvail = Math.max(0.1, clip.sourceDuration - Math.max(0, clip.inPoint));
+    sourceSpan = Math.min(sourceSpan, maxAvail);
+  }
+
+  const nextDuration = Math.max(0.25, Number((sourceSpan / safeNextSpeed).toFixed(2)));
+  const nextTransitionIn = clip.transitionIn
+    ? normalizeTransition(clip.transitionIn, nextDuration)
+    : undefined;
+  const nextTransitionOut = clip.transitionOut
+    ? normalizeTransition(clip.transitionOut, nextDuration)
+    : undefined;
+
+  return {
+    ...clip,
+    speed: safeNextSpeed,
+    duration: nextDuration,
+    ...(clip.fadeInSec !== undefined
+      ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, nextDuration) }
+      : {}),
+    ...(clip.fadeOutSec !== undefined
+      ? { fadeOutSec: clampFadeSeconds(clip.fadeOutSec, nextDuration) }
+      : {}),
+    ...(nextTransitionIn ? { transitionIn: nextTransitionIn } : {}),
+    ...(nextTransitionOut ? { transitionOut: nextTransitionOut } : {}),
+  };
+}
+
+/**
+ * Applies a playback speed change to a clip and ripples subsequent clips on track_v1
+ * so sequential V1 clips stay gap-free and non-overlapping when duration changes.
+ */
+export function applyClipSpeedOnTimeline(
+  clips: TimelineClip[],
+  clipId: string,
+  nextSpeed: number
+): {
+  clips: TimelineClip[];
+  updatedClip: TimelineClip | null;
+  beforeClip: TimelineClip | null;
+} {
+  const beforeClip = clips.find((c) => c.id === clipId) ?? null;
+  if (!beforeClip) {
+    return { clips, updatedClip: null, beforeClip: null };
+  }
+
+  const updatedClip = computeSpeedAdjustedClip(beforeClip, nextSpeed);
+  const durationDelta = Number((updatedClip.duration - beforeClip.duration).toFixed(2));
+  const afterUpdatedEnd = Number((updatedClip.startTime + updatedClip.duration).toFixed(2));
+  const beforeEnd = Number((beforeClip.startTime + beforeClip.duration).toFixed(2));
+
+  if (beforeClip.trackId !== "track_v1" || Math.abs(durationDelta) < 0.005) {
+    return {
+      clips: clips.map((c) => (c.id === clipId ? updatedClip : c)),
+      updatedClip,
+      beforeClip,
+    };
+  }
+
+  const v1Sorted = sortTrackClips(clips, "track_v1");
+  const targetIdx = v1Sorted.findIndex((c) => c.id === clipId);
+  if (targetIdx === -1) {
+    return {
+      clips: clips.map((c) => (c.id === clipId ? updatedClip : c)),
+      updatedClip,
+      beforeClip,
+    };
+  }
+
+  const updatedV1ById = new Map<string, TimelineClip>();
+  updatedV1ById.set(updatedClip.id, updatedClip);
+
+  let prevEnd = afterUpdatedEnd;
+  let prevOriginalEnd = beforeEnd;
+  for (let i = targetIdx + 1; i < v1Sorted.length; i++) {
+    const sibling = v1Sorted[i];
+    const wasSequential = Math.abs(sibling.startTime - prevOriginalEnd) <= 0.15;
+    prevOriginalEnd = Number((sibling.startTime + sibling.duration).toFixed(2));
+    const shiftedStart = wasSequential
+      ? prevEnd
+      : Math.max(prevEnd, Number((sibling.startTime + durationDelta).toFixed(2)));
+    const nextSib: TimelineClip = {
+      ...sibling,
+      startTime: Math.max(0, Number(shiftedStart.toFixed(2))),
+    };
+    updatedV1ById.set(sibling.id, nextSib);
+    prevEnd = Number((nextSib.startTime + nextSib.duration).toFixed(2));
+  }
+
+  return {
+    clips: clips.map((c) => updatedV1ById.get(c.id) ?? c),
+    updatedClip,
+    beforeClip,
+  };
+}
+
 export function splitClipAtTimestamp(
   clips: TimelineClip[],
   clipId: string,

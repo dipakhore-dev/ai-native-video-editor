@@ -6,8 +6,10 @@ import multer from "multer";
 import { getEnvConfig } from "../config/env.ts";
 import {
   aspectRatioVideoController,
+  cancelExportController,
   exportMp4VideoController,
   extractVideoMetadataController,
+  getExportProgressController,
   getVideoJobController,
   listVideoJobsController,
   mergeVideosController,
@@ -185,6 +187,8 @@ videoProcessingRouter.post(
   handleExportUploadMiddleware(),
   exportMp4VideoController
 );
+videoProcessingRouter.get("/export-progress/:jobId", getExportProgressController);
+videoProcessingRouter.post("/export-cancel/:jobId", cancelExportController);
 videoProcessingRouter.post(
   "/subtitles",
   handleUploadMiddleware("video", 1),

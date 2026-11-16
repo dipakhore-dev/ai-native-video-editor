@@ -242,7 +242,7 @@ export interface ExportAttempt {
   fps: number;
   clipCount: number;
   totalDuration: number;
-  status: "completed" | "failed" | "integration_required";
+  status: "completed" | "failed" | "cancelled" | "integration_required";
   message: string;
   requestedAt: string;
   timelineSnapshotJson: string;
