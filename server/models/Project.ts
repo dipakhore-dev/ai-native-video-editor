@@ -191,7 +191,7 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
     fadeOutSec: { type: Number, default: 0, min: 0, max: 30 },
     duckingEnabled: { type: Boolean, default: false },
     duckingAmount: { type: Number, default: 0.6, min: 0, max: 0.95 },
-    speed: { type: Number, default: 1, min: 0.25, max: 4 },
+    speed: { type: Number, default: 1, min: 0.5, max: 2 },
     opacity: { type: Number, default: 1, min: 0, max: 1 },
     transitionIn: { type: ClipTransitionSchema, required: false },
     transitionOut: { type: ClipTransitionSchema, required: false },

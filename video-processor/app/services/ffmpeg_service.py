@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,6 +13,8 @@ from pathlib import Path
 from typing import Callable, Literal, Optional, Sequence
 
 from .ffprobe_service import check_binary, extract_audio_metadata, extract_video_metadata
+
+logger = logging.getLogger("video_processor.ffmpeg")
 
 
 AspectRatioTarget = Literal["16:9", "9:16", "1:1"]
@@ -64,6 +69,35 @@ def _parse_ffmpeg_time_line(key: str, val: str) -> Optional[float]:
     return None
 
 
+def _format_ffmpeg_failure(stderr_lines: Sequence[str]) -> str:
+    if not stderr_lines:
+        return "Unknown FFmpeg error."
+    tail = stderr_lines[-1]
+    diagnostic_lines: list[str] = []
+    for line in stderr_lines[-12:]:
+        lower = line.lower()
+        if any(
+            token in lower
+            for token in (
+                "unrecognized option",
+                "option not found",
+                "error splitting",
+                "invalid",
+                "no such",
+                "failed",
+                "cannot",
+                "unable to",
+                "unknown",
+                "conversion failed",
+            )
+        ):
+            if line not in diagnostic_lines:
+                diagnostic_lines.append(line)
+    if diagnostic_lines:
+        return " | ".join(diagnostic_lines[-3:])
+    return tail
+
+
 def _run_ffmpeg_with_progress(
     cmd: list[str],
     timeout_sec: int,
@@ -82,6 +116,9 @@ def _run_ffmpeg_with_progress(
     else:
         progress_cmd = list(cmd)
 
+    formatted_cmd = " ".join(shlex.quote(str(arg)) for arg in progress_cmd)
+    logger.debug("Executing FFmpeg command (cwd=%s): %s", cwd, formatted_cmd)
+
     try:
         proc = subprocess.Popen(
             progress_cmd,
@@ -92,8 +129,10 @@ def _run_ffmpeg_with_progress(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            shell=False,
         )
     except OSError as exc:
+        logger.error("Failed to spawn FFmpeg (%s): %s", formatted_cmd, exc)
         raise VideoProcessingError(f"Failed to execute ffmpeg: {exc}", status_code=500) from exc
 
     if process_cb is not None:
@@ -111,8 +150,8 @@ def _run_ffmpeg_with_progress(
                 stripped = line.strip()
                 if stripped:
                     stderr_lines.append(stripped)
-                    if len(stderr_lines) > 120:
-                        del stderr_lines[: len(stderr_lines) - 120]
+                    if len(stderr_lines) > 250:
+                        del stderr_lines[: len(stderr_lines) - 250]
         except Exception:
             pass
 
@@ -155,6 +194,17 @@ def _run_ffmpeg_with_progress(
     timed_out = False
     cancelled = False
 
+    def _terminate_process_cleanly() -> None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
     try:
         while True:
             rc = proc.poll()
@@ -162,30 +212,27 @@ def _run_ffmpeg_with_progress(
                 break
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1.5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                _terminate_process_cleanly()
                 break
             if time.monotonic() - start_mono > timeout_sec:
                 timed_out = True
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                _terminate_process_cleanly()
                 break
             time.sleep(0.08)
 
-        out_thread.join(timeout=2.0)
-        err_thread.join(timeout=2.0)
+        if cancelled or timed_out:
+            # Close pipes first so Windows pipe reader threads unblock immediately
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+            out_thread.join(timeout=1.0)
+            err_thread.join(timeout=1.0)
+        else:
+            out_thread.join(timeout=2.0)
+            err_thread.join(timeout=2.0)
     finally:
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None:
@@ -200,14 +247,22 @@ def _run_ffmpeg_with_progress(
         raise VideoProcessingCancelledError()
 
     if timed_out:
+        logger.error("FFmpeg timed out after %ss. Command: %s", timeout_sec, formatted_cmd)
         raise VideoProcessingError(
             f"FFmpeg timed out after {timeout_sec}s while processing video.",
             status_code=504,
         )
 
     if proc.returncode != 0:
-        tail = stderr_lines[-1] if stderr_lines else "Unknown FFmpeg error."
-        raise VideoProcessingError(f"FFmpeg processing failed: {tail}", status_code=422)
+        recent_stderr = "\n".join(stderr_lines[-30:]) if stderr_lines else "(empty stderr)"
+        logger.error(
+            "FFmpeg failed with exit code %s.\nCommand: %s\nStderr:\n%s",
+            proc.returncode,
+            formatted_cmd,
+            recent_stderr,
+        )
+        summary = _format_ffmpeg_failure(stderr_lines)
+        raise VideoProcessingError(f"FFmpeg processing failed: {summary}", status_code=422)
 
 
 def _run_ffmpeg(
@@ -1204,9 +1259,45 @@ def export_timeline_mp4(
     if progress_cb is not None:
         progress_cb("probing", "Inspecting media streams", 5, False)
 
-    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
+_VALID_TRANSITION_TYPES = set(_XFADE_TRANSITION_MAP.keys()) | {"none"}
+_VALID_EFFECT_PRESETS = set(_EFFECT_PRESET_SPECS.keys())
+
+
+def _require_finite_float(raw: object, label: str) -> float:
+    try:
+        val = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise VideoProcessingError(f"{label} must be a valid number.", status_code=400) from exc
+    if not math.isfinite(val):
+        raise VideoProcessingError(f"{label} must be a finite number.", status_code=400)
+    return val
+
+
+def validate_timeline_export_spec(
+    timeline_spec: dict,
+    *,
+    num_files: int,
+    resolution: ResolutionTarget = "720p",
+    fps: int = 30,
+    aspect_ratio: AspectRatioTarget | None = None,
+) -> tuple[
+    ResolutionTarget,
+    int,
+    AspectRatioTarget | None,
+    set[str],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[int],
+    list[int],
+    list[int],
+]:
+    if not isinstance(timeline_spec, dict):
+        raise VideoProcessingError("timeline_spec must be a JSON object.", status_code=400)
+
     project_meta = timeline_spec.get("project") if isinstance(timeline_spec.get("project"), dict) else {}
-    fmt = str(timeline_spec.get("format") or project_meta.get("format") or "mp4").lower()
+    fmt = str(timeline_spec.get("format") or project_meta.get("format") or "mp4").lower().strip()
     if fmt != "mp4":
         raise VideoProcessingError(
             f"Format '{fmt}' is not supported. Synchronous FFmpeg export supports MP4 (H.264) only.",
@@ -1291,28 +1382,24 @@ def export_timeline_mp4(
                 status_code=400,
             )
 
-        try:
-            speed = float(clip.get("speed", 1.0))
-        except (TypeError, ValueError) as exc:
-            raise VideoProcessingError(
-                f"Clip '{name}' has invalid playback speed '{clip.get('speed')}'.",
-                status_code=400,
-            ) from exc
+        raw_speed = clip.get("speed")
+        speed = _require_finite_float(1.0 if raw_speed is None else raw_speed, f"Clip '{name}' speed")
         if speed < 0.5 or speed > 2.0:
             raise VideoProcessingError(
                 f"Clip '{name}' playback speed ({speed}x) must be between 0.5x and 2.0x.",
                 status_code=400,
             )
 
-        volume = float(clip.get("volume", 1.0))
+        raw_volume = clip.get("volume")
+        volume = _require_finite_float(1.0 if raw_volume is None else raw_volume, f"Clip '{name}' volume")
         if volume < 0.0 or volume > 2.0:
             raise VideoProcessingError(
                 f"Clip '{name}' volume ({int(round(volume * 100))}%) must be between 0% and 200%.",
                 status_code=400,
             )
 
-        fade_in = float(clip.get("fadeInSec", 0.0) or 0.0)
-        fade_out = float(clip.get("fadeOutSec", 0.0) or 0.0)
+        fade_in = _require_finite_float(clip.get("fadeInSec") or 0.0, f"Clip '{name}' fadeInSec")
+        fade_out = _require_finite_float(clip.get("fadeOutSec") or 0.0, f"Clip '{name}' fadeOutSec")
         if fade_in < 0.0 or fade_in > 30.0 or fade_out < 0.0 or fade_out > 30.0:
             raise VideoProcessingError(
                 f"Clip '{name}' fade durations must be between 0s and 30s.",
@@ -1320,18 +1407,87 @@ def export_timeline_mp4(
             )
 
         duck_amt = clip.get("duckingAmount")
-        if duck_amt is not None and (float(duck_amt) < 0.0 or float(duck_amt) > 0.95):
-            raise VideoProcessingError(
-                f"Clip '{name}' ducking amount must be between 0% and 95%.",
-                status_code=400,
-            )
+        if duck_amt is not None:
+            duck_val = _require_finite_float(duck_amt, f"Clip '{name}' duckingAmount")
+            if duck_val < 0.0 or duck_val > 0.95:
+                raise VideoProcessingError(
+                    f"Clip '{name}' ducking amount must be between 0% and 95%.",
+                    status_code=400,
+                )
 
-        opacity = float(clip.get("opacity", 1.0))
+        raw_opacity = clip.get("opacity")
+        opacity = _require_finite_float(1.0 if raw_opacity is None else raw_opacity, f"Clip '{name}' opacity")
         if opacity < 0.0 or opacity > 1.0:
             raise VideoProcessingError(
                 f"Clip '{name}' opacity must be between 0% and 100%.",
                 status_code=400,
             )
+
+        for label, tr_key in (("transitionIn", "transitionIn"), ("transitionOut", "transitionOut")):
+            tr = clip.get(tr_key)
+            if tr is None:
+                continue
+            if not isinstance(tr, dict):
+                raise VideoProcessingError(f"Clip '{name}' {label} must be an object.", status_code=400)
+            tr_type = str(tr.get("type") or "none").lower().strip()
+            if tr_type not in _VALID_TRANSITION_TYPES:
+                raise VideoProcessingError(
+                    f"Clip '{name}' has unsupported {label} type '{tr_type}'.",
+                    status_code=400,
+                )
+            if tr.get("durationSec") is not None:
+                tr_dur = _require_finite_float(tr.get("durationSec"), f"Clip '{name}' {label} durationSec")
+                if tr_dur < 0.2 or tr_dur > 2.0:
+                    raise VideoProcessingError(
+                        f"Clip '{name}' {label} duration must be between 0.2s and 2.0s.",
+                        status_code=400,
+                    )
+
+        fx = clip.get("effects")
+        if fx is not None:
+            if not isinstance(fx, dict):
+                raise VideoProcessingError(f"Clip '{name}' effects must be an object.", status_code=400)
+            preset = str(fx.get("preset") or "none").lower().strip()
+            if preset not in _VALID_EFFECT_PRESETS:
+                raise VideoProcessingError(
+                    f"Clip '{name}' has unsupported effect preset '{preset}'.",
+                    status_code=400,
+                )
+            if fx.get("brightness") is not None:
+                b = _require_finite_float(fx.get("brightness"), f"Clip '{name}' brightness")
+                if b < -0.5 or b > 0.5:
+                    raise VideoProcessingError(f"Clip '{name}' brightness must be between -0.5 and 0.5.", status_code=400)
+            if fx.get("contrast") is not None:
+                c = _require_finite_float(fx.get("contrast"), f"Clip '{name}' contrast")
+                if c < 0.5 or c > 1.8:
+                    raise VideoProcessingError(f"Clip '{name}' contrast must be between 0.5 and 1.8.", status_code=400)
+            if fx.get("saturation") is not None:
+                s = _require_finite_float(fx.get("saturation"), f"Clip '{name}' saturation")
+                if s < 0.0 or s > 2.0:
+                    raise VideoProcessingError(f"Clip '{name}' saturation must be between 0 and 2.", status_code=400)
+            if fx.get("blur") is not None:
+                bl = _require_finite_float(fx.get("blur"), f"Clip '{name}' blur")
+                if bl < 0.0 or bl > 10.0:
+                    raise VideoProcessingError(f"Clip '{name}' blur must be between 0 and 10.", status_code=400)
+
+        ov = clip.get("overlayTransform")
+        if ov is not None:
+            if not isinstance(ov, dict):
+                raise VideoProcessingError(f"Clip '{name}' overlayTransform must be an object.", status_code=400)
+            for axis, key in (("X position", "x"), ("Y position", "y")):
+                if ov.get(key) is not None:
+                    val = _require_finite_float(ov.get(key), f"Clip '{name}' overlay {axis}")
+                    if val < 0.0 or val > 100.0:
+                        raise VideoProcessingError(f"Clip '{name}' overlay {axis} must be between 0% and 100%.", status_code=400)
+            for dim_label, key in (("width", "widthPct"), ("height", "heightPct")):
+                if ov.get(key) is not None:
+                    val = _require_finite_float(ov.get(key), f"Clip '{name}' overlay {dim_label}")
+                    if val < 5.0 or val > 100.0:
+                        raise VideoProcessingError(f"Clip '{name}' overlay {dim_label} must be between 5% and 100%.", status_code=400)
+            if ov.get("scale") is not None:
+                sc = _require_finite_float(ov.get("scale"), f"Clip '{name}' overlay scale")
+                if sc < 0.1 or sc > 2.0:
+                    raise VideoProcessingError(f"Clip '{name}' overlay scale must be between 0.1 and 2.0.", status_code=400)
 
     if len(v1_clips) == 0:
         raise VideoProcessingError(
@@ -1361,7 +1517,7 @@ def export_timeline_mp4(
         key=lambda c: (float(c.get("timelineStartSec", 0.0)), str(c.get("id", ""))),
     )
 
-    first_start = float(sorted_v1[0].get("timelineStartSec", 0.0))
+    first_start = _require_finite_float(sorted_v1[0].get("timelineStartSec", 0.0), "V1 first clip timelineStartSec")
     if first_start > 0.15:
         raise VideoProcessingError(
             "Timeline starts with an empty gap before the first V1 clip. Move the first clip to 00:00 before exporting.",
@@ -1371,9 +1527,10 @@ def export_timeline_mp4(
     for idx in range(len(sorted_v1) - 1):
         cur = sorted_v1[idx]
         nxt = sorted_v1[idx + 1]
-        cur_start = float(cur.get("timelineStartSec", 0.0))
-        cur_end = float(cur.get("timelineEndSec", cur_start + float(cur.get("durationSec", 0.0))))
-        nxt_start = float(nxt.get("timelineStartSec", 0.0))
+        cur_start = _require_finite_float(cur.get("timelineStartSec", 0.0), f"V1 clip #{idx + 1} timelineStartSec")
+        default_end = cur_start + _require_finite_float(cur.get("durationSec", 0.0), f"V1 clip #{idx + 1} durationSec")
+        cur_end = _require_finite_float(cur.get("timelineEndSec", default_end), f"V1 clip #{idx + 1} timelineEndSec")
+        nxt_start = _require_finite_float(nxt.get("timelineStartSec", 0.0), f"V1 clip #{idx + 2} timelineStartSec")
         gap = nxt_start - cur_end
         if gap < -0.05:
             raise VideoProcessingError(
@@ -1389,17 +1546,19 @@ def export_timeline_mp4(
     def _resolve_file_index(clip: dict) -> int:
         raw_idx = clip.get("fileIndex")
         if raw_idx is None:
-            if len(uploaded_files) == 1:
+            if num_files == 1:
                 return 0
             raise VideoProcessingError(
                 "Each clip in timelineSpec must specify 'fileIndex' when uploading multiple media files.",
                 status_code=400,
             )
+        if isinstance(raw_idx, bool):
+            raise VideoProcessingError("Invalid fileIndex in timelineSpec clip.", status_code=400)
         try:
             f_idx = int(raw_idx)
         except (TypeError, ValueError) as exc:
             raise VideoProcessingError("Invalid fileIndex in timelineSpec clip.", status_code=400) from exc
-        if f_idx < 0 or f_idx >= len(uploaded_files):
+        if f_idx < 0 or f_idx >= num_files:
             raise VideoProcessingError(
                 f"Clip references missing uploaded media file index {f_idx}.",
                 status_code=400,
@@ -1409,6 +1568,131 @@ def export_timeline_mp4(
     v1_file_indices = [_resolve_file_index(c) for c in sorted_v1]
     v2_file_indices = [_resolve_file_index(c) for c in sorted_v2]
     a1_file_indices = [_resolve_file_index(c) for c in sorted_a1]
+
+    raw_intervals = timeline_spec.get("speechIntervals")
+    if isinstance(raw_intervals, list):
+        for idx, iv in enumerate(raw_intervals):
+            if not isinstance(iv, dict):
+                raise VideoProcessingError(f"Speech interval #{idx + 1} is invalid.", status_code=400)
+            s = _require_finite_float(iv.get("start"), f"Speech interval #{idx + 1} start")
+            e = _require_finite_float(iv.get("end"), f"Speech interval #{idx + 1} end")
+            if s < 0 or e <= s:
+                raise VideoProcessingError(
+                    f"Speech interval #{idx + 1} has invalid start/end timestamps.",
+                    status_code=400,
+                )
+
+    if bool(timeline_spec.get("burnSubtitles")):
+        subtitles = timeline_spec.get("subtitles")
+        if not isinstance(subtitles, list) or len(subtitles) == 0:
+            raise VideoProcessingError(
+                "Subtitle burn-in is enabled, but there are no subtitle cues to burn.",
+                status_code=400,
+            )
+        for idx, cue in enumerate(subtitles):
+            if not isinstance(cue, dict):
+                raise VideoProcessingError("Invalid subtitle cue object.", status_code=400)
+            s = _require_finite_float(cue.get("start"), f"Subtitle cue #{idx + 1} start")
+            e = _require_finite_float(cue.get("end"), f"Subtitle cue #{idx + 1} end")
+            if s < 0 or e <= s:
+                raise VideoProcessingError(
+                    f"Subtitle cue #{idx + 1} has invalid range ({s:.2f}s to {e:.2f}s).",
+                    status_code=400,
+                )
+            if not str(cue.get("text", "")).strip():
+                raise VideoProcessingError(
+                    f"Subtitle cue #{idx + 1} has empty text.",
+                    status_code=400,
+                )
+        sub_style = timeline_spec.get("subtitleStyle")
+        if isinstance(sub_style, dict):
+            if sub_style.get("fontSize") is not None:
+                fs = _require_finite_float(sub_style.get("fontSize"), "Subtitle fontSize")
+                if fs < 12 or fs > 72:
+                    raise VideoProcessingError("Subtitle fontSize must be between 12 and 72.", status_code=400)
+            if sub_style.get("position") is not None and str(sub_style.get("position")).lower() not in ("bottom", "middle", "top"):
+                raise VideoProcessingError("Subtitle position must be 'bottom', 'middle', or 'top'.", status_code=400)
+            if sub_style.get("backgroundOpacity") is not None:
+                bo = _require_finite_float(sub_style.get("backgroundOpacity"), "Subtitle backgroundOpacity")
+                if bo < 0.0 or bo > 1.0:
+                    raise VideoProcessingError("Subtitle backgroundOpacity must be between 0 and 1.", status_code=400)
+
+    return (
+        eff_resolution,
+        eff_fps,
+        eff_aspect,
+        muted_tracks,
+        sorted_v1,
+        sorted_v2,
+        sorted_t1,
+        sorted_a1,
+        v1_file_indices,
+        v2_file_indices,
+        a1_file_indices,
+    )
+
+
+def export_timeline_mp4(
+    uploaded_files: Sequence[Path],
+    output_path: Path,
+    *,
+    timeline_spec: dict | None = None,
+    resolution: ResolutionTarget = "720p",
+    fps: int = 30,
+    aspect_ratio: AspectRatioTarget | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    timeout_sec: int = 240,
+    max_duration_sec: float = 300.0,
+    progress_cb: Optional[StageProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
+) -> dict:
+    if cancel_event is not None and cancel_event.is_set():
+        raise VideoProcessingCancelledError()
+
+    if not uploaded_files:
+        raise VideoProcessingError("Upload at least one video file to export.", status_code=400)
+
+    if timeline_spec is None:
+        return export_mp4(
+            uploaded_files[0],
+            output_path,
+            resolution=resolution,
+            fps=fps,
+            aspect_ratio=aspect_ratio,
+            ffmpeg_bin=ffmpeg_bin,
+            ffprobe_bin=ffprobe_bin,
+            timeout_sec=timeout_sec,
+            max_duration_sec=max_duration_sec,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            process_cb=process_cb,
+        )
+
+    if progress_cb is not None:
+        progress_cb("probing", "Inspecting media streams", 5, False)
+
+    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
+    (
+        eff_resolution,
+        eff_fps,
+        eff_aspect,
+        muted_tracks,
+        sorted_v1,
+        sorted_v2,
+        sorted_t1,
+        sorted_a1,
+        v1_file_indices,
+        v2_file_indices,
+        a1_file_indices,
+    ) = validate_timeline_export_spec(
+        timeline_spec,
+        num_files=len(uploaded_files),
+        resolution=resolution,
+        fps=fps,
+        aspect_ratio=aspect_ratio,
+    )
 
     v1_source_metas: dict[int, dict] = {}
     for clip, f_idx in zip(sorted_v1, v1_file_indices):
@@ -2003,13 +2287,11 @@ def export_timeline_mp4(
                 f"alimiter=limit=0.98:attack=5:release=50:level=0,atrim=0:{rendered_duration:.3f}[final_a]"
             )
 
-        filter_script_path = work_dir / "audio_mix_filter.txt"
-        filter_script_path.write_text(";\n".join(audio_filters), encoding="utf-8")
-
+        filter_graph = ";".join(audio_filters)
         mixed_audio_wav = work_dir / "mixed_audio.wav"
         audio_cmd.extend([
-            "-filter_complex_script",
-            str(filter_script_path),
+            "-filter_complex",
+            filter_graph,
             "-map",
             "[final_a]",
             "-c:a",

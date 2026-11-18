@@ -522,7 +522,7 @@ function serializeClipForServer(clip: TimelineClip) {
           duckingAmount: Math.min(0.95, Math.max(0, Number((clip.duckingAmount ?? 0.6).toFixed(2)))),
         }
       : {}),
-    speed: Math.min(4, Math.max(0.25, Number(clip.speed.toFixed(2)))),
+    speed: Math.min(2, Math.max(0.5, Number(clip.speed.toFixed(2)))),
     opacity: Math.min(1, Math.max(0, Number(clip.opacity.toFixed(3)))),
     ...(clip.transitionIn ? { transitionIn: clip.transitionIn } : {}),
     ...(clip.transitionOut ? { transitionOut: clip.transitionOut } : {}),

@@ -7,12 +7,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.config import get_settings
 from app.services.ffmpeg_service import (
     VideoProcessingCancelledError,
     VideoProcessingError,
     _resolve_ass_font_name,
+    _run_ffmpeg_with_progress,
     _write_ass_subtitles,
     export_mp4,
     export_timeline_mp4,
@@ -20,6 +22,7 @@ from app.services.ffmpeg_service import (
     merge_video_clips,
     resize_crop_aspect_ratio,
     trim_video,
+    validate_timeline_export_spec,
 )
 from app.services.ffprobe_service import check_binary, extract_video_metadata
 from app.services.job_store import job_store
@@ -1610,8 +1613,11 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         self.assertEqual(res_ok.status_code, 200, res_ok.text)
         res_job = client.get("/api/v1/jobs/http-speed-ok-1")
         self.assertEqual(res_job.status_code, 200)
-        self.assertEqual(res_job.json()["status"], "completed")
-        self.assertEqual(res_job.json()["progress"], 100)
+        job_data = res_job.json()
+        self.assertEqual(job_data["status"], "completed")
+        self.assertEqual(job_data["progress"], 100)
+        # Confirm 1.5s clip exported at 1.5x actually produced ~1.0s timeline output (not unparsed 1.5s fallback)
+        self.assertAlmostEqual(float(job_data["result"]["duration_seconds"]), 1.0, delta=0.3)
 
         spec_bad = {
             **spec_ok,
@@ -1620,10 +1626,124 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         with clip.open("rb") as f:
             res_bad = client.post(
                 "/api/v1/export-mp4",
-                data={"timelineSpec": json.dumps(spec_bad)},
+                data={"timelineSpec": json.dumps(spec_bad), "client_job_id": "rejected-speed-job-3x"},
                 files=[("files", ("http_speed.mp4", f, "video/mp4"))],
             )
         self.assertEqual(res_bad.status_code, 400)
+        self.assertIsNone(job_store.get("rejected-speed-job-3x"))
+
+        spec_bad_slow = {
+            **spec_ok,
+            "clips": [{**spec_ok["clips"][0], "speed": 0.25}],
+        }
+        with clip.open("rb") as f:
+            res_bad_slow = client.post(
+                "/api/v1/export-mp4",
+                data={"timeline_spec": json.dumps(spec_bad_slow), "client_job_id": "rejected-speed-job-025x"},
+                files=[("files", ("http_speed.mp4", f, "video/mp4"))],
+            )
+        self.assertEqual(res_bad_slow.status_code, 400)
+        self.assertIsNone(job_store.get("rejected-speed-job-025x"))
+
+    def test_phase4_no_removed_filter_complex_script_and_stderr_diagnostics(self) -> None:
+        clip = self._make_clip("diag_v1.mp4", duration=1.5, size="640x360", with_audio=True)
+        out = self.test_root / "diag_out.mp4"
+        seen_cmds: list[list[str]] = []
+        seen_shells: list[bool] = []
+        real_popen = subprocess.Popen
+
+        def spy_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen_cmds.append([str(x) for x in cmd])
+            seen_shells.append(bool(kwargs.get("shell", False)))
+            return real_popen(cmd, *args, **kwargs)
+
+        with mock.patch("app.services.ffmpeg_service.subprocess.Popen", side_effect=spy_popen):
+            meta = export_timeline_mp4(
+                [clip],
+                out,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1", "type": "video", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_diag",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "diag_v1.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 1.0,
+                            "durationSec": 1.0,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 1.5,
+                            "speed": 1.5,
+                            "volume": 1.0,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        }
+                    ],
+                },
+            )
+        self.assertTrue(out.exists())
+        self.assertTrue(meta["has_audio"])
+        self.assertGreaterEqual(len(seen_cmds), 2)
+        for cmd in seen_cmds:
+            self.assertNotIn("-filter_complex_script", cmd)
+            self.assertNotIn("-filter_script", cmd)
+            self.assertNotIn("-vsync", cmd)
+        self.assertTrue(all(shell_val is False for shell_val in seen_shells))
+        self.assertTrue(any("-filter_complex" in cmd for cmd in seen_cmds))
+
+        # Verify diagnostic stderr reporting surfaces unrecognized option details and logs command
+        with self.assertLogs("video_processor.ffmpeg", level="ERROR") as log_ctx:
+            with self.assertRaises(VideoProcessingError) as err_ctx:
+                _run_ffmpeg_with_progress(
+                    [self.ffmpeg, "-y", "-bogus_nonexistent_option_xyz", "1", str(out)],
+                    timeout_sec=10,
+                )
+        msg = str(err_ctx.exception)
+        self.assertIn("Unrecognized option", msg)
+        joined_logs = "\n".join(log_ctx.output)
+        self.assertIn("-bogus_nonexistent_option_xyz", joined_logs)
+        self.assertIn("Stderr:", joined_logs)
+
+    def test_phase4_validate_timeline_export_spec_speed_and_precheck(self) -> None:
+        valid_spec = {
+            "format": "mp4",
+            "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 30},
+            "tracks": [{"id": "track_v1", "name": "V1", "type": "video", "muted": False, "locked": False}],
+            "clips": [
+                {
+                    "id": "v1_ok",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "clip.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 1.0,
+                    "durationSec": 1.0,
+                    "sourceInSec": 0.0,
+                    "sourceOutSec": 1.5,
+                    "speed": 1.5,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+        res = validate_timeline_export_spec(valid_spec, num_files=1)
+        self.assertEqual(res[0], "720p")
+        self.assertEqual(res[1], 30)
+
+        for bad_speed in (0.25, 0.49, 2.01, 3.0, "fast", float("nan"), float("inf")):
+            bad_spec = {
+                **valid_spec,
+                "clips": [{**valid_spec["clips"][0], "speed": bad_speed}],
+            }
+            with self.assertRaises(VideoProcessingError) as exc_ctx:
+                validate_timeline_export_spec(bad_spec, num_files=1)
+            self.assertEqual(exc_ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":

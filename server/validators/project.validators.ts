@@ -59,7 +59,7 @@ export const TimelineClipSchema = z.object({
   fadeOutSec: z.number().min(0).max(30).optional().default(0),
   duckingEnabled: z.boolean().optional().default(false),
   duckingAmount: z.number().min(0).max(0.95).optional().default(0.6),
-  speed: z.number().min(0.25).max(4).default(1),
+  speed: z.number().min(0.5).max(2).default(1),
   opacity: z.number().min(0).max(1).default(1),
   transitionIn: ClipTransitionSchema.optional(),
   transitionOut: ClipTransitionSchema.optional(),

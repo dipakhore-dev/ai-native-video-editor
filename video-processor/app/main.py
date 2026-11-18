@@ -27,6 +27,7 @@ from .services.ffmpeg_service import (
     merge_video_clips,
     resize_crop_aspect_ratio,
     trim_video,
+    validate_timeline_export_spec,
 )
 from .services.ffprobe_service import VideoMetadataError, check_binary, extract_video_metadata
 from .services.job_store import job_store
@@ -400,11 +401,62 @@ async def export_mp4_endpoint(
     resolution: Literal["720p", "1080p"] = Form(default="720p"),
     fps: int = Form(default=30),
     aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None),
+    aspect_ratio_camel: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None, alias="aspectRatio"),
     timeline_spec: Optional[str] = Form(default=None),
+    timeline_spec_camel: Optional[str] = Form(default=None, alias="timelineSpec"),
     client_job_id: Optional[str] = Form(default=None),
+    client_job_id_camel: Optional[str] = Form(default=None, alias="clientJobId"),
     settings: ProcessorSettings = Depends(get_settings),
 ) -> FileResponse:
-    raw_cid = (client_job_id or "").strip()
+    uploads = [*(files or []), *([file] if file is not None else [])]
+    eff_aspect_ratio = aspect_ratio or aspect_ratio_camel
+    raw_spec = timeline_spec if timeline_spec is not None else timeline_spec_camel
+    raw_cid = (client_job_id or client_job_id_camel or "").strip()
+
+    try:
+        if not uploads:
+            raise FileValidationError(
+                'Upload at least one video file using form field "files" or "file".',
+                status_code=400,
+            )
+
+        for upload in uploads:
+            validate_upload_headers(
+                upload.filename,
+                upload.content_type,
+                allow_audio=True,
+                allow_images=True,
+            )
+
+        parsed_spec: dict | None = None
+        if raw_spec is not None:
+            if not raw_spec.strip():
+                raise VideoProcessingError("timeline_spec cannot be empty when provided.", status_code=400)
+            try:
+                loaded = json.loads(raw_spec)
+            except json.JSONDecodeError as exc:
+                raise VideoProcessingError(
+                    "Invalid timeline_spec JSON payload.",
+                    status_code=400,
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise VideoProcessingError(
+                    "timeline_spec must be a JSON object.",
+                    status_code=400,
+                )
+            validate_timeline_export_spec(
+                loaded,
+                num_files=len(uploads),
+                resolution=resolution,
+                fps=fps,
+                aspect_ratio=eff_aspect_ratio,
+            )
+            parsed_spec = loaded
+    except Exception:
+        for upload in uploads:
+            await upload.close()
+        raise
+
     job_id = raw_cid if _CLIENT_JOB_ID_RE.match(raw_cid) else uuid.uuid4().hex
     job_store.create(
         job_id,
@@ -416,33 +468,10 @@ async def export_mp4_endpoint(
     job_dir = _prepare_job_dir(settings, job_id)
     job_store.register_job_dir(job_id, job_dir)
     cancel_event = job_store.get_cancel_event(job_id)
-    uploads = [*(files or []), *([file] if file is not None else [])]
 
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise VideoProcessingCancelledError()
-
-        if not uploads:
-            raise FileValidationError(
-                'Upload at least one video file using form field "files" or "file".',
-                status_code=400,
-            )
-
-        parsed_spec: dict | None = None
-        if timeline_spec and timeline_spec.strip():
-            try:
-                loaded = json.loads(timeline_spec)
-            except json.JSONDecodeError as exc:
-                raise VideoProcessingError(
-                    "Invalid timeline_spec JSON payload.",
-                    status_code=400,
-                ) from exc
-            if not isinstance(loaded, dict):
-                raise VideoProcessingError(
-                    "timeline_spec must be a JSON object.",
-                    status_code=400,
-                )
-            parsed_spec = loaded
 
         job_store.update(
             job_id,
@@ -500,7 +529,7 @@ async def export_mp4_endpoint(
             timeline_spec=parsed_spec,
             resolution=resolution,
             fps=fps,
-            aspect_ratio=aspect_ratio,
+            aspect_ratio=eff_aspect_ratio,
             ffmpeg_bin=settings.ffmpeg_bin,
             ffprobe_bin=settings.ffprobe_bin,
             timeout_sec=settings.ffmpeg_timeout_sec,
