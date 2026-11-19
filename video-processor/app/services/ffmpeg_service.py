@@ -375,14 +375,18 @@ def trim_video(
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 180,
     max_duration_sec: float = 300.0,
+    enforce_source_limit: bool = True,
     progress_cb: Optional[SubprocessProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     process_cb: Optional[ProcessAttachCallback] = None,
 ) -> dict:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
-    meta = _assert_short_video_limit(
-        input_path, ffprobe_bin=ffprobe_bin, max_duration_sec=max_duration_sec
-    )
+    if enforce_source_limit:
+        meta = _assert_short_video_limit(
+            input_path, ffprobe_bin=ffprobe_bin, max_duration_sec=max_duration_sec
+        )
+    else:
+        meta = extract_video_metadata(input_path, ffprobe_bin=ffprobe_bin)
     source_duration = float(meta["duration_seconds"])
 
     if start_sec < 0 or end_sec <= start_sec:
@@ -397,6 +401,11 @@ def trim_video(
     clip_duration = effective_end - start_sec
     if clip_duration < 0.1:
         raise VideoProcessingError("Trimmed duration must be at least 0.1 seconds.", status_code=400)
+    if clip_duration > max_duration_sec:
+        raise VideoProcessingError(
+            f"Trimmed clip duration ({clip_duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+            status_code=400,
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -433,6 +442,57 @@ def trim_video(
     )
     out_meta = extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
     return out_meta
+
+
+def _trim_audio_segment(
+    input_path: Path,
+    output_wav_path: Path,
+    *,
+    start_sec: float,
+    end_sec: float,
+    ffmpeg_bin: str = "ffmpeg",
+    ffprobe_bin: str = "ffprobe",
+    timeout_sec: int = 180,
+    progress_cb: Optional[SubprocessProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    process_cb: Optional[ProcessAttachCallback] = None,
+) -> dict:
+    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
+    span = end_sec - start_sec
+    if start_sec < 0 or span < 0.05:
+        raise VideoProcessingError(
+            "Invalid audio trim timestamps: require 0 <= start_sec < end_sec.",
+            status_code=400,
+        )
+
+    output_wav_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-i",
+        str(input_path),
+        "-t",
+        f"{span:.3f}",
+        "-vn",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        str(output_wav_path),
+    ]
+    _run_ffmpeg(
+        cmd,
+        timeout_sec,
+        expected_duration_sec=span,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        process_cb=process_cb,
+    )
+    return extract_audio_metadata(output_wav_path, ffprobe_bin=ffprobe_bin)
 
 
 def resize_crop_aspect_ratio(
@@ -1701,10 +1761,9 @@ def export_timeline_mp4(
         if _is_image_clip(clip, uploaded_files[f_idx]):
             v1_source_metas[f_idx] = {"duration_seconds": 0.0, "has_audio": False, "is_image": True}
         else:
-            v1_source_metas[f_idx] = _assert_short_video_limit(
+            v1_source_metas[f_idx] = extract_video_metadata(
                 uploaded_files[f_idx],
                 ffprobe_bin=ffprobe_bin,
-                max_duration_sec=max_duration_sec,
             )
 
     v2_source_metas: dict[int, dict] = {}
@@ -1714,18 +1773,16 @@ def export_timeline_mp4(
         if _is_image_clip(clip, uploaded_files[f_idx]):
             v2_source_metas[f_idx] = {"duration_seconds": 0.0, "has_audio": False, "is_image": True}
         else:
-            v2_source_metas[f_idx] = _assert_short_video_limit(
+            v2_source_metas[f_idx] = extract_video_metadata(
                 uploaded_files[f_idx],
                 ffprobe_bin=ffprobe_bin,
-                max_duration_sec=max_duration_sec,
             )
 
     a1_source_metas: dict[int, dict] = {}
     for f_idx in set(a1_file_indices):
-        a1_source_metas[f_idx] = _assert_short_audio_limit(
+        a1_source_metas[f_idx] = extract_audio_metadata(
             uploaded_files[f_idx],
             ffprobe_bin=ffprobe_bin,
-            max_duration_sec=max_duration_sec,
         )
 
     v1_prepared_clips: list[dict] = []
@@ -1736,6 +1793,7 @@ def export_timeline_mp4(
         src_meta = v1_source_metas[f_idx]
         is_image = bool(src_meta.get("is_image"))
         clip_speed = 1.0 if is_image else max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
+        clip_name = str(clip.get("sourceName") or clip.get("name") or f"V1 clip #{idx + 1}")
 
         if is_image:
             seg_dur = max(0.2, min(60.0, float(clip.get("durationSec", 5.0))))
@@ -1752,7 +1810,7 @@ def export_timeline_mp4(
             src_out = float(clip.get("sourceOutSec", default_out))
             if src_in < 0 or src_out <= src_in:
                 raise VideoProcessingError(
-                    f"Invalid trim range ({src_in:.2f}s to {src_out:.2f}s) on clip '{clip.get('sourceName') or idx}'.",
+                    f"Invalid trim range ({src_in:.2f}s to {src_out:.2f}s) on clip '{clip_name}'.",
                     status_code=400,
                 )
             if src_duration > 0 and src_in >= src_duration:
@@ -1764,9 +1822,19 @@ def export_timeline_mp4(
             src_span = effective_out - src_in
             if src_span < 0.08:
                 raise VideoProcessingError("Clip source range must be at least 0.1 seconds.", status_code=400)
+            if src_span > max_duration_sec:
+                raise VideoProcessingError(
+                    f"Processed video segment duration ({src_span:.1f}s) on '{clip_name}' exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+                    status_code=400,
+                )
             seg_dur = src_span / clip_speed
             if seg_dur < 0.1:
                 raise VideoProcessingError("Clip duration must be at least 0.1 seconds.", status_code=400)
+            if seg_dur > max_duration_sec:
+                raise VideoProcessingError(
+                    f"Timeline segment duration ({seg_dur:.1f}s) on '{clip_name}' exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+                    status_code=400,
+                )
 
         total_v1_duration += seg_dur
         v1_prepared_clips.append({
@@ -1792,6 +1860,70 @@ def export_timeline_mp4(
             f"Combined timeline duration ({total_v1_duration:.1f}s) exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
             status_code=400,
         )
+
+    # Validate active V2 and A1 processed segment workloads upfront before rendering
+    if "track_v2" not in muted_tracks:
+        for idx, clip in enumerate(sorted_v2):
+            if float(clip.get("opacity", 1.0)) <= 0.005:
+                continue
+            tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
+            tl_dur = max(0.1, float(clip.get("durationSec", 1.0)))
+            tl_end = min(total_v1_duration, tl_start + tl_dur)
+            if tl_start >= total_v1_duration - 0.02 or tl_end - tl_start < 0.05:
+                continue
+            f_idx = v2_file_indices[idx]
+            src_meta = v2_source_metas[f_idx]
+            if bool(src_meta.get("is_image")):
+                continue
+            ov_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
+            src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
+            src_dur = float(src_meta.get("duration_seconds", 0.0))
+            if src_dur > 0 and src_in >= src_dur:
+                continue
+            src_out = src_in + (tl_end - tl_start) * ov_speed
+            effective_out = min(src_out, src_dur) if src_dur > 0 else src_out
+            src_span = effective_out - src_in
+            if src_span > max_duration_sec:
+                clip_name = str(clip.get("sourceName") or clip.get("name") or f"V2 clip #{idx + 1}")
+                raise VideoProcessingError(
+                    f"Processed overlay segment duration ({src_span:.1f}s) on '{clip_name}' exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+                    status_code=400,
+                )
+
+    if "track_a1" not in muted_tracks:
+        for idx, clip in enumerate(sorted_a1):
+            if bool(clip.get("muted", False)) or float(clip.get("volume", 1.0)) <= 0.001:
+                continue
+            tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
+            if tl_start >= total_v1_duration - 0.02:
+                continue
+            f_idx = a1_file_indices[idx]
+            src_meta = a1_source_metas[f_idx]
+            src_duration = float(src_meta["duration_seconds"])
+            a1_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
+            src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
+            default_out = (
+                src_in + float(clip["durationSec"]) * a1_speed
+                if "durationSec" in clip
+                else src_duration
+            )
+            src_out = float(clip.get("sourceOutSec", default_out))
+            if src_out <= src_in or (src_duration > 0 and src_in >= src_duration):
+                continue
+            effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
+            src_span = effective_out - src_in
+            rendered_clip_dur = src_span / a1_speed
+            clip_name = str(clip.get("sourceName") or clip.get("name") or f"A1 clip #{idx + 1}")
+            if src_span > max_duration_sec:
+                raise VideoProcessingError(
+                    f"Audio segment duration ({src_span:.1f}s) on '{clip_name}' exceeds synchronous short-media limit ({max_duration_sec:.0f}s).",
+                    status_code=400,
+                )
+            if rendered_clip_dur > max_duration_sec:
+                raise VideoProcessingError(
+                    f"Audio timeline duration ({rendered_clip_dur:.1f}s) on '{clip_name}' exceeds synchronous short-media limit ({max_duration_sec:.0f}s).",
+                    status_code=400,
+                )
 
     # Plan active multi-pass progress slices cleanly in [10, 96]
     v2_track_muted = "track_v2" in muted_tracks
@@ -1863,6 +1995,7 @@ def export_timeline_mp4(
                     ffprobe_bin=ffprobe_bin,
                     timeout_sec=timeout_sec,
                     max_duration_sec=max_duration_sec,
+                    enforce_source_limit=False,
                     cancel_event=cancel_event,
                     process_cb=process_cb,
                 )
@@ -1930,14 +2063,42 @@ def export_timeline_mp4(
                     continue
                 tl_end = min(rendered_duration, tl_start + (src_out - src_in) / ov_speed)
 
+            ov_src_path = src_path
+            ov_src_in = src_in
+            ov_src_out = src_out
+            if not is_image:
+                needs_v2_trim = (
+                    src_in > 0.05
+                    or (src_dur > 0 and src_out < src_dur - 0.05)
+                    or src_dur > max_duration_sec
+                )
+                if needs_v2_trim:
+                    trimmed_v2_path = work_dir / f"v2_seg_{idx}_trim.mp4"
+                    trim_video(
+                        src_path,
+                        trimmed_v2_path,
+                        start_sec=src_in,
+                        end_sec=src_out,
+                        ffmpeg_bin=ffmpeg_bin,
+                        ffprobe_bin=ffprobe_bin,
+                        timeout_sec=timeout_sec,
+                        max_duration_sec=max_duration_sec,
+                        enforce_source_limit=False,
+                        cancel_event=cancel_event,
+                        process_cb=process_cb,
+                    )
+                    ov_src_path = trimmed_v2_path
+                    ov_src_in = 0.0
+                    ov_src_out = max(0.05, src_out - src_in)
+
             active_v2_overlays.append({
-                "src_path": src_path,
+                "src_path": ov_src_path,
                 "src_meta": src_meta,
                 "is_image": is_image,
                 "tl_start": tl_start,
                 "tl_end": tl_end,
-                "src_in": src_in,
-                "src_out": src_out,
+                "src_in": ov_src_in,
+                "src_out": ov_src_out,
                 "speed": ov_speed,
                 "opacity": opacity,
                 "volume": float(clip.get("volume", 1.0)),
@@ -2033,6 +2194,7 @@ def export_timeline_mp4(
 
         active_a1_clips.append({
             "src_path": src_path,
+            "src_duration": src_duration,
             "src_in": src_in,
             "src_out": effective_out,
             "tl_start": tl_start,
@@ -2107,13 +2269,38 @@ def export_timeline_mp4(
                         f"anullsrc=channel_layout=stereo:sample_rate=44100:d={seg_dur:.3f}[v1a_{s_idx}]"
                     )
                 else:
+                    v1_audio_path = item["src_path"]
+                    v1_a_in = float(item["src_in"])
+                    v1_a_out = float(item["src_out"])
+                    v1_src_dur = float(item["src_meta"].get("duration_seconds", 0.0))
+                    if (
+                        v1_a_in > 0.05
+                        or (v1_src_dur > 0 and v1_a_out < v1_src_dur - 0.05)
+                        or v1_src_dur > max_duration_sec
+                    ):
+                        trimmed_v1_wav = work_dir / f"v1_seg_{s_idx}_audio_trim.wav"
+                        _trim_audio_segment(
+                            v1_audio_path,
+                            trimmed_v1_wav,
+                            start_sec=v1_a_in,
+                            end_sec=v1_a_out,
+                            ffmpeg_bin=ffmpeg_bin,
+                            ffprobe_bin=ffprobe_bin,
+                            timeout_sec=timeout_sec,
+                            cancel_event=cancel_event,
+                            process_cb=process_cb,
+                        )
+                        v1_audio_path = trimmed_v1_wav
+                        v1_a_out = max(0.05, v1_a_out - v1_a_in)
+                        v1_a_in = 0.0
+
                     cur_in_idx = input_idx
-                    audio_cmd.extend(["-i", str(item["src_path"])])
+                    audio_cmd.extend(["-i", str(v1_audio_path)])
                     input_idx += 1
                     chain = _build_audio_clip_chain(
                         f"{cur_in_idx}:a",
-                        src_in=item["src_in"],
-                        src_out=item["src_out"],
+                        src_in=v1_a_in,
+                        src_out=v1_a_out,
                         volume=item["volume"],
                         fade_in=item["fade_in"],
                         fade_out=item["fade_out"],
@@ -2178,14 +2365,39 @@ def export_timeline_mp4(
 
         sc_split_cursor = 0
         for a_idx, item in enumerate(active_a1_clips):
+            a1_src_path = item["src_path"]
+            a1_in = float(item["src_in"])
+            a1_out = float(item["src_out"])
+            a1_src_dur = float(item.get("src_duration", 0.0))
+            if (
+                a1_in > 0.05
+                or (a1_src_dur > 0 and a1_out < a1_src_dur - 0.05)
+                or a1_src_dur > max_duration_sec
+            ):
+                trimmed_a1_wav = work_dir / f"a1_seg_{a_idx}_trim.wav"
+                _trim_audio_segment(
+                    a1_src_path,
+                    trimmed_a1_wav,
+                    start_sec=a1_in,
+                    end_sec=a1_out,
+                    ffmpeg_bin=ffmpeg_bin,
+                    ffprobe_bin=ffprobe_bin,
+                    timeout_sec=timeout_sec,
+                    cancel_event=cancel_event,
+                    process_cb=process_cb,
+                )
+                a1_src_path = trimmed_a1_wav
+                a1_out = max(0.05, a1_out - a1_in)
+                a1_in = 0.0
+
             cur_in_idx = input_idx
-            audio_cmd.extend(["-i", str(item["src_path"])])
+            audio_cmd.extend(["-i", str(a1_src_path)])
             input_idx += 1
 
             base_chain = _build_audio_clip_chain(
                 f"{cur_in_idx}:a",
-                src_in=item["src_in"],
-                src_out=item["src_out"],
+                src_in=a1_in,
+                src_out=a1_out,
                 volume=item["volume"],
                 fade_in=item["fade_in"],
                 fade_out=item["fade_out"],

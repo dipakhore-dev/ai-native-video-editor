@@ -13,8 +13,10 @@ from app.config import get_settings
 from app.services.ffmpeg_service import (
     VideoProcessingCancelledError,
     VideoProcessingError,
+    _assert_short_audio_limit,
     _resolve_ass_font_name,
     _run_ffmpeg_with_progress,
+    _trim_audio_segment,
     _write_ass_subtitles,
     export_mp4,
     export_timeline_mp4,
@@ -1744,6 +1746,283 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             with self.assertRaises(VideoProcessingError) as exc_ctx:
                 validate_timeline_export_spec(bad_spec, num_files=1)
             self.assertEqual(exc_ctx.exception.status_code, 400)
+
+    def test_phase4_long_audio_source_short_trimmed_segment_export_and_limit_enforcement(self) -> None:
+        from app.services.ffprobe_service import extract_audio_metadata
+
+        # Create a real >300s (385.1s) MP3 audio source matching the reported scenario
+        long_mp3 = self.test_root / "long_bgm_385s.mp3"
+        proc_mp3 = subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=520:sample_rate=8000:duration=385.1",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "32k",
+                str(long_mp3),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_mp3.returncode, 0, proc_mp3.stderr)
+        mp3_meta = extract_audio_metadata(long_mp3)
+        self.assertGreater(mp3_meta["duration_seconds"], 380.0)
+
+        # Standalone short-media audio guard must still enforce 300s limit
+        with self.assertRaises(VideoProcessingError) as ctx_short_guard:
+            _assert_short_audio_limit(long_mp3, ffprobe_bin="ffprobe", max_duration_sec=300.0)
+        self.assertEqual(ctx_short_guard.exception.status_code, 400)
+        self.assertIn("300s", str(ctx_short_guard.exception))
+
+        # 1) Exact scenario params: 385.1s MP3 with sourceInSec=0, sourceOutSec=50.4, speed=1 (under 300s workload)
+        v1_silent = self._make_clip("v1_long_audio_test.mp4", duration=3.0, size="640x360", with_audio=False)
+        out_50s_seg = self.test_root / "export_from_385s_head.mp4"
+        seen_cmds: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def spy_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen_cmds.append([str(x) for x in cmd])
+            return real_popen(cmd, *args, **kwargs)
+
+        with mock.patch("app.services.ffmpeg_service.subprocess.Popen", side_effect=spy_popen):
+            head_meta = export_timeline_mp4(
+                [v1_silent, long_mp3],
+                out_50s_seg,
+                max_duration_sec=300.0,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                        {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_base",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "v1_long_audio_test.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 3.0,
+                            "durationSec": 3.0,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 3.0,
+                            "speed": 1.0,
+                            "volume": 1.0,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        },
+                        {
+                            "id": "a1_head_trim",
+                            "trackId": "track_a1",
+                            "kind": "audio",
+                            "sourceName": "long_bgm_385s.mp3",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 50.4,
+                            "durationSec": 50.4,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 50.4,
+                            "speed": 1.0,
+                            "volume": 1.2,
+                            "muted": False,
+                            "fadeInSec": 0.4,
+                            "fadeOutSec": 0.4,
+                            "fileIndex": 1,
+                        },
+                    ],
+                },
+            )
+        self.assertTrue(out_50s_seg.exists())
+        self.assertTrue(head_meta["has_audio"])
+        self.assertAlmostEqual(head_meta["duration_seconds"], 3.0, delta=0.35)
+        self.assertGreater(self._measure_pcm_rms(out_50s_seg, 0.6, 1.4), 0.03)
+        # Confirm pre-trim command targeted 50.400s instead of passing raw 385.1s MP3 directly into mix filtergraph
+        self.assertTrue(
+            any("-t" in cmd and "50.400" in cmd and str(long_mp3) in cmd for cmd in seen_cmds),
+            seen_cmds,
+        )
+
+        # 2) Trimmed slice past the 300s mark inside the 385.1s MP3 (320.0s .. 323.0s) with fades & speed=1.5
+        out_tail_seg = self.test_root / "export_from_385s_tail.mp4"
+        tail_meta = export_timeline_mp4(
+            [v1_silent, long_mp3],
+            out_tail_seg,
+            max_duration_sec=300.0,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_base",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v1_long_audio_test.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 3.0,
+                        "durationSec": 3.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 3.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "a1_tail_trim",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "long_bgm_385s.mp3",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 320.0,
+                        "sourceOutSec": 323.0,
+                        "speed": 1.5,
+                        "volume": 1.0,
+                        "muted": False,
+                        "fadeInSec": 0.5,
+                        "fadeOutSec": 0.5,
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_tail_seg.exists())
+        self.assertTrue(tail_meta["has_audio"])
+        self.assertGreater(self._measure_pcm_rms(out_tail_seg, 0.5, 0.8), 0.03)
+        self.assertLess(self._measure_pcm_rms(out_tail_seg, 2.2, 0.6), 0.01)
+
+        # 3) Processed audio segment actually exceeding 300s (0..320s) MUST still be rejected with 400
+        with self.assertRaises(VideoProcessingError) as ctx_oversized_a1:
+            export_timeline_mp4(
+                [v1_silent, long_mp3],
+                self.test_root / "should_reject_320s_a1.mp4",
+                max_duration_sec=300.0,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                        {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_base",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "v1_long_audio_test.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 3.0,
+                            "durationSec": 3.0,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 3.0,
+                            "speed": 1.0,
+                            "volume": 1.0,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        },
+                        {
+                            "id": "a1_too_long",
+                            "trackId": "track_a1",
+                            "kind": "audio",
+                            "sourceName": "long_bgm_385s.mp3",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 320.0,
+                            "durationSec": 320.0,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 320.0,
+                            "speed": 1.0,
+                            "volume": 1.0,
+                            "muted": False,
+                            "fileIndex": 1,
+                        },
+                    ],
+                },
+            )
+        self.assertEqual(ctx_oversized_a1.exception.status_code, 400)
+        self.assertIn("300s", str(ctx_oversized_a1.exception))
+
+        # 4) Standalone short-video trim_video limit preserved vs timeline export short segment from >max_duration_sec video
+        vid_8s = self._make_clip("vid_8s.mp4", duration=8.0, size="320x180", with_audio=True)
+        with self.assertRaises(VideoProcessingError) as ctx_standalone_trim:
+            trim_video(vid_8s, self.test_root / "standalone_trim_reject.mp4", start_sec=0.0, end_sec=2.0, max_duration_sec=5.0)
+        self.assertEqual(ctx_standalone_trim.exception.status_code, 400)
+
+        out_short_from_long_vid = self.test_root / "short_from_long_vid.mp4"
+        vid_meta = export_timeline_mp4(
+            [vid_8s],
+            out_short_from_long_vid,
+            max_duration_sec=5.0,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_late_slice",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "vid_8s.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 5.5,
+                        "sourceOutSec": 7.5,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    }
+                ],
+            },
+        )
+        self.assertTrue(out_short_from_long_vid.exists())
+        self.assertAlmostEqual(vid_meta["duration_seconds"], 2.0, delta=0.35)
+
+        # Combined V1 timeline exceeding max_duration_sec must still fail with 400
+        with self.assertRaises(VideoProcessingError) as ctx_oversized_tl:
+            export_timeline_mp4(
+                [vid_8s],
+                self.test_root / "oversized_timeline.mp4",
+                max_duration_sec=5.0,
+                timeline_spec={
+                    "format": "mp4",
+                    "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_too_long",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "vid_8s.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 6.0,
+                            "durationSec": 6.0,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 6.0,
+                            "speed": 1.0,
+                            "volume": 1.0,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(ctx_oversized_tl.exception.status_code, 400)
 
 
 if __name__ == "__main__":
