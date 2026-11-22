@@ -31,10 +31,13 @@ import {
 } from "../../utils/effects";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
+import { usePlaybackTime, type TimelinePlaybackClock } from "../../utils/timelineClock";
+import { WaveformCanvas } from "./WaveformCanvas";
 
 interface MultitrackTimelineProps {
   project: Project;
-  playheadTime: number;
+  playheadTime?: number;
+  playbackClock?: TimelinePlaybackClock;
   onSeek: (time: number) => void;
   selectedClipId: string | null;
   onSelectClip: (clipId: string | null) => void;
@@ -52,7 +55,8 @@ function isAssetKindCompatibleWithTrack(kind: MediaKind, trackType: TrackType): 
 function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
   return {
     ...c,
-    waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
+    // Keep immutable waveformPeaks array by reference
+    waveformPeaks: c.waveformPeaks,
     textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
     transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
@@ -60,6 +64,103 @@ function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
     overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
   };
 }
+
+const TimelinePlayheadNeedle = React.memo(function TimelinePlayheadNeedle({
+  playbackClock,
+  playheadTime = 0,
+  zoomPxPerSec,
+  tracksAreaRef,
+}: {
+  playbackClock?: TimelinePlaybackClock;
+  playheadTime?: number;
+  zoomPxPerSec: number;
+  tracksAreaRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const needleRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const syncDom = (timeSec: number) => {
+      const px = timeSec * zoomPxPerSec;
+      if (needleRef.current) {
+        needleRef.current.style.transform = `translate3d(${px}px, 0, 0)`;
+      }
+      const container = tracksAreaRef.current;
+      if (container) {
+        const viewLeft = container.scrollLeft;
+        const viewRight = viewLeft + container.clientWidth;
+        if (px > viewRight - 24 || px < viewLeft) {
+          container.scrollLeft = Math.max(0, px - container.clientWidth * 0.25);
+        }
+      }
+    };
+
+    syncDom(playbackClock ? playbackClock.getTime() : playheadTime);
+    if (!playbackClock) return;
+    return playbackClock.subscribe(syncDom);
+  }, [playbackClock, playheadTime, zoomPxPerSec, tracksAreaRef]);
+
+  const initialPx = (playbackClock ? playbackClock.getTime() : playheadTime) * zoomPxPerSec;
+
+  return (
+    <div
+      ref={needleRef}
+      style={{ transform: `translate3d(${initialPx}px, 0, 0)` }}
+      className="absolute top-0 bottom-0 left-0 w-px bg-violet-400 pointer-events-none z-20 will-change-transform"
+    >
+      <div className="-translate-x-1/2 w-2.5 h-3 bg-violet-400 rounded-b-sm" />
+    </div>
+  );
+});
+
+const SplitPlayheadButton = React.memo(function SplitPlayheadButton({
+  clips,
+  selectedClipId,
+  playbackClock,
+  fallbackTime = 0,
+  onSplit,
+}: {
+  clips: TimelineClip[];
+  selectedClipId: string | null;
+  playbackClock?: TimelinePlaybackClock;
+  fallbackTime?: number;
+  onSplit: (clipId: string, timeSec: number) => boolean;
+}) {
+  const currentTime = usePlaybackTime(playbackClock, {
+    fallbackTime,
+    throttleMs: 120,
+  });
+
+  const splittableClip = useMemo(() => {
+    if (selectedClipId) {
+      const sel = clips.find((c) => c.id === selectedClipId);
+      if (sel && currentTime > sel.startTime + 0.2 && currentTime < sel.startTime + sel.duration - 0.2) {
+        return sel;
+      }
+    }
+    return (
+      clips.find(
+        (c) => currentTime > c.startTime + 0.2 && currentTime < c.startTime + c.duration - 0.2
+      ) ?? null
+    );
+  }, [clips, selectedClipId, currentTime]);
+
+  return (
+    <button
+      type="button"
+      disabled={!splittableClip}
+      onClick={() => {
+        if (!splittableClip) return;
+        const exactTime = playbackClock ? playbackClock.getTime() : currentTime;
+        onSplit(splittableClip.id, exactTime);
+      }}
+      className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35 transition-colors"
+      title="Split clip at playhead (S)"
+    >
+      <Scissors className="h-3.5 w-3.5 text-blue-400" />
+      <span>Split</span>
+    </button>
+  );
+});
 
 interface TimelineClipItemProps {
   clip: TimelineClip;
@@ -96,9 +197,17 @@ const TimelineClipItem = React.memo(function TimelineClipItem({
   const waveformBars = useMemo(
     () =>
       clip.waveformPeaks?.length
-        ? sliceWaveformPeaksForClip(clip.waveformPeaks, clip, targetBars)
+        ? sliceWaveformPeaksForClip(clip.waveformPeaks, clip, targetBars, clip.assetId)
         : [],
-    [clip.waveformPeaks, clip.inPoint, clip.duration, clip.sourceDuration, clip.speed, targetBars]
+    [
+      clip.waveformPeaks,
+      clip.assetId,
+      clip.inPoint,
+      clip.duration,
+      clip.sourceDuration,
+      clip.speed,
+      targetBars,
+    ]
   );
 
   const { fadeIn, fadeOut } = computeEffectiveFadeDurations(
@@ -157,35 +266,15 @@ const TimelineClipItem = React.memo(function TimelineClipItem({
             : "hover:brightness-110"
       }`}
     >
-      {/* Real Audio PCM Waveform Backdrop */}
+      {/* Real Audio PCM Waveform Canvas */}
       {waveformBars.length > 0 && (
-        <div
-          aria-hidden="true"
-          className={`absolute inset-0 flex pointer-events-none px-0.5 ${
-            clip.kind === "audio"
-              ? "items-center gap-[1px]"
-              : "items-end pb-0.5 gap-[1px] opacity-40"
-          }`}
-        >
-          {waveformBars.map((amp, idx) => {
-            const barHeightPct = Math.max(8, Math.min(92, Math.round(amp * 88 * gainScale)));
-            return (
-              <span
-                key={idx}
-                style={{
-                  height: `${clip.kind === "audio" ? barHeightPct : Math.round(barHeightPct * 0.48)}%`,
-                }}
-                className={`flex-1 rounded-[1px] ${
-                  clip.kind === "audio"
-                    ? isClipMuted
-                      ? "bg-zinc-500/45"
-                      : "bg-sky-300/45"
-                    : "bg-violet-200/45"
-                }`}
-              />
-            );
-          })}
-        </div>
+        <WaveformCanvas
+          bars={waveformBars}
+          widthPx={widthPx}
+          kind={clip.kind}
+          gainScale={gainScale}
+          isMuted={isClipMuted}
+        />
       )}
 
       {/* Visual Fade-In / Fade-Out Envelopes (Audio) */}
@@ -298,9 +387,10 @@ const TimelineClipItem = React.memo(function TimelineClipItem({
   );
 });
 
-export function MultitrackTimeline({
+export const MultitrackTimeline = React.memo(function MultitrackTimeline({
   project,
-  playheadTime,
+  playheadTime = 0,
+  playbackClock,
   onSeek,
   selectedClipId,
   onSelectClip,
@@ -355,18 +445,6 @@ export function MultitrackTimeline({
     }
     return grouped;
   }, [project.clips]);
-
-  // Keep playhead in view during playback
-  useEffect(() => {
-    const el = tracksAreaRef.current;
-    if (!el) return;
-    const playheadPx = playheadTime * zoomPxPerSec;
-    const viewLeft = el.scrollLeft;
-    const viewRight = viewLeft + el.clientWidth;
-    if (playheadPx > viewRight - 24 || playheadPx < viewLeft) {
-      el.scrollLeft = Math.max(0, playheadPx - el.clientWidth * 0.25);
-    }
-  }, [playheadTime, zoomPxPerSec]);
 
   const snapTime = useCallback(
     (t: number): number => {
@@ -448,15 +526,14 @@ export function MultitrackTimeline({
       const initialX = e.clientX;
       const initialStart = clip.startTime;
       let moved = false;
+      let pendingClientX = e.clientX;
+      let pendingClientY = e.clientY;
+      let dragFrameId = 0;
       setDraggingClipId(clip.id);
 
-      const onMove = (moveEv: MouseEvent) => {
-        const deltaPx = moveEv.clientX - initialX;
-        const targetTrackId = resolveCompatibleTrackAtY(
-          moveEv.clientY,
-          clip.kind,
-          clip.trackId
-        );
+      const applyMove = (clientX: number, clientY: number) => {
+        const deltaPx = clientX - initialX;
+        const targetTrackId = resolveCompatibleTrackAtY(clientY, clip.kind, clip.trackId);
         if (Math.abs(deltaPx) > 2 || targetTrackId !== clip.trackId) {
           moved = true;
         }
@@ -468,9 +545,25 @@ export function MultitrackTimeline({
         });
       };
 
+      const onMove = (moveEv: MouseEvent) => {
+        pendingClientX = moveEv.clientX;
+        pendingClientY = moveEv.clientY;
+        if (!dragFrameId) {
+          dragFrameId = requestAnimationFrame(() => {
+            dragFrameId = 0;
+            applyMove(pendingClientX, pendingClientY);
+          });
+        }
+      };
+
       const onUp = () => {
         window.removeEventListener("mousemove", onMove);
         window.removeEventListener("mouseup", onUp);
+        if (dragFrameId) {
+          cancelAnimationFrame(dragFrameId);
+          dragFrameId = 0;
+          applyMove(pendingClientX, pendingClientY);
+        }
         setDraggingClipId(null);
         if (moved) {
           commitProjectSnapshot(beforeSnapshot);
@@ -514,9 +607,11 @@ export function MultitrackTimeline({
 
       const initialX = e.clientX;
       let moved = false;
+      let pendingClientX = e.clientX;
+      let trimFrameId = 0;
 
-      const onMove = (moveEv: MouseEvent) => {
-        const deltaPx = moveEv.clientX - initialX;
+      const applyTrim = (clientX: number) => {
+        const deltaPx = clientX - initialX;
         if (Math.abs(deltaPx) > 1) moved = true;
         const deltaSec = deltaPx / zoomPxPerSec;
         const desiredStart = snapTime(initialClip.startTime + deltaSec);
@@ -527,9 +622,24 @@ export function MultitrackTimeline({
         });
       };
 
+      const onMove = (moveEv: MouseEvent) => {
+        pendingClientX = moveEv.clientX;
+        if (!trimFrameId) {
+          trimFrameId = requestAnimationFrame(() => {
+            trimFrameId = 0;
+            applyTrim(pendingClientX);
+          });
+        }
+      };
+
       const onUp = () => {
         window.removeEventListener("mousemove", onMove);
         window.removeEventListener("mouseup", onUp);
+        if (trimFrameId) {
+          cancelAnimationFrame(trimFrameId);
+          trimFrameId = 0;
+          applyTrim(pendingClientX);
+        }
         if (moved) {
           commitProjectSnapshot(beforeSnapshot);
         }
@@ -563,9 +673,11 @@ export function MultitrackTimeline({
       const initialX = e.clientX;
       const initialDur = clip.duration;
       let moved = false;
+      let pendingClientX = e.clientX;
+      let trimFrameId = 0;
 
-      const onMove = (moveEv: MouseEvent) => {
-        const deltaPx = moveEv.clientX - initialX;
+      const applyTrim = (clientX: number) => {
+        const deltaPx = clientX - initialX;
         if (Math.abs(deltaPx) > 1) moved = true;
         const deltaSec = deltaPx / zoomPxPerSec;
         const desiredDur = snapTime(initialDur + deltaSec);
@@ -576,9 +688,24 @@ export function MultitrackTimeline({
         });
       };
 
+      const onMove = (moveEv: MouseEvent) => {
+        pendingClientX = moveEv.clientX;
+        if (!trimFrameId) {
+          trimFrameId = requestAnimationFrame(() => {
+            trimFrameId = 0;
+            applyTrim(pendingClientX);
+          });
+        }
+      };
+
       const onUp = () => {
         window.removeEventListener("mousemove", onMove);
         window.removeEventListener("mouseup", onUp);
+        if (trimFrameId) {
+          cancelAnimationFrame(trimFrameId);
+          trimFrameId = 0;
+          applyTrim(pendingClientX);
+        }
         if (moved) {
           commitProjectSnapshot(beforeSnapshot);
         }
@@ -590,28 +717,9 @@ export function MultitrackTimeline({
     [commitProjectSnapshot, onSelectClip, snapTime, updateClip, zoomPxPerSec]
   );
 
-  // Find a clip to split: either the selected clip (if playhead is inside it) or any clip under playhead
-  const splittableClip = (() => {
-    if (selectedClipId) {
-      const sel = project.clips.find((c) => c.id === selectedClipId);
-      if (sel && playheadTime > sel.startTime + 0.2 && playheadTime < sel.startTime + sel.duration - 0.2) {
-        return sel;
-      }
-    }
-    return (
-      project.clips.find(
-        (c) => playheadTime > c.startTime + 0.2 && playheadTime < c.startTime + c.duration - 0.2
-      ) ?? null
-    );
-  })();
-
-  const handleSplitAtPlayhead = () => {
-    if (!splittableClip) return;
-    splitClipAtTime(splittableClip.id, playheadTime);
-  };
-
   const handleAddText = () => {
-    const created = addTextOverlay("Title Overlay", playheadTime);
+    const time = playbackClock ? playbackClock.getTime() : playheadTime;
+    const created = addTextOverlay("Title Overlay", time);
     if (created) {
       onSelectClip(created.id);
     }
@@ -626,10 +734,13 @@ export function MultitrackTimeline({
 
   const rulerStep =
     zoomPxPerSec >= 70 ? 1 : zoomPxPerSec >= 36 ? 2 : zoomPxPerSec >= 20 ? 5 : 10;
-  const markers: number[] = [];
-  for (let s = 0; s <= timelineSeconds; s += rulerStep) {
-    markers.push(s);
-  }
+  const markers = useMemo(() => {
+    const list: number[] = [];
+    for (let s = 0; s <= timelineSeconds; s += rulerStep) {
+      list.push(s);
+    }
+    return list;
+  }, [timelineSeconds, rulerStep]);
 
   return (
     <div className="border-t border-zinc-800/80 bg-[#0D0D10] flex flex-col select-none">
@@ -699,16 +810,13 @@ export function MultitrackTimeline({
             <span>Add Text</span>
           </button>
 
-          <button
-            type="button"
-            disabled={!splittableClip}
-            onClick={handleSplitAtPlayhead}
-            className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-35 transition-colors"
-            title="Split clip at playhead (S)"
-          >
-            <Scissors className="h-3.5 w-3.5 text-blue-400" />
-            <span>Split</span>
-          </button>
+          <SplitPlayheadButton
+            clips={project.clips}
+            selectedClipId={selectedClipId}
+            playbackClock={playbackClock}
+            fallbackTime={playheadTime}
+            onSplit={splitClipAtTime}
+          />
 
           <span className="h-4 w-px bg-zinc-800 mx-1" aria-hidden="true" />
 
@@ -992,16 +1100,16 @@ export function MultitrackTimeline({
               );
             })}
 
-            {/* Playhead Needle */}
-            <div
-              style={{ left: `${playheadTime * zoomPxPerSec}px` }}
-              className="absolute top-0 bottom-0 w-px bg-violet-400 pointer-events-none z-20"
-            >
-              <div className="-translate-x-1/2 w-2.5 h-3 bg-violet-400 rounded-b-sm" />
-            </div>
+            {/* Playhead Needle (GPU-composited direct clock subscriber) */}
+            <TimelinePlayheadNeedle
+              playbackClock={playbackClock}
+              playheadTime={playheadTime}
+              zoomPxPerSec={zoomPxPerSec}
+              tracksAreaRef={tracksAreaRef}
+            />
           </div>
         </div>
       </div>
     </div>
   );
-}
+});

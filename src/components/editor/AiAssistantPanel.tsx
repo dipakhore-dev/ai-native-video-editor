@@ -45,6 +45,7 @@ import {
 } from "../../utils/overlays";
 import { formatTimecode } from "../../utils/media";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
+import type { TimelinePlaybackClock } from "../../utils/timelineClock";
 import { SubtitlesPanel } from "./SubtitlesPanel";
 
 export type EditorPanelTab = "inspector" | "assistant" | "subtitles";
@@ -53,7 +54,8 @@ interface AiAssistantPanelProps {
   project: Project;
   selectedClip: TimelineClip | null;
   totalDuration: number;
-  playheadTime: number;
+  playheadTime?: number;
+  playbackClock?: TimelinePlaybackClock;
   onSeek: (time: number) => void;
   activeTab?: EditorPanelTab;
   onTabChange?: (tab: EditorPanelTab) => void;
@@ -77,11 +79,12 @@ const EXAMPLE_PROMPTS = [
   "Convert the video to 9:16.",
 ];
 
-export function AiAssistantPanel({
+export const AiAssistantPanel = React.memo(function AiAssistantPanel({
   project,
   selectedClip,
   totalDuration,
-  playheadTime,
+  playheadTime = 0,
+  playbackClock,
   onSeek,
   activeTab,
   onTabChange,
@@ -128,7 +131,7 @@ export function AiAssistantPanel({
         fps: project.fps,
         durationSeconds: Number(totalDuration.toFixed(2)),
         selectedClipId: selectedClip?.id ?? null,
-        playheadTime: Number(playheadTime.toFixed(2)),
+        playheadTime: Number((playbackClock ? playbackClock.getTime() : playheadTime).toFixed(2)),
         clips: project.clips.map((c) => ({
           id: c.id,
           name: c.name,
@@ -263,6 +266,7 @@ export function AiAssistantPanel({
           project={project}
           selectedClip={selectedClip}
           playheadTime={playheadTime}
+          playbackClock={playbackClock}
           onSeek={onSeek}
         />
       ) : tab === "inspector" ? (
@@ -1542,4 +1546,4 @@ export function AiAssistantPanel({
       )}
     </aside>
   );
-}
+});

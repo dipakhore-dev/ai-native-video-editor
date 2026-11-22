@@ -1,4 +1,5 @@
 import type { SpeechInterval, SubtitleSegment, TimelineClip } from "../types/studio";
+import { waveformCache } from "./mediaCache";
 
 export const SUPPORTED_AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"] as const;
 export const DEFAULT_WAVEFORM_BUCKETS = 160;
@@ -91,14 +92,24 @@ export function computeWaveformPeaksFromChannels(
   });
 }
 
+const inFlightWaveformExtractions = new Map<string, Promise<number[] | undefined>>();
+
 /**
  * Decodes real audio PCM samples locally in the browser using Web Audio API
  * and returns a compact peak array for timeline rendering and IndexedDB caching.
  */
 export async function extractAudioWaveformPeaks(
   blob: Blob,
-  bucketCount = DEFAULT_WAVEFORM_BUCKETS
+  bucketCount = DEFAULT_WAVEFORM_BUCKETS,
+  cacheKey?: string
 ): Promise<number[] | undefined> {
+  if (cacheKey) {
+    const cached = waveformCache.getAssetPeaks(cacheKey);
+    if (cached) return cached;
+    const pending = inFlightWaveformExtractions.get(cacheKey);
+    if (pending) return pending;
+  }
+
   if (typeof window === "undefined") return undefined;
 
   const AudioCtx =
@@ -111,36 +122,58 @@ export async function extractAudioWaveformPeaks(
     return undefined;
   }
 
-  let ctx: AudioContext | null = null;
-  try {
-    const arrayBuffer = await blob.arrayBuffer();
-    ctx = new AudioCtx();
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    const channels: Float32Array[] = [];
-    for (let c = 0; c < Math.min(2, audioBuffer.numberOfChannels); c++) {
-      channels.push(audioBuffer.getChannelData(c));
+  const run = (async () => {
+    let ctx: AudioContext | null = null;
+    try {
+      const arrayBuffer = await blob.arrayBuffer();
+      ctx = new AudioCtx();
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      const channels: Float32Array[] = [];
+      for (let c = 0; c < Math.min(2, audioBuffer.numberOfChannels); c++) {
+        channels.push(audioBuffer.getChannelData(c));
+      }
+      const peaks = computeWaveformPeaksFromChannels(channels, bucketCount);
+      if (peaks.length > 0 && cacheKey) {
+        waveformCache.setAssetPeaks(cacheKey, peaks);
+      }
+      return peaks.length > 0 ? peaks : undefined;
+    } catch {
+      // Expected for silent video files with no audio track or unsupported container codecs
+      return undefined;
+    } finally {
+      if (ctx && typeof ctx.close === "function") {
+        await ctx.close().catch(() => undefined);
+      }
     }
-    const peaks = computeWaveformPeaksFromChannels(channels, bucketCount);
-    return peaks.length > 0 ? peaks : undefined;
-  } catch {
-    // Expected for silent video files with no audio track or unsupported container codecs
-    return undefined;
-  } finally {
-    if (ctx && typeof ctx.close === "function") {
-      await ctx.close().catch(() => undefined);
+  })();
+
+  if (cacheKey) {
+    inFlightWaveformExtractions.set(cacheKey, run);
+    try {
+      return await run;
+    } finally {
+      inFlightWaveformExtractions.delete(cacheKey);
     }
   }
+
+  return run;
 }
 
 /**
- * Slices cached source waveform peaks to match the visible trimmed portion of a TimelineClip.
+ * Slices cached source waveform peaks to match the visible trimmed portion of a TimelineClip,
+ * backed by a bounded LRU cache keyed by clip bounds, speed, source duration, and bar density.
  */
 export function sliceWaveformPeaksForClip(
   peaks: number[] | undefined,
   clip: Pick<TimelineClip, "inPoint" | "duration" | "speed" | "sourceDuration">,
-  targetBars = 64
+  targetBars = 64,
+  cacheKey?: string
 ): number[] {
   if (!peaks || peaks.length === 0) return [];
+
+  const cached = waveformCache.getSlicedBars(peaks, clip, targetBars, cacheKey);
+  if (cached) return cached;
+
   const srcDur = Math.max(0.1, clip.sourceDuration || clip.duration || 1);
   const startFrac = Math.max(0, Math.min(1, clip.inPoint / srcDur));
   const endFrac = Math.max(
@@ -164,6 +197,8 @@ export function sliceWaveformPeaksForClip(
     }
     out.push(Number((sum / Math.max(1, Math.min(slice.length, to) - from)).toFixed(3)));
   }
+
+  waveformCache.setSlicedBars(peaks, clip, targetBars, out, cacheKey);
   return out;
 }
 

@@ -32,11 +32,13 @@ import {
   mapWhisperSegmentsToClip,
   SUBTITLE_LANGUAGE_OPTIONS,
 } from "../../utils/subtitles";
+import { usePlaybackTime, type TimelinePlaybackClock } from "../../utils/timelineClock";
 
 interface SubtitlesPanelProps {
   project: Project;
   selectedClip: TimelineClip | null;
-  playheadTime: number;
+  playheadTime?: number;
+  playbackClock?: TimelinePlaybackClock;
   onSeek: (time: number) => void;
 }
 
@@ -56,12 +58,17 @@ function triggerTextDownload(content: string, filename: string, mimeType: string
   URL.revokeObjectURL(url);
 }
 
-export function SubtitlesPanel({
+export const SubtitlesPanel = React.memo(function SubtitlesPanel({
   project,
   selectedClip,
-  playheadTime,
+  playheadTime = 0,
+  playbackClock,
   onSeek,
 }: SubtitlesPanelProps) {
+  const currentPlayheadTime = usePlaybackTime(playbackClock, {
+    fallbackTime: playheadTime,
+    throttleMs: 140,
+  });
   const {
     mediaAssets,
     isAuthenticated,
@@ -533,9 +540,10 @@ export function SubtitlesPanel({
             </p>
             <button
               type="button"
-              onClick={() =>
-                addSubtitleSegment(playheadTime, playheadTime + 2.5, "New subtitle", targetClip?.id)
-              }
+              onClick={() => {
+                const t = playbackClock ? playbackClock.getTime() : currentPlayheadTime;
+                addSubtitleSegment(t, t + 2.5, "New subtitle", targetClip?.id);
+              }}
               className="inline-flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800"
             >
               <Plus className="h-3 w-3 text-violet-400" />
@@ -553,7 +561,7 @@ export function SubtitlesPanel({
           ) : (
             <div className="space-y-2">
               {subtitles.map((cue, idx) => {
-                const isActive = playheadTime >= cue.start && playheadTime < cue.end;
+                const isActive = currentPlayheadTime >= cue.start && currentPlayheadTime < cue.end;
                 return (
                   <div
                     key={cue.id}
@@ -684,4 +692,4 @@ export function SubtitlesPanel({
       </div>
     </div>
   );
-}
+});

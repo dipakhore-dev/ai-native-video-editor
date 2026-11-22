@@ -31,8 +31,9 @@ import type {
   TextOverlayStyle,
   TimelineClip,
 } from "../types/studio";
-import { DEFAULT_DUCKING_AMOUNT, extractAudioWaveformPeaks } from "../utils/audio";
+import { DEFAULT_DUCKING_AMOUNT, DEFAULT_WAVEFORM_BUCKETS, extractAudioWaveformPeaks } from "../utils/audio";
 import { extractMediaAsset } from "../utils/media";
+import { clearAllMediaCaches, clearAssetMediaCaches, thumbnailCache, waveformCache } from "../utils/mediaCache";
 import {
   checkStorageQuotaForBytes,
   deleteMediaFromIndexedDB,
@@ -208,7 +209,8 @@ function cloneProject(project: Project): Project {
     tracks: project.tracks.map((t) => ({ ...t })),
     clips: project.clips.map((c) => ({
       ...c,
-      waveformPeaks: c.waveformPeaks ? [...c.waveformPeaks] : undefined,
+      // waveformPeaks are immutable normalized samples; keep reference to avoid O(N*160) allocation per drag/undo snapshot
+      waveformPeaks: c.waveformPeaks,
       transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
       transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
       effects: c.effects ? { ...c.effects } : undefined,
@@ -309,6 +311,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       URL.revokeObjectURL(prevUrl);
     }
     activeObjectUrlsRef.current.delete(assetId);
+    clearAssetMediaCaches(assetId);
   }, []);
 
   const refreshStorageEstimate = useCallback(async () => {
@@ -462,6 +465,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
         for (const asset of hydrated) {
           registerTrackedObjectUrl(asset.id, asset.objectUrl);
+          if (asset.thumbnailUrl) {
+            thumbnailCache.setCached(asset.id, asset.thumbnailUrl);
+          }
+          if (asset.waveformPeaks?.length) {
+            waveformCache.setAssetPeaks(asset.id, asset.waveformPeaks);
+          }
         }
 
         mediaAssetsRef.current = hydrated;
@@ -532,6 +541,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         }
       }
       activeObjectUrlsRef.current.clear();
+      clearAllMediaCaches();
     };
   }, [
     hydrateAuthenticatedWorkspace,
@@ -794,6 +804,33 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           registerTrackedObjectUrl(extractedAsset.id, extractedAsset.objectUrl);
           added.push(extractedAsset);
           void syncAssetMetadataToMongo(extractedAsset);
+
+          if (extractedAsset.kind === "video" && !extractedAsset.waveformPeaks) {
+            const targetAsset = extractedAsset;
+            const targetRecord = record;
+            void (async () => {
+              const peaks = await extractAudioWaveformPeaks(file, DEFAULT_WAVEFORM_BUCKETS, targetAsset.id);
+              if (!peaks || peaks.length === 0) return;
+              waveformCache.setAssetPeaks(targetAsset.id, peaks);
+              try {
+                await saveMediaToIndexedDB({
+                  ...targetRecord,
+                  waveformPeaks: peaks,
+                  updatedAt: new Date().toISOString(),
+                });
+              } catch {
+                // Best-effort waveform persistence
+              }
+              setMediaAssets((prev) => {
+                const nextAssets = prev.map((a) =>
+                  a.id === targetAsset.id ? { ...a, waveformPeaks: peaks } : a
+                );
+                mediaAssetsRef.current = nextAssets;
+                setProjects((p) => reconcileProjectsWithMediaAssets(p, nextAssets, true));
+                return nextAssets;
+              });
+            })();
+          }
         } catch (err) {
           if (extractedAsset?.objectUrl.startsWith("blob:")) {
             URL.revokeObjectURL(extractedAsset.objectUrl);
@@ -865,6 +902,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           );
         }
 
+        clearAssetMediaCaches(assetId);
         extracted = await extractMediaAsset(file, assetId);
         const now = new Date().toISOString();
         await saveMediaToIndexedDB({
@@ -1854,78 +1892,154 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setSessionUser((prev) => ({ ...prev, ...patch }));
   }, []);
 
-  const value: StudioContextValue = {
-    route,
-    navigate,
-    sidebarCollapsed,
-    setSidebarCollapsed,
-    projects,
-    activeProject,
-    activeProjectId,
-    setActiveProjectId,
-    createProject,
-    renameProject,
-    duplicateProject,
-    deleteProject,
-    mediaAssets,
-    uploadingMedia,
-    idbHydrating,
-    storageEstimate,
-    refreshStorageEstimate,
-    mediaError,
-    clearMediaError: () => setMediaError(null),
-    uploadLocalFiles,
-    relinkMissingClipAsset,
-    getProjectsUsingAsset,
-    removeMediaAsset,
-    cleanupUnusedMediaAssets,
-    totalMediaBytes,
-    addClipToTimeline,
-    addTextOverlay,
-    updateClip,
-    setClipSpeed,
-    updateTextStyle,
-    commitProjectSnapshot,
-    splitClipAtTime,
-    reorderClip,
-    reorderClipToSlot,
-    moveClipOnTimeline,
-    packTrackGaps,
-    duplicateClip,
-    deleteClip,
-    toggleTrackMute,
-    toggleTrackLock,
-    applyAiEditPlan,
-    replaceClipSubtitles,
-    updateSubtitleSegment,
-    addSubtitleSegment,
-    deleteSubtitleSegment,
-    updateSubtitleStyle,
-    saveSubtitlesToMongo,
-    canUndo: undoStack.length > 0,
-    canRedo: redoStack.length > 0,
-    undo,
-    redo,
-    lastLocalSaveAt,
-    saveTimelineLocally,
-    mongoSaveStatus,
-    lastMongoSaveAt,
-    mongoSaveError,
-    saveTimelineToMongo,
-    exportAttempts,
-    recordExportAttempt,
-    integrations,
-    integrationsLoading,
-    integrationsError,
-    refreshIntegrations,
-    sessionUser,
-    isAuthenticated,
-    updateSessionUser,
-    hydrateAuthenticatedWorkspace,
-    logoutSession,
-    createProjectModalOpen,
-    setCreateProjectModalOpen,
-  };
+  const clearMediaError = useCallback(() => setMediaError(null), []);
+  const canUndo = undoStack.length > 0;
+  const canRedo = redoStack.length > 0;
+
+  const value = useMemo<StudioContextValue>(
+    () => ({
+      route,
+      navigate,
+      sidebarCollapsed,
+      setSidebarCollapsed,
+      projects,
+      activeProject,
+      activeProjectId,
+      setActiveProjectId,
+      createProject,
+      renameProject,
+      duplicateProject,
+      deleteProject,
+      mediaAssets,
+      uploadingMedia,
+      idbHydrating,
+      storageEstimate,
+      refreshStorageEstimate,
+      mediaError,
+      clearMediaError,
+      uploadLocalFiles,
+      relinkMissingClipAsset,
+      getProjectsUsingAsset,
+      removeMediaAsset,
+      cleanupUnusedMediaAssets,
+      totalMediaBytes,
+      addClipToTimeline,
+      addTextOverlay,
+      updateClip,
+      setClipSpeed,
+      updateTextStyle,
+      commitProjectSnapshot,
+      splitClipAtTime,
+      reorderClip,
+      reorderClipToSlot,
+      moveClipOnTimeline,
+      packTrackGaps,
+      duplicateClip,
+      deleteClip,
+      toggleTrackMute,
+      toggleTrackLock,
+      applyAiEditPlan,
+      replaceClipSubtitles,
+      updateSubtitleSegment,
+      addSubtitleSegment,
+      deleteSubtitleSegment,
+      updateSubtitleStyle,
+      saveSubtitlesToMongo,
+      canUndo,
+      canRedo,
+      undo,
+      redo,
+      lastLocalSaveAt,
+      saveTimelineLocally,
+      mongoSaveStatus,
+      lastMongoSaveAt,
+      mongoSaveError,
+      saveTimelineToMongo,
+      exportAttempts,
+      recordExportAttempt,
+      integrations,
+      integrationsLoading,
+      integrationsError,
+      refreshIntegrations,
+      sessionUser,
+      isAuthenticated,
+      updateSessionUser,
+      hydrateAuthenticatedWorkspace,
+      logoutSession,
+      createProjectModalOpen,
+      setCreateProjectModalOpen,
+    }),
+    [
+      route,
+      navigate,
+      sidebarCollapsed,
+      projects,
+      activeProject,
+      activeProjectId,
+      setActiveProjectId,
+      createProject,
+      renameProject,
+      duplicateProject,
+      deleteProject,
+      mediaAssets,
+      uploadingMedia,
+      idbHydrating,
+      storageEstimate,
+      refreshStorageEstimate,
+      mediaError,
+      clearMediaError,
+      uploadLocalFiles,
+      relinkMissingClipAsset,
+      getProjectsUsingAsset,
+      removeMediaAsset,
+      cleanupUnusedMediaAssets,
+      totalMediaBytes,
+      addClipToTimeline,
+      addTextOverlay,
+      updateClip,
+      setClipSpeed,
+      updateTextStyle,
+      commitProjectSnapshot,
+      splitClipAtTime,
+      reorderClip,
+      reorderClipToSlot,
+      moveClipOnTimeline,
+      packTrackGaps,
+      duplicateClip,
+      deleteClip,
+      toggleTrackMute,
+      toggleTrackLock,
+      applyAiEditPlan,
+      replaceClipSubtitles,
+      updateSubtitleSegment,
+      addSubtitleSegment,
+      deleteSubtitleSegment,
+      updateSubtitleStyle,
+      saveSubtitlesToMongo,
+      canUndo,
+      canRedo,
+      undo,
+      redo,
+      lastLocalSaveAt,
+      saveTimelineLocally,
+      mongoSaveStatus,
+      lastMongoSaveAt,
+      mongoSaveError,
+      saveTimelineToMongo,
+      exportAttempts,
+      recordExportAttempt,
+      integrations,
+      integrationsLoading,
+      integrationsError,
+      refreshIntegrations,
+      sessionUser,
+      isAuthenticated,
+      updateSessionUser,
+      hydrateAuthenticatedWorkspace,
+      logoutSession,
+      createProjectModalOpen,
+    ]
+  );
 
   return <StudioContext.Provider value={value}>{children}</StudioContext.Provider>;
 }

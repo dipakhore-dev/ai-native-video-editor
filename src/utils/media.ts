@@ -1,5 +1,6 @@
 import type { MediaAsset, MediaKind, TimelineClip } from "../types/studio";
-import { extractAudioWaveformPeaks, normalizeAudioMimeType } from "./audio";
+import { DEFAULT_WAVEFORM_BUCKETS, extractAudioWaveformPeaks, normalizeAudioMimeType } from "./audio";
+import { thumbnailCache, waveformCache } from "./mediaCache";
 import { getMediaFromIndexedDB } from "./mediaStorage";
 
 export function formatTimecode(seconds: number, showFrames = false, fps = 30): string {
@@ -48,6 +49,45 @@ export function detectMediaKind(file: File): MediaKind | null {
   return null;
 }
 
+const IMMEDIATE_VIDEO_WAVEFORM_MAX_BYTES = 12 * 1024 * 1024;
+
+async function probeVideoDimensionsAndDuration(
+  sourceUrl: string
+): Promise<{ duration: number; width: number; height: number }> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
+
+    let settled = false;
+    const finish = (info: { duration: number; width: number; height: number }) => {
+      if (settled) return;
+      settled = true;
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      try {
+        video.removeAttribute("src");
+        video.load();
+      } catch {
+        // Ignore cleanup failures
+      }
+      resolve(info);
+    };
+
+    video.onloadedmetadata = () => {
+      finish({
+        duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 8,
+        width: video.videoWidth || 1920,
+        height: video.videoHeight || 1080,
+      });
+    };
+    video.onerror = () => finish({ duration: 8, width: 1920, height: 1080 });
+    setTimeout(() => finish({ duration: 8, width: 1920, height: 1080 }), 3500);
+    video.src = sourceUrl;
+  });
+}
+
 export async function extractMediaAsset(
   file: File,
   overrideAssetId?: string
@@ -67,6 +107,12 @@ export async function extractMediaAsset(
         img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
         img.onerror = () => resolve({ width: 1920, height: 1080 });
         img.src = objectUrl;
+      });
+
+      thumbnailCache.setCached(id, objectUrl, {
+        width: dimensions.width,
+        height: dimensions.height,
+        approxBytes: file.size,
       });
 
       return {
@@ -90,13 +136,28 @@ export async function extractMediaAsset(
         new Promise<number>((resolve) => {
           const audio = document.createElement("audio");
           audio.preload = "metadata";
-          audio.onloadedmetadata = () => {
-            resolve(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
+          let settled = false;
+          const finish = (dur: number) => {
+            if (settled) return;
+            settled = true;
+            audio.onloadedmetadata = null;
+            audio.onerror = null;
+            try {
+              audio.removeAttribute("src");
+              audio.load();
+            } catch {
+              // Ignore cleanup failures
+            }
+            resolve(dur);
           };
-          audio.onerror = () => resolve(10);
+          audio.onloadedmetadata = () => {
+            finish(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 10);
+          };
+          audio.onerror = () => finish(10);
+          setTimeout(() => finish(10), 3500);
           audio.src = objectUrl;
         }),
-        extractAudioWaveformPeaks(file),
+        extractAudioWaveformPeaks(file, DEFAULT_WAVEFORM_BUCKETS, id),
       ]);
 
       return {
@@ -113,65 +174,25 @@ export async function extractMediaAsset(
       };
     }
 
-    // Video inspection + canvas thumbnail capture
-    const videoInfo = await new Promise<{
-      duration: number;
-      width: number;
-      height: number;
-      thumbnailUrl?: string;
-    }>((resolve) => {
-      const video = document.createElement("video");
-      video.preload = "metadata";
-      video.muted = true;
-      video.playsInline = true;
+    // Video inspection + deduplicated LRU-cached thumbnail capture
+    const [videoMeta, thumbnailUrl, waveformPeaks] = await Promise.all([
+      probeVideoDimensionsAndDuration(objectUrl),
+      thumbnailCache.getOrCaptureVideoThumbnail({
+        assetId: id,
+        sourceUrl: objectUrl,
+        width: 320,
+        height: 180,
+        timeSec: 0,
+        persistableDataUrl: true,
+      }),
+      file.size <= IMMEDIATE_VIDEO_WAVEFORM_MAX_BYTES
+        ? extractAudioWaveformPeaks(file, DEFAULT_WAVEFORM_BUCKETS, id)
+        : Promise.resolve(undefined),
+    ]);
 
-      let settled = false;
-      const finish = (thumb?: string) => {
-        if (settled) return;
-        settled = true;
-        resolve({
-          duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 8,
-          width: video.videoWidth || 1920,
-          height: video.videoHeight || 1080,
-          thumbnailUrl: thumb,
-        });
-      };
-
-      video.onloadeddata = () => {
-        const targetSeek = Math.min(0.6, Math.max(0.05, (video.duration || 1) * 0.1));
-        try {
-          video.currentTime = targetSeek;
-        } catch {
-          finish(undefined);
-        }
-      };
-
-      video.onseeked = () => {
-        try {
-          const canvas = document.createElement("canvas");
-          const w = 320;
-          const h = Math.max(180, Math.round((video.videoHeight / (video.videoWidth || 16)) * w) || 180);
-          canvas.width = w;
-          canvas.height = h;
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.drawImage(video, 0, 0, w, h);
-            finish(canvas.toDataURL("image/jpeg", 0.78));
-            return;
-          }
-        } catch {
-          // Fallback if canvas capture blocked
-        }
-        finish(undefined);
-      };
-
-      video.onerror = () => finish(undefined);
-      setTimeout(() => finish(undefined), 3500);
-      video.src = objectUrl;
-    });
-
-    // Best-effort waveform extraction for short video clips so audio peaks can render on V1
-    const waveformPeaks = await extractAudioWaveformPeaks(file);
+    if (waveformPeaks?.length) {
+      waveformCache.setAssetPeaks(id, waveformPeaks);
+    }
 
     return {
       id,
@@ -179,11 +200,11 @@ export async function extractMediaAsset(
       kind,
       mimeType: file.type || "video/mp4",
       sizeBytes: file.size,
-      duration: videoInfo.duration,
-      width: videoInfo.width,
-      height: videoInfo.height,
+      duration: videoMeta.duration,
+      width: videoMeta.width,
+      height: videoMeta.height,
       objectUrl,
-      thumbnailUrl: videoInfo.thumbnailUrl,
+      thumbnailUrl,
       waveformPeaks,
       sourceFile: file,
       addedAt: new Date().toISOString(),

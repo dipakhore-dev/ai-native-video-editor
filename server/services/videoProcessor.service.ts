@@ -1,5 +1,7 @@
 import fs from "fs/promises";
-import { openAsBlob } from "fs";
+import type { FileHandle } from "fs/promises";
+import crypto from "crypto";
+import { PassThrough, Readable } from "stream";
 import mongoose from "mongoose";
 import { getEnvConfig } from "../config/env.ts";
 import { MediaAssetModel } from "../models/MediaAsset.ts";
@@ -96,6 +98,7 @@ interface ActiveExportEntry extends ExportProgressSnapshot {
   startedAtMs: number;
   finishedAtMs?: number;
   tempFilePaths: string[];
+  activeUploadPromise: Promise<void> | null;
 }
 
 const activeExportRegistry = new Map<string, ActiveExportEntry>();
@@ -131,6 +134,7 @@ export function registerActiveExport(params: {
     error: null,
     startedAtMs: now,
     tempFilePaths: [...params.tempFilePaths],
+    activeUploadPromise: null,
   });
   return abortController;
 }
@@ -252,6 +256,14 @@ export async function cancelActiveExport(
     );
   }
 
+  // Wait for any in-flight multipart FileHandle streams to finish closing before unlinking temp files
+  if (entry.activeUploadPromise) {
+    await Promise.race([
+      entry.activeUploadPromise.catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+    ]);
+  }
+
   await Promise.all(
     entry.tempFilePaths.map((filePath) => fs.unlink(filePath).catch(() => undefined))
   );
@@ -300,6 +312,238 @@ function createCombinedSignal(externalSignal?: AbortSignal): {
       externalSignal.removeEventListener("abort", onExt);
       timeoutSignal.removeEventListener("abort", onTimeout);
     },
+  };
+}
+
+function sanitizeHeaderToken(raw: string): string {
+  return raw.replace(/[\r\n"]/g, "_");
+}
+
+function isLocalBlobOrFileReadError(err: unknown): boolean {
+  const check = (candidate: unknown): boolean => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const obj = candidate as { name?: string; code?: string; message?: string };
+    const name = String(obj.name || "");
+    const code = String(obj.code || "");
+    const msg = String(obj.message || "").toLowerCase();
+    return (
+      name === "NotReadableError" ||
+      code === "ENOENT" ||
+      code === "EBADF" ||
+      msg.includes("blob could not be read")
+    );
+  };
+  return check(err) || (typeof err === "object" && err !== null && check((err as { cause?: unknown }).cause));
+}
+
+async function createStreamingMultipartUpload(params: {
+  files: Array<{
+    fieldName: string;
+    filePath: string;
+    originalName: string;
+    mimeType: string;
+  }>;
+  fields?: Record<string, string | number | undefined>;
+  signal?: AbortSignal;
+}): Promise<{
+  contentType: string;
+  contentLength: number;
+  body: ReadableStream<Uint8Array>;
+  waitForClose: () => Promise<void>;
+}> {
+  const boundary = `----AIStudioBoundary${crypto.randomBytes(16).toString("hex")}`;
+  const fieldBuffers: Buffer[] = [];
+
+  for (const [key, val] of Object.entries(params.fields ?? {})) {
+    if (val === undefined || val === null || String(val).trim() === "") continue;
+    const safeKey = sanitizeHeaderToken(key);
+    fieldBuffers.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${safeKey}"\r\n\r\n${String(val)}\r\n`,
+        "utf8"
+      )
+    );
+  }
+
+  const openedFiles: Array<{
+    handle: FileHandle;
+    sizeBytes: number;
+    headerBuf: Buffer;
+  }> = [];
+
+  try {
+    for (const f of params.files) {
+      let handle: FileHandle;
+      try {
+        handle = await fs.open(f.filePath, "r");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Temp upload file is missing or unreadable.";
+        throw Object.assign(
+          new Error(`Failed to read uploaded file '${f.originalName}': ${msg}`),
+          { statusCode: 400, cause: err }
+        );
+      }
+
+      try {
+        const stat = await handle.stat();
+        const safeField = sanitizeHeaderToken(f.fieldName);
+        const safeFilename = sanitizeHeaderToken(f.originalName || "upload.bin");
+        const safeMime = (f.mimeType || "application/octet-stream").replace(/[\r\n]/g, "");
+        const headerBuf = Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${safeField}"; filename="${safeFilename}"\r\nContent-Type: ${safeMime}\r\n\r\n`,
+          "utf8"
+        );
+        openedFiles.push({
+          handle,
+          sizeBytes: stat.size,
+          headerBuf,
+        });
+      } catch (err) {
+        await handle.close().catch(() => undefined);
+        throw err;
+      }
+    }
+  } catch (err) {
+    await Promise.all(openedFiles.map((item) => item.handle.close().catch(() => undefined)));
+    throw err;
+  }
+
+  const crlfBuf = Buffer.from("\r\n", "utf8");
+  const endBuf = Buffer.from(`--${boundary}--\r\n`, "utf8");
+
+  let contentLength = endBuf.length;
+  for (const fb of fieldBuffers) contentLength += fb.length;
+  for (const ofile of openedFiles) {
+    contentLength += ofile.headerBuf.length + ofile.sizeBytes + crlfBuf.length;
+  }
+
+  const passThrough = new PassThrough();
+  passThrough.on("error", () => {
+    // Error propagates through webStream/fetch catch without crashing Node
+  });
+
+  let currentReadStream: Readable | null = null;
+  let aborted = Boolean(params.signal?.aborted);
+  let resolveClosed!: () => void;
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+
+  const onAbort = () => {
+    aborted = true;
+    if (currentReadStream && !currentReadStream.destroyed) {
+      currentReadStream.destroy(new Error("Upload stream aborted."));
+    }
+    if (!passThrough.destroyed) {
+      passThrough.destroy(new Error("Upload stream aborted."));
+    }
+  };
+  params.signal?.addEventListener("abort", onAbort, { once: true });
+
+  const writeChunk = async (chunk: Buffer): Promise<void> => {
+    if (aborted || passThrough.destroyed) return;
+    if (!passThrough.write(chunk)) {
+      await new Promise<void>((resolve) => {
+        const onDrain = () => {
+          cleanupWait();
+          resolve();
+        };
+        const onClose = () => {
+          cleanupWait();
+          resolve();
+        };
+        const cleanupWait = () => {
+          passThrough.off("drain", onDrain);
+          passThrough.off("close", onClose);
+          passThrough.off("error", onClose);
+        };
+        passThrough.once("drain", onDrain);
+        passThrough.once("close", onClose);
+        passThrough.once("error", onClose);
+      });
+    }
+  };
+
+  void (async () => {
+    try {
+      for (const fb of fieldBuffers) {
+        if (aborted || passThrough.destroyed) break;
+        await writeChunk(fb);
+      }
+
+      for (const item of openedFiles) {
+        if (aborted || passThrough.destroyed) break;
+        await writeChunk(item.headerBuf);
+        if (item.sizeBytes > 0 && !aborted && !passThrough.destroyed) {
+          await new Promise<void>((resolve, reject) => {
+            const rs = item.handle.createReadStream({ autoClose: false });
+            currentReadStream = rs;
+            const onData = (chunk: Buffer | string) => {
+              const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+              if (aborted || passThrough.destroyed) {
+                rs.destroy();
+                return;
+              }
+              if (!passThrough.write(buf)) {
+                rs.pause();
+                passThrough.once("drain", () => {
+                  if (!rs.destroyed) rs.resume();
+                });
+              }
+            };
+            const onEnd = () => {
+              cleanupStream();
+              resolve();
+            };
+            const onErr = (err: Error) => {
+              cleanupStream();
+              reject(err);
+            };
+            const onClose = () => {
+              cleanupStream();
+              resolve();
+            };
+            const cleanupStream = () => {
+              rs.off("data", onData);
+              rs.off("end", onEnd);
+              rs.off("error", onErr);
+              rs.off("close", onClose);
+              if (currentReadStream === rs) {
+                currentReadStream = null;
+              }
+            };
+            rs.on("data", onData);
+            rs.once("end", onEnd);
+            rs.once("error", onErr);
+            rs.once("close", onClose);
+          });
+        }
+        await item.handle.close().catch(() => undefined);
+        if (!aborted && !passThrough.destroyed) {
+          await writeChunk(crlfBuf);
+        }
+      }
+
+      if (!aborted && !passThrough.destroyed) {
+        await writeChunk(endBuf);
+        passThrough.end();
+      }
+    } catch (err) {
+      if (!passThrough.destroyed) {
+        passThrough.destroy(err instanceof Error ? err : new Error("Multipart stream failed."));
+      }
+    } finally {
+      params.signal?.removeEventListener("abort", onAbort);
+      await Promise.all(openedFiles.map((item) => item.handle.close().catch(() => undefined)));
+      resolveClosed();
+    }
+  })();
+
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    contentLength,
+    body: Readable.toWeb(passThrough) as ReadableStream<Uint8Array>,
+    waitForClose: () => closedPromise,
   };
 }
 
@@ -413,21 +657,37 @@ export async function forwardMetadataFileToPython(params: {
 }): Promise<PythonVideoMetadataResult> {
   const videoProcessorUrl = requireConfiguredProcessorUrl();
 
-  const fileBlob = await openAsBlob(params.filePath, {
-    type: params.mimeType || "application/octet-stream",
+  const upload = await createStreamingMultipartUpload({
+    files: [
+      {
+        fieldName: "file",
+        filePath: params.filePath,
+        originalName: params.originalName,
+        mimeType: params.mimeType || "application/octet-stream",
+      },
+    ],
   });
-  const form = new FormData();
-  form.append("file", fileBlob, params.originalName);
 
   let res: Response;
   try {
     res = await fetch(`${videoProcessorUrl}/api/v1/metadata`, {
       method: "POST",
-      headers: getProcessorHeaders(),
-      body: form,
+      headers: {
+        ...getProcessorHeaders(),
+        "Content-Type": upload.contentType,
+        "Content-Length": String(upload.contentLength),
+      },
+      body: upload.body,
+      duplex: "half",
       signal: AbortSignal.timeout(60_000),
-    });
+    } as RequestInit & { duplex: "half" });
   } catch (err) {
+    if (isLocalBlobOrFileReadError(err)) {
+      throw Object.assign(new Error("Temporary upload file could not be read before processing."), {
+        statusCode: 500,
+        cause: err,
+      });
+    }
     throw Object.assign(
       new Error(
         `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
@@ -438,6 +698,8 @@ export async function forwardMetadataFileToPython(params: {
         cause: err,
       }
     );
+  } finally {
+    await upload.waitForClose();
   }
 
   const body = (await res.json().catch(() => ({}))) as {
@@ -652,30 +914,32 @@ export async function runSyncBinaryVideoOperation(params: {
     }
 
     const videoProcessorUrl = requireConfiguredProcessorUrl();
-    const form = new FormData();
-    for (const f of params.files) {
-      const blob = await openAsBlob(f.filePath, {
-        type: f.mimeType || "application/octet-stream",
-      });
-      form.append(f.fieldName, blob, f.originalName);
-    }
-    for (const [k, v] of Object.entries(params.fields ?? {})) {
-      if (v !== undefined && v !== null && String(v).trim() !== "") {
-        form.append(k, String(v));
-      }
-    }
-    if (params.clientJobId) {
-      form.append("client_job_id", params.clientJobId);
+    const multipartFields: Record<string, string | number | undefined> = {
+      ...(params.fields ?? {}),
+      ...(params.clientJobId ? { client_job_id: params.clientJobId } : {}),
+    };
+    const upload = await createStreamingMultipartUpload({
+      files: params.files,
+      fields: multipartFields,
+      signal,
+    });
+    if (activeEntry) {
+      activeEntry.activeUploadPromise = upload.waitForClose();
     }
 
     let res: Response;
     try {
       res = await fetch(`${videoProcessorUrl}${params.endpointPath}`, {
         method: "POST",
-        headers: getProcessorHeaders(),
-        body: form,
+        headers: {
+          ...getProcessorHeaders(),
+          "Content-Type": upload.contentType,
+          "Content-Length": String(upload.contentLength),
+        },
+        body: upload.body,
+        duplex: "half",
         signal,
-      });
+      } as RequestInit & { duplex: "half" });
     } catch (err) {
       if (params.signal?.aborted || activeEntry?.cancelled) {
         throw Object.assign(new Error("Export cancelled by user."), {
@@ -684,12 +948,20 @@ export async function runSyncBinaryVideoOperation(params: {
           cause: err,
         });
       }
+      if (isLocalBlobOrFileReadError(err)) {
+        throw Object.assign(
+          new Error("Temporary upload media file became unreadable during processing."),
+          { statusCode: 500, cause: err }
+        );
+      }
       throw Object.assign(
         new Error(
           `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
         ),
         { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
       );
+    } finally {
+      await upload.waitForClose();
     }
 
     if (!res.ok) {
@@ -817,30 +1089,46 @@ export async function runSyncSubtitlesGeneration(params: {
 
   try {
     const videoProcessorUrl = requireConfiguredProcessorUrl();
-    const blob = await openAsBlob(params.filePath, {
-      type: params.mimeType || "application/octet-stream",
+    const upload = await createStreamingMultipartUpload({
+      files: [
+        {
+          fieldName: "file",
+          filePath: params.filePath,
+          originalName: params.originalName,
+          mimeType: params.mimeType || "application/octet-stream",
+        },
+      ],
+      fields: params.language ? { language: params.language } : undefined,
     });
-    const form = new FormData();
-    form.append("file", blob, params.originalName);
-    if (params.language) {
-      form.append("language", params.language);
-    }
 
     let res: Response;
     try {
       res = await fetch(`${videoProcessorUrl}/api/v1/subtitles`, {
         method: "POST",
-        headers: getProcessorHeaders(),
-        body: form,
+        headers: {
+          ...getProcessorHeaders(),
+          "Content-Type": upload.contentType,
+          "Content-Length": String(upload.contentLength),
+        },
+        body: upload.body,
+        duplex: "half",
         signal: AbortSignal.timeout(240_000),
-      });
+      } as RequestInit & { duplex: "half" });
     } catch (err) {
+      if (isLocalBlobOrFileReadError(err)) {
+        throw Object.assign(new Error("Temporary upload media file could not be read for subtitle generation."), {
+          statusCode: 500,
+          cause: err,
+        });
+      }
       throw Object.assign(
         new Error(
           `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
         ),
         { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
       );
+    } finally {
+      await upload.waitForClose();
     }
 
     const body = (await res.json().catch(() => ({}))) as Partial<PythonSubtitleResult> & {
