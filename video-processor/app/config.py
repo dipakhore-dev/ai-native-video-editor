@@ -25,7 +25,7 @@ class ProcessorSettings:
 def get_settings() -> ProcessorSettings:
     max_mb = max(1, int(os.getenv("MAX_UPLOAD_MB", "500")))
     probe_timeout = max(5, int(os.getenv("FFPROBE_TIMEOUT_SEC", "30")))
-    ffmpeg_timeout = max(15, int(os.getenv("FFMPEG_TIMEOUT_SEC", "180")))
+    ffmpeg_timeout = max(15, int(os.getenv("FFMPEG_TIMEOUT_SEC", "300")))
     max_short_sec = max(10.0, float(os.getenv("MAX_SHORT_VIDEO_SEC", "300")))
     port_raw = os.getenv("PORT") or os.getenv("VIDEO_PROCESSOR_PORT") or "8001"
     return ProcessorSettings(

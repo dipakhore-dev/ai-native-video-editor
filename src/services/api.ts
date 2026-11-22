@@ -59,6 +59,38 @@ export async function fetchIntegrationStatus(): Promise<
   return requestJson("/api/integrations/status");
 }
 
+export interface VideoProcessorStatusResponse {
+  status: string;
+  processor: {
+    configured: boolean;
+    reachable: boolean;
+    status: "ok" | "degraded" | "unreachable";
+    ffmpegAvailable: boolean;
+    ffprobeAvailable: boolean;
+    fasterWhisperAvailable: boolean;
+    hardwareEncoders?: string[];
+    recommendedEncoder?: string;
+    encoderCapabilities?: Record<string, { available: boolean; label: string; detail: string }>;
+    exportProfiles?: Record<string, { id: string; label: string; resolution: string; description?: string }>;
+    error: string | null;
+  };
+  capabilities: {
+    exportMp4: boolean;
+    localSubtitles: boolean;
+    hardwareEncoding?: boolean;
+    hardwareEncoders?: string[];
+    recommendedEncoder?: string;
+    encoderCapabilities?: Record<string, { available: boolean; label: string; detail: string }>;
+    exportProfiles?: Record<string, { id: string; label: string; resolution: string; description?: string }>;
+  };
+}
+
+export async function fetchVideoProcessorStatus(): Promise<
+  ApiResult<VideoProcessorStatusResponse>
+> {
+  return requestJson("/api/video/status");
+}
+
 export interface TimelineMetadataPayload {
   projectId: string;
   projectName: string;
@@ -178,6 +210,9 @@ export interface ExportMp4BinaryResult {
   filename: string;
   sizeBytes: number;
   jobId: string;
+  exportProfile?: string;
+  encoderUsed?: string;
+  hardwareFallbackUsed?: boolean;
 }
 
 export interface ExportProgressSnapshot {
@@ -316,6 +351,9 @@ export function exportTimelineMp4(
       const match = /filename="?([^";]+)"?/i.exec(disposition);
       const filename = match?.[1] || "export.mp4";
       const jobId = xhr.getResponseHeader("x-video-job-id") || "";
+      const exportProfile = xhr.getResponseHeader("x-export-profile") || undefined;
+      const encoderUsed = xhr.getResponseHeader("x-export-encoder") || undefined;
+      const hardwareFallbackUsed = xhr.getResponseHeader("x-export-fallback") === "1";
 
       finish({
         ok: true,
@@ -325,6 +363,9 @@ export function exportTimelineMp4(
           filename,
           sizeBytes: responseBlob.size,
           jobId,
+          exportProfile,
+          encoderUsed,
+          hardwareFallbackUsed,
         },
       });
     };

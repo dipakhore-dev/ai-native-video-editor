@@ -136,6 +136,8 @@ export interface TimelineClip {
 
 export type AspectRatioOption = "16:9" | "9:16" | "1:1";
 export type ResolutionOption = "1080p" | "4K" | "720p";
+export type ExportProfileId = "fast_preview" | "balanced" | "high_quality";
+export type HardwareEncodingMode = "auto" | "cpu" | "gpu";
 
 export type SubtitlePosition = "bottom" | "middle" | "top";
 
@@ -215,6 +217,8 @@ export interface RenderTimelineClipSpec {
 export interface RenderTimelinePayload {
   schemaVersion: "1.0";
   exportedAt: string;
+  exportProfile?: ExportProfileId;
+  encodingMode?: HardwareEncodingMode;
   project: {
     id: string;
     name: string;
@@ -238,6 +242,9 @@ export interface ExportAttempt {
   projectId: string;
   projectName: string;
   resolution: string;
+  exportProfile?: ExportProfileId;
+  encodingMode?: HardwareEncodingMode;
+  encoderUsed?: string;
   format: "mp4" | "webm" | "mov";
   fps: number;
   clipCount: number;

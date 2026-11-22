@@ -81,6 +81,8 @@ export function ExportsPage() {
                     </td>
                     <td className="py-3.5 px-4 font-mono text-zinc-300 tabular-nums">
                       {item.format.toUpperCase()} · {item.resolution} · {item.fps}fps
+                      {item.exportProfile ? ` · ${item.exportProfile}` : ""}
+                      {item.encoderUsed ? ` · ${item.encoderUsed}` : ""}
                       {item.outputSizeBytes ? ` · ${formatBytes(item.outputSizeBytes)}` : ""}
                     </td>
                     <td className="py-3.5 px-4 font-mono text-zinc-300 text-right tabular-nums">

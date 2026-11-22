@@ -19,13 +19,17 @@ from .schemas import (
     VideoMetadataResponse,
 )
 from .services.ffmpeg_service import (
+    EXPORT_PROFILES,
     VideoProcessingCancelledError,
     VideoProcessingError,
+    detect_hardware_h264_encoders,
     export_mp4,
     export_timeline_mp4,
     generate_thumbnail,
     merge_video_clips,
+    normalize_encoding_mode,
     resize_crop_aspect_ratio,
+    resolve_export_profile_spec,
     trim_video,
     validate_timeline_export_spec,
 )
@@ -91,6 +95,15 @@ def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthRespons
     ffprobe_path = check_binary(settings.ffprobe_bin)
     whisper_ok = is_faster_whisper_available()
     ready = bool(ffmpeg_path and ffprobe_path)
+    hw_caps = (
+        detect_hardware_h264_encoders(settings.ffmpeg_bin)
+        if ffmpeg_path
+        else {
+            "available_hardware_encoders": [],
+            "recommended_encoder": "libx264",
+            "encoders": {},
+        }
+    )
     return HealthResponse(
         status="ok" if ready else "degraded",
         ffmpeg_available=bool(ffmpeg_path),
@@ -98,6 +111,10 @@ def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthRespons
         faster_whisper_available=whisper_ok,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
+        hardware_encoders=list(hw_caps.get("available_hardware_encoders") or []),  # type: ignore[arg-type]
+        recommended_encoder=str(hw_caps.get("recommended_encoder") or "libx264"),
+        encoder_capabilities=dict(hw_caps.get("encoders") or {}),  # type: ignore[arg-type]
+        export_profiles=EXPORT_PROFILES,
     )
 
 
@@ -402,6 +419,10 @@ async def export_mp4_endpoint(
     fps: int = Form(default=30),
     aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None),
     aspect_ratio_camel: Optional[Literal["16:9", "9:16", "1:1"]] = Form(default=None, alias="aspectRatio"),
+    export_profile: Optional[str] = Form(default=None),
+    export_profile_camel: Optional[str] = Form(default=None, alias="exportProfile"),
+    encoding_mode: Optional[str] = Form(default=None),
+    encoding_mode_camel: Optional[str] = Form(default=None, alias="encodingMode"),
     timeline_spec: Optional[str] = Form(default=None),
     timeline_spec_camel: Optional[str] = Form(default=None, alias="timelineSpec"),
     client_job_id: Optional[str] = Form(default=None),
@@ -410,6 +431,8 @@ async def export_mp4_endpoint(
 ) -> FileResponse:
     uploads = [*(files or []), *([file] if file is not None else [])]
     eff_aspect_ratio = aspect_ratio or aspect_ratio_camel
+    raw_profile = export_profile if export_profile is not None else export_profile_camel
+    raw_enc_mode = encoding_mode if encoding_mode is not None else encoding_mode_camel
     raw_spec = timeline_spec if timeline_spec is not None else timeline_spec_camel
     raw_cid = (client_job_id or client_job_id_camel or "").strip()
 
@@ -419,6 +442,13 @@ async def export_mp4_endpoint(
                 'Upload at least one video file using form field "files" or "file".',
                 status_code=400,
             )
+
+        eff_profile_id, eff_profile_resolution, _ = resolve_export_profile_spec(
+            raw_profile,
+            resolution,
+        )
+        eff_encoding_mode = normalize_encoding_mode(raw_enc_mode)
+        eff_resolution = eff_profile_resolution if eff_profile_id is not None else resolution
 
         for upload in uploads:
             validate_upload_headers(
@@ -447,7 +477,7 @@ async def export_mp4_endpoint(
             validate_timeline_export_spec(
                 loaded,
                 num_files=len(uploads),
-                resolution=resolution,
+                resolution=eff_resolution,
                 fps=fps,
                 aspect_ratio=eff_aspect_ratio,
             )
@@ -527,9 +557,11 @@ async def export_mp4_endpoint(
             saved_paths,
             output_path,
             timeline_spec=parsed_spec,
-            resolution=resolution,
+            resolution=eff_resolution,
             fps=fps,
             aspect_ratio=eff_aspect_ratio,
+            export_profile=eff_profile_id,
+            encoding_mode=eff_encoding_mode,
             ffmpeg_bin=settings.ffmpeg_bin,
             ffprobe_bin=settings.ffprobe_bin,
             timeout_sec=settings.ffmpeg_timeout_sec,
@@ -551,7 +583,12 @@ async def export_mp4_endpoint(
             path=output_path,
             media_type="video/mp4",
             filename=output_path.name,
-            headers={"X-Processor-Job-Id": job_id},
+            headers={
+                "X-Processor-Job-Id": job_id,
+                "X-Export-Profile": str(out_meta.get("export_profile") or eff_profile_id or "legacy"),
+                "X-Export-Encoder": str(out_meta.get("encoder_used") or "libx264"),
+                "X-Export-Fallback": "1" if out_meta.get("hardware_fallback_used") else "0",
+            },
             background=BackgroundTask(cleanup_path, job_dir),
         )
     except VideoProcessingCancelledError as exc:

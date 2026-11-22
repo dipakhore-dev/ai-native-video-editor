@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -20,10 +21,326 @@ logger = logging.getLogger("video_processor.ffmpeg")
 AspectRatioTarget = Literal["16:9", "9:16", "1:1"]
 FitMode = Literal["crop", "pad"]
 ResolutionTarget = Literal["720p", "1080p"]
+ExportProfileId = Literal["fast_preview", "balanced", "high_quality"]
+EncodingModeTarget = Literal["auto", "cpu", "gpu"]
 
 StageProgressCallback = Callable[[str, str, int, bool], None]
 SubprocessProgressCallback = Callable[[float, bool], None]
 ProcessAttachCallback = Callable[[Optional[subprocess.Popen[str]]], None]
+
+EXPORT_PROFILES: dict[str, dict[str, object]] = {
+    "fast_preview": {
+        "id": "fast_preview",
+        "label": "Fast Preview",
+        "resolution": "720p",
+        "x264_preset": "ultrafast",
+        "crf": 26,
+        "nvenc_preset": "p1",
+        "nvenc_cq": 28,
+        "qsv_preset": "veryfast",
+        "qsv_quality": 27,
+        "amf_quality": "speed",
+        "amf_qp": 27,
+        "audio_bitrate": "128k",
+        "description": "720p H.264 ultrafast (CRF 26) — fastest render for quick drafts and reviews.",
+    },
+    "balanced": {
+        "id": "balanced",
+        "label": "Balanced",
+        "resolution": "1080p",
+        "x264_preset": "veryfast",
+        "crf": 22,
+        "nvenc_preset": "p4",
+        "nvenc_cq": 23,
+        "qsv_preset": "faster",
+        "qsv_quality": 23,
+        "amf_quality": "balanced",
+        "amf_qp": 22,
+        "audio_bitrate": "192k",
+        "description": "1080p H.264 veryfast (CRF 22) — crisp quality with fast speed and moderate file size.",
+    },
+    "high_quality": {
+        "id": "high_quality",
+        "label": "High Quality",
+        "resolution": "1080p",
+        "x264_preset": "medium",
+        "crf": 19,
+        "nvenc_preset": "p6",
+        "nvenc_cq": 19,
+        "qsv_preset": "medium",
+        "qsv_quality": 19,
+        "amf_quality": "quality",
+        "amf_qp": 19,
+        "audio_bitrate": "192k",
+        "description": "1080p H.264 medium (CRF 19) — highest detail retention and compression efficiency.",
+    },
+}
+
+_LEGACY_PROFILE_SPEC: dict[str, object] = {
+    "id": "balanced",
+    "label": "Balanced",
+    "resolution": "720p",
+    "x264_preset": "veryfast",
+    "crf": 22,
+    "nvenc_preset": "p4",
+    "nvenc_cq": 23,
+    "qsv_preset": "faster",
+    "qsv_quality": 23,
+    "amf_quality": "balanced",
+    "amf_qp": 22,
+    "audio_bitrate": "192k",
+}
+
+_HARDWARE_ENCODER_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("h264_nvenc", "NVIDIA NVENC"),
+    ("h264_qsv", "Intel Quick Sync (QSV)"),
+    ("h264_amf", "AMD AMF"),
+)
+_HW_PROBE_CACHE_LOCK = threading.Lock()
+_HW_PROBE_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
+_HW_PROBE_TTL_SEC = 300.0
+
+
+def clear_hardware_encoder_cache() -> None:
+    with _HW_PROBE_CACHE_LOCK:
+        _HW_PROBE_CACHE.clear()
+
+
+def _sanitize_probe_detail(stderr_text: str, returncode: int) -> str:
+    if returncode == 0:
+        return "Ready"
+    lower = (stderr_text or "").lower()
+    if "unknown encoder" in lower or "encoder" in lower and "not found" in lower:
+        return "Encoder not compiled in this FFmpeg build"
+    if any(tok in lower for tok in ("cuda", "nvenc", "driver", "unsupported device", "cannot load", "no nvenc")):
+        return "GPU driver or device unavailable"
+    if any(tok in lower for tok in ("mfx", "qsv", "vaapi", "d3d11", "dxva", "amf", "init")):
+        return "Hardware acceleration device not initialized"
+    return "Hardware encoder initialization unavailable"
+
+
+def detect_hardware_h264_encoders(
+    ffmpeg_bin: str = "ffmpeg",
+    *,
+    force_refresh: bool = False,
+) -> dict[str, object]:
+    ffmpeg_path = check_binary(ffmpeg_bin)
+    if not ffmpeg_path:
+        return {
+            "software_encoder": "libx264",
+            "available_hardware_encoders": [],
+            "recommended_encoder": "libx264",
+            "encoders": {
+                name: {"available": False, "label": label, "detail": "ffmpeg binary unavailable"}
+                for name, label in _HARDWARE_ENCODER_CANDIDATES
+            },
+        }
+
+    now = time.monotonic()
+    if not force_refresh:
+        with _HW_PROBE_CACHE_LOCK:
+            cached = _HW_PROBE_CACHE.get(ffmpeg_path)
+            if cached and (now - cached[0]) < _HW_PROBE_TTL_SEC:
+                return cached[1]
+
+    available_hw: list[str] = []
+    encoders_info: dict[str, dict[str, object]] = {}
+    for enc_name, enc_label in _HARDWARE_ENCODER_CANDIDATES:
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=256x256:d=0.1:r=24",
+            "-pix_fmt",
+            "nv12" if enc_name == "h264_qsv" else "yuv420p",
+            "-c:v",
+            enc_name,
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ]
+        ok = False
+        detail = "Hardware encoder initialization unavailable"
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            ok = proc.returncode == 0
+            detail = _sanitize_probe_detail(proc.stderr or "", proc.returncode)
+        except Exception:
+            ok = False
+            detail = "Hardware encoder probe failed"
+
+        if ok:
+            available_hw.append(enc_name)
+        encoders_info[enc_name] = {
+            "available": ok,
+            "label": enc_label,
+            "detail": detail,
+        }
+
+    result: dict[str, object] = {
+        "software_encoder": "libx264",
+        "available_hardware_encoders": available_hw,
+        "recommended_encoder": available_hw[0] if available_hw else "libx264",
+        "encoders": encoders_info,
+    }
+    with _HW_PROBE_CACHE_LOCK:
+        _HW_PROBE_CACHE[ffmpeg_path] = (now, result)
+    return result
+
+
+def resolve_export_profile_spec(
+    export_profile: str | None,
+    resolution: ResolutionTarget,
+) -> tuple[Optional[ExportProfileId], ResolutionTarget, dict[str, object]]:
+    if export_profile is None or not str(export_profile).strip():
+        return (None, resolution, {**_LEGACY_PROFILE_SPEC, "resolution": resolution})
+    norm = str(export_profile).strip().lower()
+    if norm not in EXPORT_PROFILES:
+        raise VideoProcessingError(
+            f"Unsupported export profile '{export_profile}'. Choose 'fast_preview', 'balanced', or 'high_quality'.",
+            status_code=400,
+        )
+    spec = EXPORT_PROFILES[norm]
+    eff_res: ResolutionTarget = "1080p" if spec["resolution"] == "1080p" else "720p"
+    return (norm, eff_res, spec)  # type: ignore[return-value]
+
+
+def normalize_encoding_mode(encoding_mode: str | None) -> EncodingModeTarget:
+    if encoding_mode is None or not str(encoding_mode).strip():
+        return "auto"
+    norm = str(encoding_mode).strip().lower()
+    if norm not in ("auto", "cpu", "gpu"):
+        raise VideoProcessingError(
+            f"Unsupported encoding mode '{encoding_mode}'. Choose 'auto', 'cpu', or 'gpu'.",
+            status_code=400,
+        )
+    return norm  # type: ignore[return-value]
+
+
+def _select_video_encoder(
+    encoding_mode: EncodingModeTarget,
+    ffmpeg_bin: str,
+) -> tuple[str, bool]:
+    if encoding_mode == "cpu":
+        return ("libx264", False)
+    caps = detect_hardware_h264_encoders(ffmpeg_bin)
+    hw_list = caps.get("available_hardware_encoders") or []
+    if isinstance(hw_list, list) and len(hw_list) > 0:
+        return (str(hw_list[0]), False)
+    return ("libx264", encoding_mode == "gpu")
+
+
+def _build_video_encode_args(
+    encoder: str,
+    profile_spec: dict[str, object],
+) -> list[str]:
+    if encoder == "h264_nvenc":
+        return [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            str(profile_spec.get("nvenc_preset", "p4")),
+            "-rc",
+            "vbr",
+            "-cq",
+            str(profile_spec.get("nvenc_cq", 23)),
+            "-b:v",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    if encoder == "h264_qsv":
+        return [
+            "-c:v",
+            "h264_qsv",
+            "-preset",
+            str(profile_spec.get("qsv_preset", "faster")),
+            "-global_quality",
+            str(profile_spec.get("qsv_quality", 23)),
+            "-pix_fmt",
+            "nv12",
+        ]
+    if encoder == "h264_amf":
+        return [
+            "-c:v",
+            "h264_amf",
+            "-quality",
+            str(profile_spec.get("amf_quality", "balanced")),
+            "-rc",
+            "cqp",
+            "-qp_i",
+            str(profile_spec.get("amf_qp", 22)),
+            "-qp_p",
+            str(profile_spec.get("amf_qp", 22)),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        str(profile_spec.get("x264_preset", "veryfast")),
+        "-crf",
+        str(profile_spec.get("crf", 22)),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+class _ExportProfiler:
+    """Lightweight time.perf_counter() profiler separating Python and FFmpeg execution times."""
+
+    def __init__(self) -> None:
+        self.export_start = time.perf_counter()
+        self.ffmpeg_exec_sec = 0.0
+        self.stages: dict[str, dict[str, object]] = {}
+
+    def record(
+        self,
+        stage_name: str,
+        *,
+        total_sec: float,
+        ffmpeg_sec: float = 0.0,
+        active: bool = True,
+        note: str = "",
+    ) -> None:
+        safe_total = max(0.0, float(total_sec))
+        safe_ffmpeg = max(0.0, min(safe_total, float(ffmpeg_sec)))
+        safe_python = max(0.0, safe_total - safe_ffmpeg)
+        self.ffmpeg_exec_sec += safe_ffmpeg
+        entry: dict[str, object] = {
+            "total_sec": round(safe_total, 4),
+            "python_sec": round(safe_python, 4),
+            "ffmpeg_sec": round(safe_ffmpeg, 4),
+            "active": bool(active),
+        }
+        if note:
+            entry["note"] = note
+        self.stages[stage_name] = entry
+
+    def finalize(self) -> dict[str, object]:
+        total_export_sec = max(0.0, time.perf_counter() - self.export_start)
+        ffmpeg_sec = min(total_export_sec, self.ffmpeg_exec_sec)
+        python_sec = max(0.0, total_export_sec - ffmpeg_sec)
+        return {
+            "total_export_sec": round(total_export_sec, 4),
+            "ffmpeg_execution_sec": round(ffmpeg_sec, 4),
+            "python_processing_sec": round(python_sec, 4),
+            "stages": self.stages,
+        }
 
 
 class VideoProcessingError(Exception):
@@ -979,34 +1296,30 @@ def _build_audio_clip_chain(
     return f"[{input_label}]{','.join(filters)}"
 
 
-def _render_v1_visual_mp4(
+def _render_unified_visual_mp4(
     v1_segments: Sequence[dict],
+    v2_overlays: Sequence[dict],
     output_path: Path,
     *,
-    resolution: ResolutionTarget,
+    width: int,
+    height: int,
     fps: int,
-    aspect_ratio: AspectRatioTarget | None,
+    ass_path: Path | None,
+    ass_cwd: Path | None,
+    profile_spec: dict[str, object],
+    encoder: str,
     ffmpeg_bin: str,
     ffprobe_bin: str,
     timeout_sec: int,
     progress_cb: Optional[SubprocessProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     process_cb: Optional[ProcessAttachCallback] = None,
-) -> tuple[dict, list[float]]:
+    profiler: Optional[_ExportProfiler] = None,
+) -> tuple[dict, list[float], str, bool]:
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
-    target_w, target_h = _resolve_export_dimensions(resolution, aspect_ratio)
     safe_fps = fps if fps in (24, 30, 60) else 30
 
-    if len(v1_segments) == 1 and aspect_ratio is None and not v1_segments[0]["is_image"]:
-        meta = extract_video_metadata(v1_segments[0]["visual_path"], ffprobe_bin=ffprobe_bin)
-        max_h = 1080 if resolution == "1080p" else 720
-        src_w = int(meta["video"]["width"])
-        src_h = int(meta["video"]["height"])
-        scale_factor = min(1.0, max_h / src_h) if src_h > max_h else 1.0
-        target_w = max(2, int(round(src_w * scale_factor / 2) * 2))
-        target_h = max(2, int(round(src_h * scale_factor / 2) * 2))
-
-    # Determine seam transitions between adjacent V1 segments
+    seam_start = time.perf_counter()
     seam_transitions: list[tuple[str, float]] = []
     for idx in range(len(v1_segments) - 1):
         left = v1_segments[idx]
@@ -1023,62 +1336,91 @@ def _render_v1_visual_mp4(
 
     cmd = [ffmpeg_path, "-y"]
     filter_parts: list[str] = []
+    has_speed_clip = False
+    has_effects_or_tr = False
 
     for idx, seg in enumerate(v1_segments):
-        seg_path = seg["visual_path"]
+        seg_path = Path(seg["src_path"]).resolve()
         seg_dur = float(seg["seg_dur"])
         seg_speed = max(0.5, min(2.0, float(seg.get("speed", 1.0) or 1.0)))
         if seg["is_image"]:
             cmd.extend(["-loop", "1", "-t", f"{seg_dur:.3f}", "-i", str(seg_path)])
         else:
+            src_in = max(0.0, float(seg.get("src_in", 0.0)))
+            src_out = float(seg.get("src_out", seg_dur * seg_speed))
+            src_span = max(0.08, src_out - src_in)
+            src_dur = float(seg["src_meta"].get("duration_seconds", 0.0))
+            if src_in > 0.02:
+                cmd.extend(["-ss", f"{src_in:.3f}"])
+            if src_dur <= 0 or src_span < src_dur - 0.02:
+                cmd.extend(["-t", f"{src_span:.3f}"])
             cmd.extend(["-i", str(seg_path)])
 
         if len(v1_segments) == 1:
             chain_steps = [
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase",
-                f"crop={target_w}:{target_h}",
+                f"scale={width}:{height}:force_original_aspect_ratio=increase",
+                f"crop={width}:{height}",
             ]
         else:
             chain_steps = [
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease",
-                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
             ]
         chain_steps.append("setsar=1")
-        if not seg["is_image"] and abs(seg_speed - 1.0) > 0.005:
-            chain_steps.append(f"setpts=(PTS-STARTPTS)/{seg_speed:.6f}")
+        if not seg["is_image"]:
+            if abs(seg_speed - 1.0) > 0.005:
+                has_speed_clip = True
+                chain_steps.append(f"setpts=(PTS-STARTPTS)/{seg_speed:.6f}")
+            else:
+                chain_steps.append("setpts=PTS-STARTPTS")
         chain_steps.append(f"fps={safe_fps}")
-        chain_steps.extend(
-            _build_visual_effects_filter_steps(
-                seg.get("effects"),
-                opacity=float(seg.get("opacity", 1.0)),
-                is_overlay=False,
-            )
-        )
 
-        # Edge fade-in on first clip and fade-out on last clip
+        fx_steps = _build_visual_effects_filter_steps(
+            seg.get("effects"),
+            opacity=float(seg.get("opacity", 1.0)),
+            is_overlay=False,
+        )
+        if fx_steps:
+            has_effects_or_tr = True
+            chain_steps.extend(fx_steps)
+
         if idx == 0:
             edge_in_type, edge_in_dur = _normalize_transition(
                 seg.get("transition_in"), seg_dur * 0.45
             )
             if edge_in_type != "none":
+                has_effects_or_tr = True
                 chain_steps.append(f"fade=t=in:st=0:d={edge_in_dur:.3f}")
         if idx == len(v1_segments) - 1:
             edge_out_type, edge_out_dur = _normalize_transition(
                 seg.get("transition_out"), seg_dur * 0.45
             )
             if edge_out_type != "none":
+                has_effects_or_tr = True
                 fade_st = max(0.0, seg_dur - edge_out_dur)
                 chain_steps.append(f"fade=t=out:st={fade_st:.3f}:d={edge_out_dur:.3f}")
 
         chain_steps.extend(["format=yuv420p", "settb=AVTB", "setpts=PTS-STARTPTS"])
-        out_label = "[outv]" if len(v1_segments) == 1 else f"[v{idx}]"
+        is_single_no_post = len(v1_segments) == 1 and not v2_overlays and ass_path is None
+        out_label = "[outv]" if is_single_no_post else ("[v1_base]" if len(v1_segments) == 1 else f"[v{idx}]")
         filter_parts.append(f"[{idx}:v]{','.join(chain_steps)}{out_label}")
 
+    seam_overlaps = [d if t != "none" else 0.0 for t, d in seam_transitions]
+    expected_v1_dur = max(
+        0.1,
+        sum(float(s["seg_dur"]) for s in v1_segments) - sum(seam_overlaps),
+    )
+
+    v1_done_label = "[outv]" if (len(v1_segments) == 1 and not v2_overlays and ass_path is None) else "[v1_base]"
     if len(v1_segments) > 1:
+        v1_target = "[v1_base]" if (v2_overlays or ass_path is not None) else "[outv]"
+        v1_done_label = v1_target
         has_seam_xfade = any(t != "none" and d > 0.05 for t, d in seam_transitions)
+        if has_seam_xfade:
+            has_effects_or_tr = True
         if not has_seam_xfade:
             concat_inputs = "".join(f"[v{i}]" for i in range(len(v1_segments)))
-            filter_parts.append(f"{concat_inputs}concat=n={len(v1_segments)}:v=1:a=0[outv]")
+            filter_parts.append(f"{concat_inputs}concat=n={len(v1_segments)}:v=1:a=0{v1_target}")
         else:
             cur_label = "[v0]"
             cur_dur = float(v1_segments[0]["seg_dur"])
@@ -1086,7 +1428,7 @@ def _render_v1_visual_mp4(
                 nxt_label = f"[v{idx + 1}]"
                 nxt_dur = float(v1_segments[idx + 1]["seg_dur"])
                 t_type, t_dur = seam_transitions[idx]
-                out_lbl = "[outv]" if idx == len(v1_segments) - 2 else f"[vx{idx + 1}]"
+                out_lbl = v1_target if idx == len(v1_segments) - 2 else f"[vx{idx + 1}]"
                 if t_type != "none" and t_dur > 0.05:
                     ff_tr = _XFADE_TRANSITION_MAP.get(t_type, "fade")
                     offset = max(0.0, cur_dur - t_dur)
@@ -1099,39 +1441,165 @@ def _render_v1_visual_mp4(
                     cur_dur += nxt_dur
                 cur_label = out_lbl
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd.extend([
+    fx_build_sec = time.perf_counter() - seam_start
+    if profiler is not None:
+        profiler.record(
+            "playback_speed_processing",
+            total_sec=0.0,
+            active=has_speed_clip,
+            note="Fused into single-pass visual filtergraph" if has_speed_clip else "No speed != 1.0",
+        )
+        profiler.record(
+            "effects_and_transitions",
+            total_sec=fx_build_sec,
+            active=has_effects_or_tr,
+            note="Fused into single-pass visual filtergraph" if has_effects_or_tr else "No custom effects/transitions",
+        )
+
+    v2_prep_start = time.perf_counter()
+    cur_comp_label = v1_done_label
+    next_input_idx = len(v1_segments)
+    for idx, ov in enumerate(v2_overlays):
+        in_idx = next_input_idx + idx
+        tl_start = max(0.0, float(ov["tl_start"]))
+        tl_end = min(expected_v1_dur, float(ov["tl_end"]))
+        clip_dur = max(0.1, tl_end - tl_start)
+        ov_speed = max(0.5, min(2.0, float(ov.get("speed", 1.0) or 1.0)))
+        ov_src_path = Path(ov["src_path"]).resolve()
+
+        if ov["is_image"]:
+            cmd.extend(["-loop", "1", "-t", f"{clip_dur:.3f}", "-i", str(ov_src_path)])
+            ov_steps = [f"setpts=PTS-STARTPTS+{tl_start:.3f}/TB"]
+        else:
+            src_in = max(0.0, float(ov["src_in"]))
+            src_out = float(ov["src_out"])
+            src_span = max(0.05, src_out - src_in)
+            src_dur = float(ov["src_meta"].get("duration_seconds", 0.0))
+            if src_in > 0.02:
+                cmd.extend(["-ss", f"{src_in:.3f}"])
+            if src_dur <= 0 or src_span < src_dur - 0.02:
+                cmd.extend(["-t", f"{src_span:.3f}"])
+            cmd.extend(["-i", str(ov_src_path)])
+            ov_steps = [
+                f"setpts=(PTS-STARTPTS)/{ov_speed:.6f}+{tl_start:.3f}/TB",
+            ]
+
+        x_frac, y_frac, box_w, box_h, lock_aspect = _normalize_overlay_transform(
+            ov.get("overlay_transform"),
+            width,
+            height,
+        )
+        if lock_aspect:
+            scale_step = f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease"
+        else:
+            scale_step = f"scale={box_w}:{box_h},setsar=1"
+
+        ov_steps.extend([scale_step, f"fps={safe_fps}"])
+        ov_steps.extend(
+            _build_visual_effects_filter_steps(
+                ov.get("effects"),
+                opacity=float(ov.get("opacity", 1.0)),
+                is_overlay=True,
+            )
+        )
+
+        tr_in_type, tr_in_dur = _normalize_transition(ov.get("transition_in"), clip_dur * 0.45)
+        tr_out_type, tr_out_dur = _normalize_transition(ov.get("transition_out"), clip_dur * 0.45)
+        if tr_in_type != "none":
+            ov_steps.append(f"fade=t=in:st={tl_start:.3f}:d={tr_in_dur:.3f}:alpha=1")
+        if tr_out_type != "none":
+            out_st = max(tl_start, tl_end - tr_out_dur)
+            ov_steps.append(f"fade=t=out:st={out_st:.3f}:d={tr_out_dur:.3f}:alpha=1")
+
+        ov_lbl = f"[ov_{idx}]"
+        is_last_ov = idx == len(v2_overlays) - 1
+        next_lbl = "[outv]" if (is_last_ov and ass_path is None) else (
+            "[comp_v]" if is_last_ov else f"[base{idx + 1}]"
+        )
+        filter_parts.append(f"[{in_idx}:v]{','.join(ov_steps)}{ov_lbl}")
+        filter_parts.append(
+            f"{cur_comp_label}{ov_lbl}overlay=x='round(W*{x_frac:.5f}-w/2)':y='round(H*{y_frac:.5f}-h/2)':enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
+        )
+        cur_comp_label = next_lbl
+
+    if profiler is not None:
+        profiler.record(
+            "v2_overlay_compositing",
+            total_sec=time.perf_counter() - v2_prep_start if v2_overlays else 0.0,
+            active=len(v2_overlays) > 0,
+            note="Fused into single-pass visual filtergraph" if v2_overlays else "No V2 overlays",
+        )
+
+    if ass_path is not None:
+        filter_parts.append(f"{cur_comp_label}ass={ass_path.name}[outv]")
+        cur_comp_label = "[outv]"
+
+    resolved_out = output_path.resolve()
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
+    base_cmd = [
+        *cmd,
         "-filter_complex",
         ";".join(filter_parts),
         "-map",
-        "[outv]",
+        cur_comp_label,
         "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ])
-    seam_overlaps = [d if t != "none" else 0.0 for t, d in seam_transitions]
-    expected_v1_dur = max(
-        0.1,
-        sum(float(s["seg_dur"]) for s in v1_segments) - sum(seam_overlaps),
-    )
-    _run_ffmpeg(
-        cmd,
-        timeout_sec,
-        expected_duration_sec=expected_v1_dur,
-        progress_cb=progress_cb,
-        cancel_event=cancel_event,
-        process_cb=process_cb,
-    )
-    return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin), seam_overlaps
+    ]
+    tail_args = ["-movflags", "+faststart", str(resolved_out)]
+
+    active_encoder = encoder
+    fallback_used = False
+    encode_cmd = [*base_cmd, *_build_video_encode_args(active_encoder, profile_spec), *tail_args]
+
+    ffmpeg_run_start = time.perf_counter()
+    try:
+        _run_ffmpeg(
+            encode_cmd,
+            timeout_sec,
+            cwd=ass_cwd.resolve() if ass_cwd is not None else None,
+            expected_duration_sec=expected_v1_dur,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            process_cb=process_cb,
+        )
+    except VideoProcessingCancelledError:
+        raise
+    except VideoProcessingError as exc:
+        if active_encoder != "libx264" and exc.status_code != 504:
+            logger.warning(
+                "Hardware encoder '%s' failed during export (%s); falling back to libx264.",
+                active_encoder,
+                exc,
+            )
+            active_encoder = "libx264"
+            fallback_used = True
+            fallback_cmd = [*base_cmd, *_build_video_encode_args("libx264", profile_spec), *tail_args]
+            _run_ffmpeg(
+                fallback_cmd,
+                timeout_sec,
+                cwd=ass_cwd.resolve() if ass_cwd is not None else None,
+                expected_duration_sec=expected_v1_dur,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                process_cb=process_cb,
+            )
+        else:
+            raise
+    ffmpeg_run_sec = time.perf_counter() - ffmpeg_run_start
+
+    probe_start = time.perf_counter()
+    out_meta = extract_video_metadata(resolved_out, ffprobe_bin=ffprobe_bin)
+    probe_sec = time.perf_counter() - probe_start
+
+    if profiler is not None:
+        profiler.record(
+            "visual_single_pass_encode",
+            total_sec=ffmpeg_run_sec + probe_sec,
+            ffmpeg_sec=ffmpeg_run_sec,
+            active=True,
+            note=f"encoder={active_encoder}, fallback={fallback_used}",
+        )
+
+    return out_meta, seam_overlaps, active_encoder, fallback_used
 
 
 def _normalize_overlay_transform(
@@ -1170,154 +1638,6 @@ def _normalize_overlay_transform(
     box_w -= box_w % 2
     box_h -= box_h % 2
     return x_pct / 100.0, y_pct / 100.0, max(2, box_w), max(2, box_h), lock_aspect
-
-
-def _composite_v2_overlays_mp4(
-    base_video_path: Path,
-    v2_overlays: Sequence[dict],
-    output_path: Path,
-    *,
-    width: int,
-    height: int,
-    fps: int,
-    rendered_duration: float,
-    ffmpeg_bin: str,
-    ffprobe_bin: str,
-    timeout_sec: int,
-    progress_cb: Optional[SubprocessProgressCallback] = None,
-    cancel_event: Optional[threading.Event] = None,
-    process_cb: Optional[ProcessAttachCallback] = None,
-) -> dict:
-    ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
-    cmd = [ffmpeg_path, "-y", "-i", str(base_video_path)]
-    filter_parts: list[str] = ["[0:v]setpts=PTS-STARTPTS[base0]"]
-    cur_label = "[base0]"
-
-    for idx, ov in enumerate(v2_overlays):
-        in_idx = idx + 1
-        tl_start = max(0.0, float(ov["tl_start"]))
-        tl_end = min(rendered_duration, float(ov["tl_end"]))
-        clip_dur = max(0.1, tl_end - tl_start)
-        ov_speed = max(0.5, min(2.0, float(ov.get("speed", 1.0) or 1.0)))
-
-        if ov["is_image"]:
-            cmd.extend(["-loop", "1", "-t", f"{clip_dur:.3f}", "-i", str(ov["src_path"])])
-            ov_steps = [f"setpts=PTS-STARTPTS+{tl_start:.3f}/TB"]
-        else:
-            cmd.extend(["-i", str(ov["src_path"])])
-            ov_steps = [
-                f"trim=start={ov['src_in']:.3f}:end={ov['src_out']:.3f}",
-                f"setpts=(PTS-STARTPTS)/{ov_speed:.6f}+{tl_start:.3f}/TB",
-            ]
-
-        x_frac, y_frac, box_w, box_h, lock_aspect = _normalize_overlay_transform(
-            ov.get("overlay_transform"),
-            width,
-            height,
-        )
-        if lock_aspect:
-            scale_step = f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease"
-        else:
-            scale_step = f"scale={box_w}:{box_h},setsar=1"
-
-        ov_steps.extend([
-            scale_step,
-            f"fps={fps}",
-        ])
-        ov_steps.extend(
-            _build_visual_effects_filter_steps(
-                ov.get("effects"),
-                opacity=float(ov.get("opacity", 1.0)),
-                is_overlay=True,
-            )
-        )
-
-        tr_in_type, tr_in_dur = _normalize_transition(ov.get("transition_in"), clip_dur * 0.45)
-        tr_out_type, tr_out_dur = _normalize_transition(ov.get("transition_out"), clip_dur * 0.45)
-        if tr_in_type != "none":
-            ov_steps.append(f"fade=t=in:st={tl_start:.3f}:d={tr_in_dur:.3f}:alpha=1")
-        if tr_out_type != "none":
-            out_st = max(tl_start, tl_end - tr_out_dur)
-            ov_steps.append(f"fade=t=out:st={out_st:.3f}:d={tr_out_dur:.3f}:alpha=1")
-
-        ov_lbl = f"[ov_{idx}]"
-        next_lbl = "[outv]" if idx == len(v2_overlays) - 1 else f"[base{idx + 1}]"
-        filter_parts.append(f"[{in_idx}:v]{','.join(ov_steps)}{ov_lbl}")
-        filter_parts.append(
-            f"{cur_label}{ov_lbl}overlay=x='round(W*{x_frac:.5f}-w/2)':y='round(H*{y_frac:.5f}-h/2)':enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
-        )
-        cur_label = next_lbl
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd.extend([
-        "-filter_complex",
-        ";".join(filter_parts),
-        "-map",
-        cur_label,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ])
-    _run_ffmpeg(
-        cmd,
-        timeout_sec,
-        expected_duration_sec=rendered_duration,
-        progress_cb=progress_cb,
-        cancel_event=cancel_event,
-        process_cb=process_cb,
-    )
-    return extract_video_metadata(output_path, ffprobe_bin=ffprobe_bin)
-
-
-def export_timeline_mp4(
-    uploaded_files: Sequence[Path],
-    output_path: Path,
-    *,
-    timeline_spec: dict | None = None,
-    resolution: ResolutionTarget = "720p",
-    fps: int = 30,
-    aspect_ratio: AspectRatioTarget | None = None,
-    ffmpeg_bin: str = "ffmpeg",
-    ffprobe_bin: str = "ffprobe",
-    timeout_sec: int = 240,
-    max_duration_sec: float = 300.0,
-    progress_cb: Optional[StageProgressCallback] = None,
-    cancel_event: Optional[threading.Event] = None,
-    process_cb: Optional[ProcessAttachCallback] = None,
-) -> dict:
-    if cancel_event is not None and cancel_event.is_set():
-        raise VideoProcessingCancelledError()
-
-    if not uploaded_files:
-        raise VideoProcessingError("Upload at least one video file to export.", status_code=400)
-
-    if timeline_spec is None:
-        return export_mp4(
-            uploaded_files[0],
-            output_path,
-            resolution=resolution,
-            fps=fps,
-            aspect_ratio=aspect_ratio,
-            ffmpeg_bin=ffmpeg_bin,
-            ffprobe_bin=ffprobe_bin,
-            timeout_sec=timeout_sec,
-            max_duration_sec=max_duration_sec,
-            progress_cb=progress_cb,
-            cancel_event=cancel_event,
-            process_cb=process_cb,
-        )
-
-    if progress_cb is not None:
-        progress_cb("probing", "Inspecting media streams", 5, False)
 
 _VALID_TRANSITION_TYPES = set(_XFADE_TRANSITION_MAP.keys()) | {"none"}
 _VALID_EFFECT_PRESETS = set(_EFFECT_PRESET_SPECS.keys())
@@ -1377,9 +1697,18 @@ def validate_timeline_export_spec(
             status_code=400,
         )
 
-    eff_resolution: ResolutionTarget = (
-        "1080p" if (resolution == "1080p" or proj_res == "1080p") else "720p"
-    )
+    raw_profile = timeline_spec.get("exportProfile")
+    if raw_profile is not None and str(raw_profile).strip():
+        _, profile_res, _ = resolve_export_profile_spec(str(raw_profile), resolution)
+        eff_resolution: ResolutionTarget = profile_res
+    else:
+        eff_resolution = (
+            "1080p" if (resolution == "1080p" or proj_res == "1080p") else "720p"
+        )
+
+    raw_enc_mode = timeline_spec.get("encodingMode")
+    if raw_enc_mode is not None:
+        normalize_encoding_mode(str(raw_enc_mode))
 
     raw_fps = project_meta.get("fps") or fps
     try:
@@ -1700,6 +2029,8 @@ def export_timeline_mp4(
     resolution: ResolutionTarget = "720p",
     fps: int = 30,
     aspect_ratio: AspectRatioTarget | None = None,
+    export_profile: ExportProfileId | None = None,
+    encoding_mode: EncodingModeTarget = "auto",
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     timeout_sec: int = 240,
@@ -1714,11 +2045,29 @@ def export_timeline_mp4(
     if not uploaded_files:
         raise VideoProcessingError("Upload at least one video file to export.", status_code=400)
 
+    raw_profile_arg: str | None = export_profile
+    if raw_profile_arg is None and isinstance(timeline_spec, dict) and timeline_spec.get("exportProfile"):
+        raw_profile_arg = str(timeline_spec.get("exportProfile"))
+    raw_enc_arg: str | None = encoding_mode
+    if (
+        (raw_enc_arg is None or raw_enc_arg == "auto")
+        and isinstance(timeline_spec, dict)
+        and timeline_spec.get("encodingMode")
+    ):
+        raw_enc_arg = str(timeline_spec.get("encodingMode"))
+
+    resolved_profile_id, profile_res, profile_spec = resolve_export_profile_spec(
+        raw_profile_arg,
+        resolution,
+    )
+    eff_encoding_mode = normalize_encoding_mode(raw_enc_arg)
+    target_resolution: ResolutionTarget = profile_res if resolved_profile_id is not None else resolution
+
     if timeline_spec is None:
         return export_mp4(
             uploaded_files[0],
             output_path,
-            resolution=resolution,
+            resolution=target_resolution,
             fps=fps,
             aspect_ratio=aspect_ratio,
             ffmpeg_bin=ffmpeg_bin,
@@ -1730,12 +2079,14 @@ def export_timeline_mp4(
             process_cb=process_cb,
         )
 
+    profiler = _ExportProfiler()
+
     if progress_cb is not None:
         progress_cb("probing", "Inspecting media streams", 5, False)
 
     ffmpeg_path = _require_ffmpeg(ffmpeg_bin)
     (
-        eff_resolution,
+        spec_resolution,
         eff_fps,
         eff_aspect,
         muted_tracks,
@@ -1749,11 +2100,13 @@ def export_timeline_mp4(
     ) = validate_timeline_export_spec(
         timeline_spec,
         num_files=len(uploaded_files),
-        resolution=resolution,
+        resolution=target_resolution,
         fps=fps,
         aspect_ratio=aspect_ratio,
     )
+    eff_resolution: ResolutionTarget = profile_res if resolved_profile_id is not None else spec_resolution
 
+    probe_start = time.perf_counter()
     v1_source_metas: dict[int, dict] = {}
     for clip, f_idx in zip(sorted_v1, v1_file_indices):
         if f_idx in v1_source_metas:
@@ -1770,6 +2123,9 @@ def export_timeline_mp4(
     for clip, f_idx in zip(sorted_v2, v2_file_indices):
         if f_idx in v2_source_metas:
             continue
+        if f_idx in v1_source_metas:
+            v2_source_metas[f_idx] = v1_source_metas[f_idx]
+            continue
         if _is_image_clip(clip, uploaded_files[f_idx]):
             v2_source_metas[f_idx] = {"duration_seconds": 0.0, "has_audio": False, "is_image": True}
         else:
@@ -1780,11 +2136,16 @@ def export_timeline_mp4(
 
     a1_source_metas: dict[int, dict] = {}
     for f_idx in set(a1_file_indices):
-        a1_source_metas[f_idx] = extract_audio_metadata(
-            uploaded_files[f_idx],
-            ffprobe_bin=ffprobe_bin,
-        )
+        if f_idx in v1_source_metas and bool(v1_source_metas[f_idx].get("has_audio")):
+            a1_source_metas[f_idx] = v1_source_metas[f_idx]
+        else:
+            a1_source_metas[f_idx] = extract_audio_metadata(
+                uploaded_files[f_idx],
+                ffprobe_bin=ffprobe_bin,
+            )
+    profiler.record("metadata_probing", total_sec=time.perf_counter() - probe_start, active=True)
 
+    v1_prep_start = time.perf_counter()
     v1_prepared_clips: list[dict] = []
     total_v1_duration = 0.0
     for idx, clip in enumerate(sorted_v1):
@@ -1861,36 +2222,86 @@ def export_timeline_mp4(
             status_code=400,
         )
 
-    # Validate active V2 and A1 processed segment workloads upfront before rendering
-    if "track_v2" not in muted_tracks:
+    profiler.record(
+        "v1_clip_preparation_and_trimming",
+        total_sec=time.perf_counter() - v1_prep_start,
+        active=True,
+        note="Direct input-side -ss/-t seeking (zero intermediate H.264 pre-encode)",
+    )
+
+    # Estimate rendered visual duration (accounts for V1 seam xfade overlaps) before filtering V2/T1
+    est_overlaps: list[float] = []
+    for idx in range(len(v1_prepared_clips) - 1):
+        left = v1_prepared_clips[idx]
+        right = v1_prepared_clips[idx + 1]
+        max_seam = min(left["seg_dur"] * 0.45, right["seg_dur"] * 0.45)
+        t_out_type, t_out_dur = _normalize_transition(left.get("transition_out"), max_seam)
+        t_in_type, t_in_dur = _normalize_transition(right.get("transition_in"), max_seam)
+        if t_out_type != "none":
+            est_overlaps.append(t_out_dur)
+        elif t_in_type != "none":
+            est_overlaps.append(t_in_dur)
+        else:
+            est_overlaps.append(0.0)
+    expected_v1_dur = max(0.1, total_v1_duration - sum(est_overlaps))
+
+    # Validate & prepare active V2 overlays upfront so they fuse cleanly into single visual pass
+    v2_track_muted = "track_v2" in muted_tracks
+    active_v2_overlays: list[dict] = []
+    if not v2_track_muted:
         for idx, clip in enumerate(sorted_v2):
             if float(clip.get("opacity", 1.0)) <= 0.005:
                 continue
             tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
             tl_dur = max(0.1, float(clip.get("durationSec", 1.0)))
-            tl_end = min(total_v1_duration, tl_start + tl_dur)
-            if tl_start >= total_v1_duration - 0.02 or tl_end - tl_start < 0.05:
+            tl_end = min(expected_v1_dur, tl_start + tl_dur)
+            if tl_start >= expected_v1_dur - 0.02 or tl_end - tl_start < 0.05:
                 continue
             f_idx = v2_file_indices[idx]
+            src_path = uploaded_files[f_idx]
             src_meta = v2_source_metas[f_idx]
-            if bool(src_meta.get("is_image")):
-                continue
-            ov_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
+            is_image = bool(src_meta.get("is_image"))
+            ov_speed = 1.0 if is_image else max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
             src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
             src_dur = float(src_meta.get("duration_seconds", 0.0))
-            if src_dur > 0 and src_in >= src_dur:
-                continue
             src_out = src_in + (tl_end - tl_start) * ov_speed
-            effective_out = min(src_out, src_dur) if src_dur > 0 else src_out
-            src_span = effective_out - src_in
-            if src_span > max_duration_sec:
+            if not is_image and src_dur > 0:
+                if src_in >= src_dur:
+                    continue
+                src_out = min(src_out, src_dur)
+                if src_out <= src_in + 0.05:
+                    continue
+                tl_end = min(expected_v1_dur, tl_start + (src_out - src_in) / ov_speed)
+            if not is_image and (src_out - src_in) > max_duration_sec:
                 clip_name = str(clip.get("sourceName") or clip.get("name") or f"V2 clip #{idx + 1}")
                 raise VideoProcessingError(
-                    f"Processed overlay segment duration ({src_span:.1f}s) on '{clip_name}' exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
+                    f"Processed overlay segment duration ({src_out - src_in:.1f}s) on '{clip_name}' exceeds synchronous short-video limit ({max_duration_sec:.0f}s).",
                     status_code=400,
                 )
 
-    if "track_a1" not in muted_tracks:
+            active_v2_overlays.append({
+                "src_path": src_path,
+                "src_meta": src_meta,
+                "is_image": is_image,
+                "tl_start": tl_start,
+                "tl_end": tl_end,
+                "src_in": src_in,
+                "src_out": src_out,
+                "speed": ov_speed,
+                "opacity": float(clip.get("opacity", 1.0)),
+                "volume": float(clip.get("volume", 1.0)),
+                "muted": bool(clip.get("muted", False)) or v2_track_muted or is_image,
+                "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
+                "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
+                "transition_in": clip.get("transitionIn"),
+                "transition_out": clip.get("transitionOut"),
+                "effects": clip.get("effects"),
+                "overlay_transform": clip.get("overlayTransform"),
+            })
+
+    # Validate & prepare active A1 workload upfront
+    a1_track_muted = "track_a1" in muted_tracks
+    if not a1_track_muted:
         for idx, clip in enumerate(sorted_a1):
             if bool(clip.get("muted", False)) or float(clip.get("volume", 1.0)) <= 0.001:
                 continue
@@ -1925,217 +2336,18 @@ def export_timeline_mp4(
                     status_code=400,
                 )
 
-    # Plan active multi-pass progress slices cleanly in [10, 96]
-    v2_track_muted = "track_v2" in muted_tracks
-    has_potential_v2 = (not v2_track_muted) and any(
-        float(c.get("opacity", 1.0)) > 0.005 for c in sorted_v2
-    )
     t1_track_muted = "track_t1" in muted_tracks
-    has_potential_t1 = (not t1_track_muted) and len(sorted_t1) > 0
     burn_subs = bool(timeline_spec.get("burnSubtitles"))
-    has_potential_ass = burn_subs or has_potential_t1
-    a1_track_muted = "track_a1" in muted_tracks
-    has_potential_a1 = (not a1_track_muted) and any(
-        (not bool(c.get("muted", False))) and float(c.get("volume", 1.0)) > 0.001
-        for c in sorted_a1
-    )
-    has_potential_v1_audio = any(
-        bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
-        for item in v1_prepared_clips
-    )
-    has_potential_audio = has_potential_v1_audio or has_potential_a1 or has_potential_v2
-
-    stage_weights: list[tuple[str, float]] = [("v1", 45.0)]
-    if has_potential_v2:
-        stage_weights.append(("v2", 25.0))
-    if has_potential_audio:
-        stage_weights.append(("audio", 15.0))
-    if has_potential_ass:
-        stage_weights.append(("ass", 25.0))
-    total_weight = sum(w for _, w in stage_weights) or 1.0
-    stage_ranges: dict[str, tuple[int, int]] = {}
-    cursor_pct = 10.0
-    for key, w in stage_weights:
-        span = (w / total_weight) * 86.0
-        stage_ranges[key] = (int(round(cursor_pct)), int(round(cursor_pct + span)))
-        cursor_pct += span
-
-    def _emit_stage_progress(key: str, stage: str, label: str, frac: float, measurable: bool) -> None:
-        if progress_cb is None:
-            return
-        start_p, end_p = stage_ranges.get(key, (10, 96))
-        pct = start_p + int(round(max(0.0, min(1.0, frac)) * max(1, end_p - start_p))) if measurable else start_p
-        progress_cb(stage, label, pct, measurable)
-
-    work_dir = output_path.parent / "_timeline_work"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    v1_visual_segments: list[dict] = []
-
-    for idx, item in enumerate(v1_prepared_clips):
-        if cancel_event is not None and cancel_event.is_set():
-            raise VideoProcessingCancelledError()
-        src_path = item["src_path"]
-        is_image = bool(item["is_image"])
-        if is_image:
-            visual_path = src_path
-        else:
-            src_duration = float(item["src_meta"]["duration_seconds"])
-            src_in = float(item["src_in"])
-            effective_out = float(item["src_out"])
-            needs_trim = src_in > 0.05 or (src_duration > 0 and effective_out < src_duration - 0.05)
-
-            if needs_trim:
-                trimmed_path = work_dir / f"v1_seg_{idx}_trim.mp4"
-                trim_video(
-                    src_path,
-                    trimmed_path,
-                    start_sec=src_in,
-                    end_sec=effective_out,
-                    ffmpeg_bin=ffmpeg_bin,
-                    ffprobe_bin=ffprobe_bin,
-                    timeout_sec=timeout_sec,
-                    max_duration_sec=max_duration_sec,
-                    enforce_source_limit=False,
-                    cancel_event=cancel_event,
-                    process_cb=process_cb,
-                )
-                visual_path = trimmed_path
-            else:
-                visual_path = src_path
-
-        v1_visual_segments.append({
-            "visual_path": visual_path,
-            "is_image": is_image,
-            "seg_dur": item["seg_dur"],
-            "speed": item["speed"],
-            "opacity": item["opacity"],
-            "transition_in": item["transition_in"],
-            "transition_out": item["transition_out"],
-            "effects": item["effects"],
-        })
-
-    # Render V1 visual frames (with speed, effects, opacity & xfade transitions)
-    v1_visual_mp4 = work_dir / "v1_visual_only.mp4"
-    _emit_stage_progress("v1", "rendering_v1", "Rendering V1 timeline & effects", 0.0, True)
-    visual_meta, seam_overlaps = _render_v1_visual_mp4(
-        v1_visual_segments,
-        v1_visual_mp4,
-        resolution=eff_resolution,
-        fps=eff_fps,
-        aspect_ratio=eff_aspect,
-        ffmpeg_bin=ffmpeg_bin,
-        ffprobe_bin=ffprobe_bin,
-        timeout_sec=timeout_sec,
-        progress_cb=lambda frac, m: _emit_stage_progress(
-            "v1", "rendering_v1", "Rendering V1 timeline & effects", frac, m
-        ),
-        cancel_event=cancel_event,
-        process_cb=process_cb,
-    )
-    rendered_duration = float(visual_meta["duration_seconds"]) or total_v1_duration
-    out_w = int(visual_meta["video"]["width"])
-    out_h = int(visual_meta["video"]["height"])
-
-    # Composite active V2 overlays onto visual track
-    active_v2_overlays: list[dict] = []
-    if not v2_track_muted:
-        for idx, clip in enumerate(sorted_v2):
-            tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
-            tl_dur = max(0.1, float(clip.get("durationSec", 1.0)))
-            tl_end = min(rendered_duration, tl_start + tl_dur)
-            if tl_start >= rendered_duration - 0.02 or tl_end - tl_start < 0.05:
-                continue
-            opacity = float(clip.get("opacity", 1.0))
-            if opacity <= 0.005:
-                continue
-
-            f_idx = v2_file_indices[idx]
-            src_path = uploaded_files[f_idx]
-            src_meta = v2_source_metas[f_idx]
-            is_image = bool(src_meta.get("is_image"))
-            ov_speed = 1.0 if is_image else max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
-            src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
-            src_dur = float(src_meta.get("duration_seconds", 0.0))
-            src_out = src_in + (tl_end - tl_start) * ov_speed
-            if not is_image and src_dur > 0:
-                src_out = min(src_out, src_dur)
-                if src_out <= src_in + 0.05:
-                    continue
-                tl_end = min(rendered_duration, tl_start + (src_out - src_in) / ov_speed)
-
-            ov_src_path = src_path
-            ov_src_in = src_in
-            ov_src_out = src_out
-            if not is_image:
-                needs_v2_trim = (
-                    src_in > 0.05
-                    or (src_dur > 0 and src_out < src_dur - 0.05)
-                    or src_dur > max_duration_sec
-                )
-                if needs_v2_trim:
-                    trimmed_v2_path = work_dir / f"v2_seg_{idx}_trim.mp4"
-                    trim_video(
-                        src_path,
-                        trimmed_v2_path,
-                        start_sec=src_in,
-                        end_sec=src_out,
-                        ffmpeg_bin=ffmpeg_bin,
-                        ffprobe_bin=ffprobe_bin,
-                        timeout_sec=timeout_sec,
-                        max_duration_sec=max_duration_sec,
-                        enforce_source_limit=False,
-                        cancel_event=cancel_event,
-                        process_cb=process_cb,
-                    )
-                    ov_src_path = trimmed_v2_path
-                    ov_src_in = 0.0
-                    ov_src_out = max(0.05, src_out - src_in)
-
-            active_v2_overlays.append({
-                "src_path": ov_src_path,
-                "src_meta": src_meta,
-                "is_image": is_image,
-                "tl_start": tl_start,
-                "tl_end": tl_end,
-                "src_in": ov_src_in,
-                "src_out": ov_src_out,
-                "speed": ov_speed,
-                "opacity": opacity,
-                "volume": float(clip.get("volume", 1.0)),
-                "muted": bool(clip.get("muted", False)) or v2_track_muted or is_image,
-                "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
-                "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
-                "transition_in": clip.get("transitionIn"),
-                "transition_out": clip.get("transitionOut"),
-                "effects": clip.get("effects"),
-                "overlay_transform": clip.get("overlayTransform"),
-            })
-
-    if active_v2_overlays:
-        visual_only_mp4 = work_dir / "v1_v2_composited.mp4"
-        _emit_stage_progress("v2", "compositing_v2", "Compositing V2 overlays", 0.0, True)
-        visual_meta = _composite_v2_overlays_mp4(
-            v1_visual_mp4,
-            active_v2_overlays,
-            visual_only_mp4,
-            width=out_w,
-            height=out_h,
-            fps=eff_fps,
-            rendered_duration=rendered_duration,
-            ffmpeg_bin=ffmpeg_bin,
-            ffprobe_bin=ffprobe_bin,
-            timeout_sec=timeout_sec,
-            progress_cb=lambda frac, m: _emit_stage_progress(
-                "v2", "compositing_v2", "Compositing V2 overlays", frac, m
-            ),
-            cancel_event=cancel_event,
-            process_cb=process_cb,
-        )
+    if burn_subs:
+        subtitles = timeline_spec.get("subtitles")
+        if not isinstance(subtitles, list) or len(subtitles) == 0:
+            raise VideoProcessingError(
+                "Subtitle burn-in is enabled, but there are no subtitle cues to burn.",
+                status_code=400,
+            )
     else:
-        visual_only_mp4 = v1_visual_mp4
+        subtitles = []
 
-    # Prepare active T1 text overlays
-    t1_track_muted = "track_t1" in muted_tracks
     active_t1_overlays: list[dict] = []
     if not t1_track_muted:
         for clip in sorted_t1:
@@ -2145,8 +2357,8 @@ def export_timeline_mp4(
                 continue
             tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
             tl_dur = max(0.1, float(clip.get("durationSec", 1.0)))
-            tl_end = min(rendered_duration, tl_start + tl_dur)
-            if tl_start >= rendered_duration - 0.02 or tl_end - tl_start < 0.05:
+            tl_end = min(expected_v1_dur, tl_start + tl_dur)
+            if tl_start >= expected_v1_dur - 0.02 or tl_end - tl_start < 0.05:
                 continue
             opacity = float(clip.get("opacity", 1.0))
             if opacity <= 0.005:
@@ -2160,443 +2372,498 @@ def export_timeline_mp4(
                 "textStyle": {**t_style, "text": text_val},
             })
 
-    # Prepare A1 active audio clips
-    active_a1_clips: list[dict] = []
-    for idx, clip in enumerate(sorted_a1):
-        if a1_track_muted or bool(clip.get("muted", False)):
-            continue
-        vol = float(clip.get("volume", 1.0))
-        if vol <= 0.001:
-            continue
-        tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
-        if tl_start >= rendered_duration - 0.02:
-            continue
-
-        f_idx = a1_file_indices[idx]
-        src_path = uploaded_files[f_idx]
-        src_meta = a1_source_metas[f_idx]
-        src_duration = float(src_meta["duration_seconds"])
-        a1_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
-        src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
-        default_out = (
-            src_in + float(clip["durationSec"]) * a1_speed
-            if "durationSec" in clip
-            else src_duration
-        )
-        src_out = float(clip.get("sourceOutSec", default_out))
-        if src_out <= src_in:
-            continue
-        if src_duration > 0 and src_in >= src_duration:
-            continue
-        effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
-        if effective_out - src_in < 0.05:
-            continue
-
-        active_a1_clips.append({
-            "src_path": src_path,
-            "src_duration": src_duration,
-            "src_in": src_in,
-            "src_out": effective_out,
-            "tl_start": tl_start,
-            "speed": a1_speed,
-            "volume": vol,
-            "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
-            "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
-            "ducking_enabled": bool(clip.get("duckingEnabled", False)),
-            "ducking_amount": float(
-                clip.get("duckingAmount", 0.6) if clip.get("duckingAmount") is not None else 0.6
-            ),
-        })
-
-    v1_has_any_audible = any(
-        bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
-        for item in v1_prepared_clips
-    )
-    needs_sidechain_key = (
-        len(active_a1_clips) > 0
-        and any(c["ducking_enabled"] for c in active_a1_clips)
-        and v1_has_any_audible
-    )
-    speech_intervals = _merge_speech_intervals(
-        timeline_spec.get("speechIntervals"),
-        timeline_spec.get("subtitles"),
-    )
-
-    if burn_subs:
-        subtitles = timeline_spec.get("subtitles")
-        if not isinstance(subtitles, list) or len(subtitles) == 0:
-            raise VideoProcessingError(
-                "Subtitle burn-in is enabled, but there are no subtitle cues to burn.",
-                status_code=400,
-            )
-    else:
-        subtitles = []
-
-    active_v2_audio_clips = [
-        item
-        for item in active_v2_overlays
-        if not item["is_image"]
-        and bool(item["src_meta"].get("has_audio"))
-        and not item["muted"]
-        and item["volume"] > 0.001
-    ]
-
     needs_ass_pass = burn_subs or len(active_t1_overlays) > 0
-    raw_export_path = work_dir / "pre_ass_pass.mp4" if needs_ass_pass else output_path
-    raw_export_path.parent.mkdir(parents=True, exist_ok=True)
 
-    has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0 or len(active_v2_audio_clips) > 0
+    # Resolve target canvas dimensions up front (preserving single-clip auto-aspect behavior)
+    target_w, target_h = _resolve_export_dimensions(eff_resolution, eff_aspect)
+    if len(v1_prepared_clips) == 1 and eff_aspect is None and not v1_prepared_clips[0]["is_image"]:
+        single_meta = v1_prepared_clips[0]["src_meta"]
+        max_h = 1080 if eff_resolution == "1080p" else 720
+        src_w = int(single_meta["video"]["width"])
+        src_h = int(single_meta["video"]["height"])
+        scale_factor = min(1.0, max_h / src_h) if src_h > max_h else 1.0
+        target_w = max(2, int(round(src_w * scale_factor / 2) * 2))
+        target_h = max(2, int(round(src_h * scale_factor / 2) * 2))
 
-    if not has_output_audio:
-        shutil.copy2(visual_only_mp4, raw_export_path)
-        rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
-    else:
-        _emit_stage_progress("audio", "mixing_audio", "Mixing audio tracks & fades", 0.0, True)
-        audio_cmd = [ffmpeg_path, "-y"]
-        audio_filters: list[str] = []
-        input_idx = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="_timeline_work_", dir=str(output_path.parent)))
 
-        v1_mix_label: str | None = None
-        v1_key_label: str | None = None
+    try:
 
-        if v1_has_any_audible:
-            v1_seg_labels: list[str] = []
-            for s_idx, item in enumerate(v1_prepared_clips):
-                seg_dur = float(item["seg_dur"])
-                has_src_audio = bool(item["src_meta"].get("has_audio"))
-                if not has_src_audio or item["muted"] or item["volume"] <= 0.001:
-                    audio_filters.append(
-                        f"anullsrc=channel_layout=stereo:sample_rate=44100:d={seg_dur:.3f}[v1a_{s_idx}]"
-                    )
-                else:
-                    v1_audio_path = item["src_path"]
-                    v1_a_in = float(item["src_in"])
-                    v1_a_out = float(item["src_out"])
-                    v1_src_dur = float(item["src_meta"].get("duration_seconds", 0.0))
-                    if (
-                        v1_a_in > 0.05
-                        or (v1_src_dur > 0 and v1_a_out < v1_src_dur - 0.05)
-                        or v1_src_dur > max_duration_sec
-                    ):
-                        trimmed_v1_wav = work_dir / f"v1_seg_{s_idx}_audio_trim.wav"
-                        _trim_audio_segment(
-                            v1_audio_path,
-                            trimmed_v1_wav,
-                            start_sec=v1_a_in,
-                            end_sec=v1_a_out,
-                            ffmpeg_bin=ffmpeg_bin,
-                            ffprobe_bin=ffprobe_bin,
-                            timeout_sec=timeout_sec,
-                            cancel_event=cancel_event,
-                            process_cb=process_cb,
-                        )
-                        v1_audio_path = trimmed_v1_wav
-                        v1_a_out = max(0.05, v1_a_out - v1_a_in)
-                        v1_a_in = 0.0
-
-                    cur_in_idx = input_idx
-                    audio_cmd.extend(["-i", str(v1_audio_path)])
-                    input_idx += 1
-                    chain = _build_audio_clip_chain(
-                        f"{cur_in_idx}:a",
-                        src_in=v1_a_in,
-                        src_out=v1_a_out,
-                        volume=item["volume"],
-                        fade_in=item["fade_in"],
-                        fade_out=item["fade_out"],
-                        speed=item["speed"],
-                    )
-                    audio_filters.append(f"{chain}[v1a_{s_idx}]")
-                v1_seg_labels.append(f"[v1a_{s_idx}]")
-
-            if len(v1_seg_labels) == 1:
-                v1_joined = v1_seg_labels[0]
-            elif not any(d > 0.05 for d in seam_overlaps):
-                v1_joined = f"{''.join(v1_seg_labels)}concat=n={len(v1_seg_labels)}:v=0:a=1"
-            else:
-                cur_albl = v1_seg_labels[0]
-                for s_idx in range(len(v1_seg_labels) - 1):
-                    nxt_albl = v1_seg_labels[s_idx + 1]
-                    overlap_d = seam_overlaps[s_idx] if s_idx < len(seam_overlaps) else 0.0
-                    out_albl = f"[v1aj_{s_idx + 1}]"
-                    if overlap_d > 0.05:
-                        audio_filters.append(
-                            f"{cur_albl}{nxt_albl}acrossfade=d={overlap_d:.3f}:c1=tri:c2=tri{out_albl}"
-                        )
-                    else:
-                        audio_filters.append(f"{cur_albl}{nxt_albl}concat=n=2:v=0:a=1{out_albl}")
-                    cur_albl = out_albl
-                v1_joined = cur_albl
-
-            v1_base_chain = (
-                f"{v1_joined}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
-                if v1_joined.startswith("[") and not v1_joined.endswith("=1")
-                else f"{v1_joined},apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
+        ass_path: Path | None = None
+        t1_prep_start = time.perf_counter()
+        if needs_ass_pass:
+            style = (
+                timeline_spec.get("subtitleStyle")
+                if isinstance(timeline_spec.get("subtitleStyle"), dict)
+                else {}
             )
-            if needs_sidechain_key and len(speech_intervals) == 0:
-                audio_filters.append(f"{v1_base_chain},asplit=2[v1_out][v1_sc_raw]")
-                v1_mix_label = "[v1_out]"
-                v1_key_label = "[v1_sc_raw]"
-            else:
-                audio_filters.append(f"{v1_base_chain}[v1_out]")
-                v1_mix_label = "[v1_out]"
+            ass_path = work_dir / "overlays_and_subtitles.ass"
+            _write_ass_subtitles(
+                subtitles if burn_subs else [],
+                style,
+                ass_path,
+                width=target_w,
+                height=target_h,
+                text_overlays=active_t1_overlays,
+            )
+        profiler.record(
+            "t1_text_rendering",
+            total_sec=time.perf_counter() - t1_prep_start if needs_ass_pass else 0.0,
+            active=needs_ass_pass,
+            note="ASS script generated upfront and burned inside single visual pass" if needs_ass_pass else "No T1/subtitles",
+        )
 
-        a1_clip_labels: list[str] = []
-        sidechain_duck_clips = [
-            c for c in active_a1_clips if c["ducking_enabled"] and len(speech_intervals) == 0 and v1_key_label
+        # Determine audible clips before visual render so silent timelines can write directly to output_path
+        active_a1_clips: list[dict] = []
+        for idx, clip in enumerate(sorted_a1):
+            if a1_track_muted or bool(clip.get("muted", False)):
+                continue
+            vol = float(clip.get("volume", 1.0))
+            if vol <= 0.001:
+                continue
+            tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
+            if tl_start >= expected_v1_dur - 0.02:
+                continue
+
+            f_idx = a1_file_indices[idx]
+            src_path = uploaded_files[f_idx]
+            src_meta = a1_source_metas[f_idx]
+            src_duration = float(src_meta["duration_seconds"])
+            a1_speed = max(0.5, min(2.0, float(clip.get("speed", 1.0) or 1.0)))
+            src_in = max(0.0, float(clip.get("sourceInSec", 0.0)))
+            default_out = (
+                src_in + float(clip["durationSec"]) * a1_speed
+                if "durationSec" in clip
+                else src_duration
+            )
+            src_out = float(clip.get("sourceOutSec", default_out))
+            if src_out <= src_in or (src_duration > 0 and src_in >= src_duration):
+                continue
+            effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
+            if effective_out - src_in < 0.05:
+                continue
+
+            active_a1_clips.append({
+                "src_path": src_path,
+                "src_duration": src_duration,
+                "src_in": src_in,
+                "src_out": effective_out,
+                "tl_start": tl_start,
+                "speed": a1_speed,
+                "volume": vol,
+                "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
+                "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
+                "ducking_enabled": bool(clip.get("duckingEnabled", False)),
+                "ducking_amount": float(
+                    clip.get("duckingAmount", 0.6) if clip.get("duckingAmount") is not None else 0.6
+                ),
+            })
+
+        v1_has_any_audible = any(
+            bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
+            for item in v1_prepared_clips
+        )
+        active_v2_audio_clips = [
+            item
+            for item in active_v2_overlays
+            if not item["is_image"]
+            and bool(item["src_meta"].get("has_audio"))
+            and not item["muted"]
+            and item["volume"] > 0.001
         ]
-        sc_key_splits: list[str] = []
-        if sidechain_duck_clips and v1_key_label:
-            if len(sidechain_duck_clips) == 1:
-                sc_key_splits = ["[v1_sc_0]"]
-                audio_filters.append(
-                    f"{v1_key_label}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[v1_sc_0]"
-                )
-            else:
-                sc_raw_splits = [f"[v1_sc_raw_{i}]" for i in range(len(sidechain_duck_clips))]
-                sc_key_splits = [f"[v1_sc_{i}]" for i in range(len(sidechain_duck_clips))]
-                audio_filters.append(
-                    f"{v1_key_label}asplit={len(sidechain_duck_clips)}{''.join(sc_raw_splits)}"
-                )
-                for raw_lbl, fmt_lbl in zip(sc_raw_splits, sc_key_splits):
-                    audio_filters.append(
-                        f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{fmt_lbl}"
-                    )
+        has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0 or len(active_v2_audio_clips) > 0
 
-        sc_split_cursor = 0
-        for a_idx, item in enumerate(active_a1_clips):
-            a1_src_path = item["src_path"]
-            a1_in = float(item["src_in"])
-            a1_out = float(item["src_out"])
-            a1_src_dur = float(item.get("src_duration", 0.0))
-            if (
-                a1_in > 0.05
-                or (a1_src_dur > 0 and a1_out < a1_src_dur - 0.05)
-                or a1_src_dur > max_duration_sec
-            ):
-                trimmed_a1_wav = work_dir / f"a1_seg_{a_idx}_trim.wav"
-                _trim_audio_segment(
-                    a1_src_path,
-                    trimmed_a1_wav,
-                    start_sec=a1_in,
-                    end_sec=a1_out,
-                    ffmpeg_bin=ffmpeg_bin,
-                    ffprobe_bin=ffprobe_bin,
-                    timeout_sec=timeout_sec,
-                    cancel_event=cancel_event,
-                    process_cb=process_cb,
-                )
-                a1_src_path = trimmed_a1_wav
-                a1_out = max(0.05, a1_out - a1_in)
-                a1_in = 0.0
+        stage_weights: list[tuple[str, float]] = [("visual", 82.0)]
+        if has_output_audio:
+            stage_weights.append(("audio", 18.0))
+        total_weight = sum(w for _, w in stage_weights) or 1.0
+        stage_ranges: dict[str, tuple[int, int]] = {}
+        cursor_pct = 10.0
+        for key, w in stage_weights:
+            span = (w / total_weight) * 86.0
+            stage_ranges[key] = (int(round(cursor_pct)), int(round(cursor_pct + span)))
+            cursor_pct += span
 
-            cur_in_idx = input_idx
-            audio_cmd.extend(["-i", str(a1_src_path)])
-            input_idx += 1
+        def _emit_stage_progress(key: str, stage: str, label: str, frac: float, measurable: bool) -> None:
+            if progress_cb is None:
+                return
+            start_p, end_p = stage_ranges.get(key, (10, 96))
+            pct = start_p + int(round(max(0.0, min(1.0, frac)) * max(1, end_p - start_p))) if measurable else start_p
+            progress_cb(stage, label, pct, measurable)
 
-            base_chain = _build_audio_clip_chain(
-                f"{cur_in_idx}:a",
-                src_in=a1_in,
-                src_out=a1_out,
-                volume=item["volume"],
-                fade_in=item["fade_in"],
-                fade_out=item["fade_out"],
-                speed=item["speed"],
-            )
-            cur_label = f"[a1_base_{a_idx}]"
-            audio_filters.append(f"{base_chain}{cur_label}")
+        chosen_encoder, pre_fallback = _select_video_encoder(eff_encoding_mode, ffmpeg_bin)
+        visual_label_parts = ["V1 timeline"]
+        if active_v2_overlays:
+            visual_label_parts.append("V2 overlays")
+        if needs_ass_pass:
+            visual_label_parts.append("subtitles/titles")
+        visual_stage_label = f"Rendering {' & '.join(visual_label_parts)}"
 
-            if item["tl_start"] > 0.01:
-                delay_ms = int(round(item["tl_start"] * 1000))
-                delayed_label = f"[a1_del_{a_idx}]"
-                audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
-                cur_label = delayed_label
-
-            padded_label = f"[a1_pad_{a_idx}]"
-            audio_filters.append(
-                f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
-                f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
-            )
-            cur_label = padded_label
-
-            if item["ducking_enabled"] and item["ducking_amount"] > 0.01:
-                if speech_intervals:
-                    duck_expr = _build_interval_ducking_expr(speech_intervals, item["ducking_amount"])
-                    ducked_label = f"[a1_duck_{a_idx}]"
-                    audio_filters.append(
-                        f"{cur_label}volume='{duck_expr}':eval=frame{ducked_label}"
-                    )
-                    cur_label = ducked_label
-                elif sc_split_cursor < len(sc_key_splits):
-                    key_lbl = sc_key_splits[sc_split_cursor]
-                    sc_split_cursor += 1
-                    duck_mix = max(0.1, min(1.0, item["ducking_amount"]))
-                    ducked_label = f"[a1_scduck_{a_idx}]"
-                    audio_filters.append(
-                        f"{cur_label}{key_lbl}sidechaincompress=threshold=0.04:ratio=6:attack=40:release=350:mix={duck_mix:.2f}{ducked_label}"
-                    )
-                    cur_label = ducked_label
-
-            a1_clip_labels.append(cur_label)
-
-        v2_audio_labels: list[str] = []
-        for v2_idx, item in enumerate(active_v2_audio_clips):
-            cur_in_idx = input_idx
-            audio_cmd.extend(["-i", str(item["src_path"])])
-            input_idx += 1
-
-            base_chain = _build_audio_clip_chain(
-                f"{cur_in_idx}:a",
-                src_in=item["src_in"],
-                src_out=item["src_out"],
-                volume=item["volume"],
-                fade_in=item["fade_in"],
-                fade_out=item["fade_out"],
-                speed=item["speed"],
-            )
-            cur_label = f"[v2a_base_{v2_idx}]"
-            audio_filters.append(f"{base_chain}{cur_label}")
-
-            if item["tl_start"] > 0.01:
-                delay_ms = int(round(item["tl_start"] * 1000))
-                delayed_label = f"[v2a_del_{v2_idx}]"
-                audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
-                cur_label = delayed_label
-
-            padded_label = f"[v2a_pad_{v2_idx}]"
-            audio_filters.append(
-                f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
-                f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
-            )
-            v2_audio_labels.append(padded_label)
-
-        mix_inputs: list[str] = []
-        if v1_mix_label:
-            mix_inputs.append(v1_mix_label)
-        mix_inputs.extend(v2_audio_labels)
-        mix_inputs.extend(a1_clip_labels)
-
-        any_boost = (
-            any(
-                item["volume"] > 1.02
-                for item in v1_prepared_clips
-                if not item["muted"]
-            )
-            or any(c["volume"] > 1.02 for c in active_a1_clips)
-            or any(c["volume"] > 1.02 for c in active_v2_audio_clips)
-        )
-
-        if len(mix_inputs) == 1:
-            if any_boost:
-                audio_filters.append(
-                    f"{mix_inputs[0]}alimiter=limit=0.98:attack=5:release=50:level=0[final_a]"
-                )
-            else:
-                audio_filters.append(f"{mix_inputs[0]}acopy[final_a]")
-        else:
-            audio_filters.append(
-                f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0:normalize=0,"
-                f"alimiter=limit=0.98:attack=5:release=50:level=0,atrim=0:{rendered_duration:.3f}[final_a]"
-            )
-
-        filter_graph = ";".join(audio_filters)
-        mixed_audio_wav = work_dir / "mixed_audio.wav"
-        audio_cmd.extend([
-            "-filter_complex",
-            filter_graph,
-            "-map",
-            "[final_a]",
-            "-c:a",
-            "pcm_s16le",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            str(mixed_audio_wav),
-        ])
-        _run_ffmpeg(
-            audio_cmd,
-            timeout_sec,
-            expected_duration_sec=rendered_duration,
-            progress_cb=lambda frac, m: _emit_stage_progress(
-                "audio", "mixing_audio", "Mixing audio tracks & fades", frac * 0.75, m
-            ),
-            cancel_event=cancel_event,
-            process_cb=process_cb,
-        )
-
-        mux_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-i",
-            str(visual_only_mp4),
-            "-i",
-            str(mixed_audio_wav),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(raw_export_path),
-        ]
-        _run_ffmpeg(
-            mux_cmd,
-            timeout_sec,
-            expected_duration_sec=rendered_duration,
-            progress_cb=lambda frac, m: _emit_stage_progress(
-                "audio", "mixing_audio", "Muxing mixed audio stream", 0.75 + frac * 0.25, m
-            ),
-            cancel_event=cancel_event,
-            process_cb=process_cb,
-        )
-        rendered_meta = extract_video_metadata(raw_export_path, ffprobe_bin=ffprobe_bin)
-
-    if needs_ass_pass:
-        style = (
-            timeline_spec.get("subtitleStyle")
-            if isinstance(timeline_spec.get("subtitleStyle"), dict)
-            else {}
-        )
-        final_w = int(rendered_meta["video"]["width"])
-        final_h = int(rendered_meta["video"]["height"])
-        ass_path = work_dir / "overlays_and_subtitles.ass"
-        _write_ass_subtitles(
-            subtitles if burn_subs else [],
-            style,
-            ass_path,
-            width=final_w,
-            height=final_h,
-            text_overlays=active_t1_overlays,
-        )
-        _emit_stage_progress("ass", "burning_subtitles", "Burning subtitles & titles", 0.0, True)
-        rendered_meta = burn_subtitles_into_mp4(
-            raw_export_path,
-            output_path,
-            ass_path,
-            has_audio=bool(rendered_meta.get("has_audio")),
+        visual_target_path = work_dir / "visual_only.mp4" if has_output_audio else output_path
+        _emit_stage_progress("visual", "rendering_v1", visual_stage_label, 0.0, True)
+        visual_meta, seam_overlaps, encoder_used, runtime_fallback = _render_unified_visual_mp4(
+            v1_prepared_clips,
+            active_v2_overlays,
+            visual_target_path,
+            width=target_w,
+            height=target_h,
+            fps=eff_fps,
+            ass_path=ass_path,
+            ass_cwd=work_dir if ass_path is not None else None,
+            profile_spec=profile_spec,
+            encoder=chosen_encoder,
             ffmpeg_bin=ffmpeg_bin,
             ffprobe_bin=ffprobe_bin,
             timeout_sec=timeout_sec,
-            expected_duration_sec=rendered_duration,
             progress_cb=lambda frac, m: _emit_stage_progress(
-                "ass", "burning_subtitles", "Burning subtitles & titles", frac, m
+                "visual", "rendering_v1", visual_stage_label, frac, m
             ),
             cancel_event=cancel_event,
             process_cb=process_cb,
+            profiler=profiler,
+        )
+        fallback_used = pre_fallback or runtime_fallback
+        rendered_duration = float(visual_meta["duration_seconds"]) or expected_v1_dur
+
+        if not has_output_audio:
+            profiler.record("audio_segment_pretrimming", total_sec=0.0, active=False)
+            profiler.record("audio_mixing_and_ducking", total_sec=0.0, active=False)
+            profiler.record("final_encoding_and_muxing", total_sec=0.0, active=True, note="Direct visual-only MP4 output")
+            rendered_meta = visual_meta
+        else:
+            _emit_stage_progress("audio", "mixing_audio", "Mixing audio & muxing MP4", 0.0, True)
+            audio_prep_start = time.perf_counter()
+
+            needs_sidechain_key = (
+                len(active_a1_clips) > 0
+                and any(c["ducking_enabled"] for c in active_a1_clips)
+                and v1_has_any_audible
+            )
+            speech_intervals = _merge_speech_intervals(
+                timeline_spec.get("speechIntervals"),
+                timeline_spec.get("subtitles"),
+            )
+
+            audio_cmd = [ffmpeg_path, "-y", "-i", str(visual_target_path)]
+            audio_filters: list[str] = []
+            input_idx = 1
+
+            v1_mix_label: str | None = None
+            v1_key_label: str | None = None
+
+            if v1_has_any_audible:
+                v1_seg_labels: list[str] = []
+                for s_idx, item in enumerate(v1_prepared_clips):
+                    seg_dur = float(item["seg_dur"])
+                    has_src_audio = bool(item["src_meta"].get("has_audio"))
+                    if not has_src_audio or item["muted"] or item["volume"] <= 0.001:
+                        audio_filters.append(
+                            f"anullsrc=channel_layout=stereo:sample_rate=44100:d={seg_dur:.3f}[v1a_{s_idx}]"
+                        )
+                    else:
+                        v1_audio_path = Path(item["src_path"]).resolve()
+                        v1_a_in = float(item["src_in"])
+                        v1_a_out = float(item["src_out"])
+                        v1_src_dur = float(item["src_meta"].get("duration_seconds", 0.0))
+                        v1_span = max(0.05, v1_a_out - v1_a_in)
+                        cur_in_idx = input_idx
+                        if (
+                            v1_a_in > 0.05
+                            or (v1_src_dur > 0 and v1_a_out < v1_src_dur - 0.05)
+                            or v1_src_dur > max_duration_sec
+                        ):
+                            audio_cmd.extend(["-ss", f"{v1_a_in:.3f}", "-t", f"{v1_span:.3f}", "-i", str(v1_audio_path)])
+                            chain_in, chain_out = 0.0, v1_span
+                        else:
+                            audio_cmd.extend(["-i", str(v1_audio_path)])
+                            chain_in, chain_out = v1_a_in, v1_a_out
+                        input_idx += 1
+                        chain = _build_audio_clip_chain(
+                            f"{cur_in_idx}:a",
+                            src_in=chain_in,
+                            src_out=chain_out,
+                            volume=item["volume"],
+                            fade_in=item["fade_in"],
+                            fade_out=item["fade_out"],
+                            speed=item["speed"],
+                        )
+                        audio_filters.append(f"{chain}[v1a_{s_idx}]")
+                    v1_seg_labels.append(f"[v1a_{s_idx}]")
+
+                if len(v1_seg_labels) == 1:
+                    v1_joined = v1_seg_labels[0]
+                elif not any(d > 0.05 for d in seam_overlaps):
+                    v1_joined = f"{''.join(v1_seg_labels)}concat=n={len(v1_seg_labels)}:v=0:a=1"
+                else:
+                    cur_albl = v1_seg_labels[0]
+                    for s_idx in range(len(v1_seg_labels) - 1):
+                        nxt_albl = v1_seg_labels[s_idx + 1]
+                        overlap_d = seam_overlaps[s_idx] if s_idx < len(seam_overlaps) else 0.0
+                        out_albl = f"[v1aj_{s_idx + 1}]"
+                        if overlap_d > 0.05:
+                            audio_filters.append(
+                                f"{cur_albl}{nxt_albl}acrossfade=d={overlap_d:.3f}:c1=tri:c2=tri{out_albl}"
+                            )
+                        else:
+                            audio_filters.append(f"{cur_albl}{nxt_albl}concat=n=2:v=0:a=1{out_albl}")
+                        cur_albl = out_albl
+                    v1_joined = cur_albl
+
+                v1_base_chain = (
+                    f"{v1_joined}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
+                    if v1_joined.startswith("[") and not v1_joined.endswith("=1")
+                    else f"{v1_joined},apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f}"
+                )
+                if needs_sidechain_key and len(speech_intervals) == 0:
+                    audio_filters.append(f"{v1_base_chain},asplit=2[v1_out][v1_sc_raw]")
+                    v1_mix_label = "[v1_out]"
+                    v1_key_label = "[v1_sc_raw]"
+                else:
+                    audio_filters.append(f"{v1_base_chain}[v1_out]")
+                    v1_mix_label = "[v1_out]"
+
+            a1_clip_labels: list[str] = []
+            sidechain_duck_clips = [
+                c for c in active_a1_clips if c["ducking_enabled"] and len(speech_intervals) == 0 and v1_key_label
+            ]
+            sc_key_splits: list[str] = []
+            if sidechain_duck_clips and v1_key_label:
+                if len(sidechain_duck_clips) == 1:
+                    sc_key_splits = ["[v1_sc_0]"]
+                    audio_filters.append(
+                        f"{v1_key_label}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[v1_sc_0]"
+                    )
+                else:
+                    sc_raw_splits = [f"[v1_sc_raw_{i}]" for i in range(len(sidechain_duck_clips))]
+                    sc_key_splits = [f"[v1_sc_{i}]" for i in range(len(sidechain_duck_clips))]
+                    audio_filters.append(
+                        f"{v1_key_label}asplit={len(sidechain_duck_clips)}{''.join(sc_raw_splits)}"
+                    )
+                    for raw_lbl, fmt_lbl in zip(sc_raw_splits, sc_key_splits):
+                        audio_filters.append(
+                            f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{fmt_lbl}"
+                        )
+
+            sc_split_cursor = 0
+            for a_idx, item in enumerate(active_a1_clips):
+                a1_src_path = Path(item["src_path"]).resolve()
+                a1_in = float(item["src_in"])
+                a1_out = float(item["src_out"])
+                a1_src_dur = float(item.get("src_duration", 0.0))
+                a1_span = max(0.05, a1_out - a1_in)
+                cur_in_idx = input_idx
+                if (
+                    a1_in > 0.05
+                    or (a1_src_dur > 0 and a1_out < a1_src_dur - 0.05)
+                    or a1_src_dur > max_duration_sec
+                ):
+                    audio_cmd.extend(["-ss", f"{a1_in:.3f}", "-t", f"{a1_span:.3f}", "-i", str(a1_src_path)])
+                    chain_in, chain_out = 0.0, a1_span
+                else:
+                    audio_cmd.extend(["-i", str(a1_src_path)])
+                    chain_in, chain_out = a1_in, a1_out
+                input_idx += 1
+
+                base_chain = _build_audio_clip_chain(
+                    f"{cur_in_idx}:a",
+                    src_in=chain_in,
+                    src_out=chain_out,
+                    volume=item["volume"],
+                    fade_in=item["fade_in"],
+                    fade_out=item["fade_out"],
+                    speed=item["speed"],
+                )
+                cur_label = f"[a1_base_{a_idx}]"
+                audio_filters.append(f"{base_chain}{cur_label}")
+
+                if item["tl_start"] > 0.01:
+                    delay_ms = int(round(item["tl_start"] * 1000))
+                    delayed_label = f"[a1_del_{a_idx}]"
+                    audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
+                    cur_label = delayed_label
+
+                padded_label = f"[a1_pad_{a_idx}]"
+                audio_filters.append(
+                    f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
+                    f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
+                )
+                cur_label = padded_label
+
+                if item["ducking_enabled"] and item["ducking_amount"] > 0.01:
+                    if speech_intervals:
+                        duck_expr = _build_interval_ducking_expr(speech_intervals, item["ducking_amount"])
+                        ducked_label = f"[a1_duck_{a_idx}]"
+                        audio_filters.append(
+                            f"{cur_label}volume='{duck_expr}':eval=frame{ducked_label}"
+                        )
+                        cur_label = ducked_label
+                    elif sc_split_cursor < len(sc_key_splits):
+                        key_lbl = sc_key_splits[sc_split_cursor]
+                        sc_split_cursor += 1
+                        duck_mix = max(0.1, min(1.0, item["ducking_amount"]))
+                        ducked_label = f"[a1_scduck_{a_idx}]"
+                        audio_filters.append(
+                            f"{cur_label}{key_lbl}sidechaincompress=threshold=0.04:ratio=6:attack=40:release=350:mix={duck_mix:.2f}{ducked_label}"
+                        )
+                        cur_label = ducked_label
+
+                a1_clip_labels.append(cur_label)
+
+            v2_audio_labels: list[str] = []
+            for v2_idx, item in enumerate(active_v2_audio_clips):
+                v2_src_path = Path(item["src_path"]).resolve()
+                v2_in = float(item["src_in"])
+                v2_out = float(item["src_out"])
+                v2_span = max(0.05, v2_out - v2_in)
+                v2_src_dur = float(item["src_meta"].get("duration_seconds", 0.0))
+                cur_in_idx = input_idx
+                if v2_in > 0.02 or (v2_src_dur > 0 and v2_out < v2_src_dur - 0.02) or v2_src_dur > max_duration_sec:
+                    audio_cmd.extend(["-ss", f"{v2_in:.3f}", "-t", f"{v2_span:.3f}", "-i", str(v2_src_path)])
+                    chain_in, chain_out = 0.0, v2_span
+                else:
+                    audio_cmd.extend(["-i", str(v2_src_path)])
+                    chain_in, chain_out = v2_in, v2_out
+                input_idx += 1
+
+                base_chain = _build_audio_clip_chain(
+                    f"{cur_in_idx}:a",
+                    src_in=chain_in,
+                    src_out=chain_out,
+                    volume=item["volume"],
+                    fade_in=item["fade_in"],
+                    fade_out=item["fade_out"],
+                    speed=item["speed"],
+                )
+                cur_label = f"[v2a_base_{v2_idx}]"
+                audio_filters.append(f"{base_chain}{cur_label}")
+
+                if item["tl_start"] > 0.01:
+                    delay_ms = int(round(item["tl_start"] * 1000))
+                    delayed_label = f"[v2a_del_{v2_idx}]"
+                    audio_filters.append(f"{cur_label}adelay={delay_ms}|{delay_ms}{delayed_label}")
+                    cur_label = delayed_label
+
+                padded_label = f"[v2a_pad_{v2_idx}]"
+                audio_filters.append(
+                    f"{cur_label}apad=whole_dur={rendered_duration:.3f},atrim=0:{rendered_duration:.3f},"
+                    f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo{padded_label}"
+                )
+                v2_audio_labels.append(padded_label)
+
+            mix_inputs: list[str] = []
+            if v1_mix_label:
+                mix_inputs.append(v1_mix_label)
+            mix_inputs.extend(v2_audio_labels)
+            mix_inputs.extend(a1_clip_labels)
+
+            any_boost = (
+                any(
+                    item["volume"] > 1.02
+                    for item in v1_prepared_clips
+                    if not item["muted"]
+                )
+                or any(c["volume"] > 1.02 for c in active_a1_clips)
+                or any(c["volume"] > 1.02 for c in active_v2_audio_clips)
+            )
+
+            if len(mix_inputs) == 1:
+                if any_boost:
+                    audio_filters.append(
+                        f"{mix_inputs[0]}alimiter=limit=0.98:attack=5:release=50:level=0[final_a]"
+                    )
+                else:
+                    audio_filters.append(f"{mix_inputs[0]}acopy[final_a]")
+            else:
+                audio_filters.append(
+                    f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0:normalize=0,"
+                    f"alimiter=limit=0.98:attack=5:release=50:level=0,atrim=0:{rendered_duration:.3f}[final_a]"
+                )
+
+            audio_prep_sec = time.perf_counter() - audio_prep_start
+            profiler.record(
+                "audio_segment_pretrimming",
+                total_sec=audio_prep_sec,
+                active=True,
+                note="Direct input-side -ss/-t audio seeking (zero intermediate WAV disk pass)",
+            )
+            profiler.record(
+                "audio_mixing_and_ducking",
+                total_sec=0.0,
+                active=len(mix_inputs) > 1 or any(c["ducking_enabled"] for c in active_a1_clips),
+                note="Fused into final audio filtergraph + -c:v copy mux pass",
+            )
+
+            resolved_final_out = output_path.resolve()
+            resolved_final_out.parent.mkdir(parents=True, exist_ok=True)
+            audio_bitrate = str(profile_spec.get("audio_bitrate", "192k"))
+            filter_graph = ";".join(audio_filters)
+            audio_cmd.extend([
+                "-filter_complex",
+                filter_graph,
+                "-map",
+                "0:v:0",
+                "-map",
+                "[final_a]",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                audio_bitrate,
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                str(resolved_final_out),
+            ])
+            mux_ffmpeg_start = time.perf_counter()
+            _run_ffmpeg(
+                audio_cmd,
+                timeout_sec,
+                expected_duration_sec=rendered_duration,
+                progress_cb=lambda frac, m: _emit_stage_progress(
+                    "audio", "mixing_audio", "Mixing audio & muxing MP4", frac, m
+                ),
+                cancel_event=cancel_event,
+                process_cb=process_cb,
+            )
+            mux_ffmpeg_sec = time.perf_counter() - mux_ffmpeg_start
+            final_probe_start = time.perf_counter()
+            rendered_meta = extract_video_metadata(resolved_final_out, ffprobe_bin=ffprobe_bin)
+            final_probe_sec = time.perf_counter() - final_probe_start
+            profiler.record(
+                "final_encoding_and_muxing",
+                total_sec=mux_ffmpeg_sec + final_probe_sec,
+                ffmpeg_sec=mux_ffmpeg_sec,
+                active=True,
+                note="Direct audio mix + -c:v copy MP4 mux + faststart",
+            )
+
+        perf_summary = profiler.finalize()
+        logger.info(
+            "MP4 export profile=%s encoder=%s fallback=%s resolution=%s fps=%d duration=%.2fs total=%.3fs ffmpeg=%.3fs python=%.3fs stages=%s",
+            resolved_profile_id or "legacy",
+            encoder_used,
+            fallback_used,
+            eff_resolution,
+            eff_fps,
+            float(rendered_meta.get("duration_seconds") or 0.0),
+            perf_summary["total_export_sec"],
+            perf_summary["ffmpeg_execution_sec"],
+            perf_summary["python_processing_sec"],
+            {k: v.get("total_sec") for k, v in perf_summary["stages"].items()},
         )
 
-    if progress_cb is not None:
-        progress_cb("finalizing", "Finalizing MP4 metadata", 98, False)
+        if progress_cb is not None:
+            progress_cb("finalizing", "Finalizing MP4 metadata", 98, False)
 
-    return rendered_meta
+        rendered_meta["export_profile"] = resolved_profile_id or "legacy"
+        rendered_meta["encoder_used"] = encoder_used
+        rendered_meta["hardware_fallback_used"] = fallback_used
+        rendered_meta["performance"] = perf_summary
+        return rendered_meta
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _hex_to_ass_color(hex_color: str, opacity: float = 1.0) -> str:

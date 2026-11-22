@@ -93,3 +93,7 @@ class HealthResponse(BaseModel):
     faster_whisper_available: bool
     ffmpeg_path: Optional[str] = None
     ffprobe_path: Optional[str] = None
+    hardware_encoders: list[str] = Field(default_factory=list)
+    recommended_encoder: str = "libx264"
+    encoder_capabilities: dict[str, dict[str, object]] = Field(default_factory=dict)
+    export_profiles: dict[str, dict[str, object]] = Field(default_factory=dict)

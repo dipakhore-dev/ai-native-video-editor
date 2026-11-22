@@ -10,17 +10,26 @@ import {
   LogIn,
   Captions,
   Ban,
+  Cpu,
+  Zap,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import {
   cancelExportMp4,
   exportTimelineMp4,
   fetchExportProgress,
+  fetchVideoProcessorStatus,
+  type VideoProcessorStatusResponse,
 } from "../../services/api";
-import type { Project, RenderTimelinePayload } from "../../types/studio";
+import type {
+  ExportProfileId,
+  HardwareEncodingMode,
+  Project,
+  RenderTimelinePayload,
+} from "../../types/studio";
 import { formatBytes, formatTimecode, resolveClipSourceFile } from "../../utils/media";
 import { getSubtitleStyle } from "../../utils/subtitles";
-import { buildStructuredTimelineSpec } from "../../utils/timeline";
+import { buildStructuredTimelineSpec, resolveDimensions } from "../../utils/timeline";
 
 interface ExportModalProps {
   project: Project;
@@ -43,6 +52,34 @@ interface LiveExportProgress {
   measurable: boolean;
   elapsedMs: number;
 }
+
+interface ExportProfileOptionMeta {
+  id: ExportProfileId;
+  label: string;
+  resolutionPreset: "720p" | "1080p";
+  tradeoff: string;
+}
+
+const EXPORT_PROFILE_OPTIONS: Record<ExportProfileId, ExportProfileOptionMeta> = {
+  fast_preview: {
+    id: "fast_preview",
+    label: "Fast Preview (720p)",
+    resolutionPreset: "720p",
+    tradeoff: "720p · Ultrafast · Smaller file · Fastest render",
+  },
+  balanced: {
+    id: "balanced",
+    label: "Balanced (1080p)",
+    resolutionPreset: "1080p",
+    tradeoff: "1080p · Veryfast · Balanced size & crisp quality",
+  },
+  high_quality: {
+    id: "high_quality",
+    label: "High Quality (1080p)",
+    resolutionPreset: "1080p",
+    tradeoff: "1080p · Medium · Larger file · Best detail retention",
+  },
+};
 
 function formatElapsedDuration(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -169,13 +206,29 @@ function triggerBrowserDownload(url: string, filename: string): void {
 export function ExportModal({ project, totalDuration, onClose }: ExportModalProps) {
   const { mediaAssets, recordExportAttempt, navigate } = useStudio();
   const [format, setFormat] = useState<"mp4" | "webm" | "mov">("mp4");
-  const [resolution, setResolution] = useState(
-    project.resolution === "4K"
-      ? "3840x2160"
-      : project.resolution === "720p"
-        ? "1280x720"
-        : "1920x1080"
+  const [exportProfile, setExportProfile] = useState<ExportProfileId>(
+    project.resolution === "720p" ? "fast_preview" : "balanced"
   );
+  const [encodingMode, setEncodingMode] = useState<HardwareEncodingMode>("auto");
+  const [processorCaps, setProcessorCaps] = useState<{
+    loading: boolean;
+    reachable: boolean;
+    hardwareEncoders: string[];
+    recommendedEncoder: string;
+  }>({
+    loading: true,
+    reachable: false,
+    hardwareEncoders: [],
+    recommendedEncoder: "libx264",
+  });
+
+  const activeProfileMeta = EXPORT_PROFILE_OPTIONS[exportProfile];
+  const resolvedDims = useMemo(
+    () => resolveDimensions(project.aspectRatio, activeProfileMeta.resolutionPreset),
+    [project.aspectRatio, activeProfileMeta.resolutionPreset]
+  );
+  const resolution = `${resolvedDims.width}x${resolvedDims.height}`;
+
   const validSubtitles = useMemo(
     () =>
       (project.subtitles ?? []).filter(
@@ -210,6 +263,34 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
   };
 
   useEffect(() => {
+    let active = true;
+    void fetchVideoProcessorStatus().then((res) => {
+      if (!active) return;
+      if (res.ok && res.data) {
+        const data: VideoProcessorStatusResponse = res.data;
+        const hw = data.capabilities?.hardwareEncoders ?? data.processor?.hardwareEncoders ?? [];
+        const rec = data.capabilities?.recommendedEncoder ?? data.processor?.recommendedEncoder ?? "libx264";
+        setProcessorCaps({
+          loading: false,
+          reachable: Boolean(data.processor?.reachable),
+          hardwareEncoders: hw,
+          recommendedEncoder: rec,
+        });
+      } else {
+        setProcessorCaps({
+          loading: false,
+          reachable: false,
+          hardwareEncoders: [],
+          recommendedEncoder: "libx264",
+        });
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (feedback?.downloadUrl) {
         URL.revokeObjectURL(feedback.downloadUrl);
@@ -229,10 +310,29 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
     };
   }, []);
 
-  const structuredSpec = useMemo(
-    () => buildStructuredTimelineSpec(project, resolution, fps),
-    [project, resolution, fps]
-  );
+  const structuredSpec = useMemo(() => {
+    const base = buildStructuredTimelineSpec(project, resolution, fps);
+    return {
+      ...base,
+      exportProfile,
+      encodingMode,
+      project: {
+        ...base.project,
+        resolution: activeProfileMeta.resolutionPreset,
+        width: resolvedDims.width,
+        height: resolvedDims.height,
+      },
+    };
+  }, [
+    project,
+    resolution,
+    fps,
+    exportProfile,
+    encodingMode,
+    activeProfileMeta.resolutionPreset,
+    resolvedDims.width,
+    resolvedDims.height,
+  ]);
 
   const snapshotJson = useMemo(() => JSON.stringify(structuredSpec, null, 2), [structuredSpec]);
 
@@ -273,6 +373,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         projectId: project.id,
         projectName: project.name,
         resolution,
+        exportProfile,
+        encodingMode,
         format,
         fps,
         clipCount: project.clips.length,
@@ -347,14 +449,18 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         return;
       }
 
-      const resolutionPreset = resolution === "1920x1080" ? "1080p" : "720p";
+      const resolutionPreset = activeProfileMeta.resolutionPreset;
       const shouldBurnSubtitles = burnSubtitles && validSubtitles.length > 0;
       const exportSpec: RenderTimelinePayload & { format: "mp4" } = {
         ...structuredSpec,
         format: "mp4",
+        exportProfile,
+        encodingMode,
         project: {
           ...structuredSpec.project,
           resolution: resolutionPreset,
+          width: resolvedDims.width,
+          height: resolvedDims.height,
         },
         clips: structuredSpec.clips.map((c) => {
           if (c.kind === "text") {
@@ -380,6 +486,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       }
       formData.append("format", "mp4");
       formData.append("resolution", resolutionPreset);
+      formData.append("exportProfile", exportProfile);
+      formData.append("encodingMode", encodingMode);
       formData.append("fps", String(fps));
       formData.append("aspectRatio", project.aspectRatio);
       formData.append("timelineSpec", JSON.stringify(exportSpec));
@@ -458,7 +566,10 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         triggerBrowserDownload(downloadUrl, res.data.filename);
 
         const elapsedSec = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
-        const successMsg = `Exported ${res.data.filename} (${formatBytes(res.data.sizeBytes)}) in ${elapsedSec}s using FFmpeg.`;
+        const encoderNote = res.data.encoderUsed
+          ? `${activeProfileMeta.label} · ${res.data.encoderUsed}${res.data.hardwareFallbackUsed ? " (CPU fallback)" : ""}`
+          : activeProfileMeta.label;
+        const successMsg = `Exported ${res.data.filename} (${formatBytes(res.data.sizeBytes)}, ${encoderNote}) in ${elapsedSec}s.`;
         setFeedback({
           kind: "success",
           message: successMsg,
@@ -472,6 +583,9 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           projectId: project.id,
           projectName: project.name,
           resolution,
+          exportProfile,
+          encodingMode,
+          encoderUsed: res.data.encoderUsed,
           format,
           fps,
           clipCount: project.clips.length,
@@ -615,7 +729,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
             </span>
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-zinc-300 mb-1.5">Format</label>
               <select
@@ -630,19 +744,6 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
               </select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">Resolution</label>
-              <select
-                value={resolution}
-                disabled={submitting}
-                onChange={(e) => setResolution(e.target.value)}
-                className="w-full rounded-lg border border-zinc-800 bg-[#09090B] px-2.5 py-2 text-xs text-zinc-100 focus:border-violet-500 focus:outline-none disabled:opacity-50"
-              >
-                <option value="1920x1080">1080p</option>
-                <option value="1280x720">720p</option>
-                <option value="3840x2160">4K (Unsupported)</option>
-              </select>
-            </div>
-            <div>
               <label className="block text-xs font-medium text-zinc-300 mb-1.5">Frame Rate</label>
               <select
                 value={fps}
@@ -654,6 +755,68 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
                 <option value={30}>30 fps</option>
                 <option value={60}>60 fps</option>
               </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                Export Profile
+              </label>
+              <select
+                value={exportProfile}
+                disabled={submitting}
+                onChange={(e) => setExportProfile(e.target.value as ExportProfileId)}
+                className="w-full rounded-lg border border-zinc-800 bg-[#09090B] px-2.5 py-2 text-xs text-zinc-100 focus:border-violet-500 focus:outline-none disabled:opacity-50"
+              >
+                <option value="fast_preview">Fast Preview (720p)</option>
+                <option value="balanced">Balanced (1080p)</option>
+                <option value="high_quality">High Quality (1080p)</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                Encoding Engine
+              </label>
+              <select
+                value={encodingMode}
+                disabled={submitting}
+                onChange={(e) => setEncodingMode(e.target.value as HardwareEncodingMode)}
+                className="w-full rounded-lg border border-zinc-800 bg-[#09090B] px-2.5 py-2 text-xs text-zinc-100 focus:border-violet-500 focus:outline-none disabled:opacity-50"
+              >
+                <option value="auto">
+                  Auto ({processorCaps.hardwareEncoders.length > 0 ? processorCaps.recommendedEncoder : "libx264"})
+                </option>
+                <option value="cpu">CPU (libx264)</option>
+                <option value="gpu">
+                  GPU ({processorCaps.hardwareEncoders.length > 0 ? processorCaps.recommendedEncoder : "Fallback to CPU"})
+                </option>
+              </select>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-zinc-800/80 bg-[#09090B] px-3 py-2.5 text-[11px] space-y-1">
+            <div className="flex items-center justify-between gap-2 text-zinc-300">
+              <span className="inline-flex items-center gap-1.5 font-medium">
+                <Zap className="h-3.5 w-3.5 text-violet-400 shrink-0" />
+                <span>{activeProfileMeta.label}</span>
+              </span>
+              <span className="font-mono text-zinc-400 tabular-nums">
+                {resolvedDims.width}×{resolvedDims.height} ({project.aspectRatio})
+              </span>
+            </div>
+            <p className="text-zinc-400">{activeProfileMeta.tradeoff}</p>
+            <div className="flex items-center gap-1.5 text-zinc-500 pt-0.5">
+              <Cpu className="h-3 w-3 shrink-0 text-zinc-400" />
+              <span>
+                {processorCaps.loading
+                  ? "Checking local FFmpeg hardware H.264 encoders..."
+                  : processorCaps.hardwareEncoders.length > 0
+                    ? `Hardware H.264 detected: ${processorCaps.hardwareEncoders.join(", ")} (automatic CPU fallback if needed).`
+                    : processorCaps.reachable
+                      ? "No active GPU H.264 encoder detected — Auto/GPU will encode safely using CPU libx264."
+                      : "Local encoder capability checked during export (libx264 fallback active)."}
+              </span>
             </div>
           </div>
 

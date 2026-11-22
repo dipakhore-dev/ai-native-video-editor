@@ -71,6 +71,10 @@ export interface ProcessorHealthStatus {
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
   fasterWhisperAvailable: boolean;
+  hardwareEncoders: string[];
+  recommendedEncoder: string;
+  encoderCapabilities: Record<string, { available: boolean; label: string; detail: string }>;
+  exportProfiles: Record<string, { id: string; label: string; resolution: string; description?: string }>;
   error: string | null;
 }
 
@@ -272,7 +276,7 @@ function createCombinedSignal(externalSignal?: AbortSignal): {
   signal: AbortSignal;
   cleanup: () => void;
 } {
-  const timeoutSignal = AbortSignal.timeout(240_000);
+  const timeoutSignal = AbortSignal.timeout(360_000);
   if (!externalSignal) {
     return { signal: timeoutSignal, cleanup: () => undefined };
   }
@@ -328,6 +332,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       ffmpegAvailable: false,
       ffprobeAvailable: false,
       fasterWhisperAvailable: false,
+      hardwareEncoders: [],
+      recommendedEncoder: "libx264",
+      encoderCapabilities: {},
+      exportProfiles: {},
       error:
         "VIDEO_PROCESSOR_URL is not configured. Start the local Python FastAPI service and set VIDEO_PROCESSOR_URL in .env.",
     };
@@ -335,7 +343,7 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
 
   try {
     const res = await fetch(`${videoProcessorUrl}/health`, {
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(4000),
     });
     if (!res.ok) {
       return {
@@ -346,6 +354,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
         ffmpegAvailable: false,
         ffprobeAvailable: false,
         fasterWhisperAvailable: false,
+        hardwareEncoders: [],
+        recommendedEncoder: "libx264",
+        encoderCapabilities: {},
+        exportProfiles: {},
         error: `Python FastAPI /health returned HTTP ${res.status}`,
       };
     }
@@ -354,6 +366,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       ffmpeg_available?: boolean;
       ffprobe_available?: boolean;
       faster_whisper_available?: boolean;
+      hardware_encoders?: string[];
+      recommended_encoder?: string;
+      encoder_capabilities?: Record<string, { available: boolean; label: string; detail: string }>;
+      export_profiles?: Record<string, { id: string; label: string; resolution: string; description?: string }>;
     };
     return {
       configured: true,
@@ -363,6 +379,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       ffmpegAvailable: Boolean(body.ffmpeg_available),
       ffprobeAvailable: Boolean(body.ffprobe_available),
       fasterWhisperAvailable: Boolean(body.faster_whisper_available),
+      hardwareEncoders: Array.isArray(body.hardware_encoders) ? body.hardware_encoders : [],
+      recommendedEncoder: body.recommended_encoder || "libx264",
+      encoderCapabilities: body.encoder_capabilities || {},
+      exportProfiles: body.export_profiles || {},
       error: null,
     };
   } catch (err) {
@@ -374,6 +394,10 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       ffmpegAvailable: false,
       ffprobeAvailable: false,
       fasterWhisperAvailable: false,
+      hardwareEncoders: [],
+      recommendedEncoder: "libx264",
+      encoderCapabilities: {},
+      exportProfiles: {},
       error:
         err instanceof Error
           ? `Python FastAPI service unreachable: ${err.message}`
@@ -593,6 +617,9 @@ export async function runSyncBinaryVideoOperation(params: {
   contentType: string;
   filename: string;
   processorJobId: string;
+  exportProfile: string;
+  encoderUsed: string;
+  hardwareFallbackUsed: boolean;
 }> {
   await assertOwnedReferences(params.userId, params.projectId, null);
 
@@ -694,6 +721,9 @@ export async function runSyncBinaryVideoOperation(params: {
     const buffer = Buffer.from(arrayBuf);
     const contentType = res.headers.get("content-type") || params.defaultContentType;
     const processorJobId = res.headers.get("x-processor-job-id") || "";
+    const exportProfile = res.headers.get("x-export-profile") || "";
+    const encoderUsed = res.headers.get("x-export-encoder") || "";
+    const hardwareFallbackUsed = res.headers.get("x-export-fallback") === "1";
     const disposition = res.headers.get("content-disposition") || "";
     const nameMatch = /filename="?([^";]+)"?/i.exec(disposition);
     const filename = nameMatch?.[1] || params.defaultOutputFilename;
@@ -701,7 +731,13 @@ export async function runSyncBinaryVideoOperation(params: {
     jobDoc.status = "completed";
     jobDoc.progress = 100;
     jobDoc.processorJobId = processorJobId;
-    jobDoc.result = { outputFilename: filename, outputSizeBytes: buffer.length, contentType };
+    jobDoc.result = {
+      outputFilename: filename,
+      outputSizeBytes: buffer.length,
+      contentType,
+      ...(exportProfile ? { exportProfile } : {}),
+      ...(encoderUsed ? { encoderUsed, hardwareFallbackUsed } : {}),
+    };
     jobDoc.completedAt = new Date();
     await jobDoc.save();
 
@@ -714,7 +750,16 @@ export async function runSyncBinaryVideoOperation(params: {
       activeEntry.finishedAtMs = Date.now();
     }
 
-    return { job: jobDoc, buffer, contentType, filename, processorJobId };
+    return {
+      job: jobDoc,
+      buffer,
+      contentType,
+      filename,
+      processorJobId,
+      exportProfile,
+      encoderUsed,
+      hardwareFallbackUsed,
+    };
   } catch (err) {
     const statusCode = (err as { statusCode?: number }).statusCode;
     const isCancelled =

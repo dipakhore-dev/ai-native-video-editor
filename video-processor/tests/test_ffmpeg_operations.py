@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ from unittest import mock
 
 from app.config import get_settings
 from app.services.ffmpeg_service import (
+    EXPORT_PROFILES,
     VideoProcessingCancelledError,
     VideoProcessingError,
     _assert_short_audio_limit,
@@ -18,11 +20,15 @@ from app.services.ffmpeg_service import (
     _run_ffmpeg_with_progress,
     _trim_audio_segment,
     _write_ass_subtitles,
+    clear_hardware_encoder_cache,
+    detect_hardware_h264_encoders,
     export_mp4,
     export_timeline_mp4,
     generate_thumbnail,
     merge_video_clips,
+    normalize_encoding_mode,
     resize_crop_aspect_ratio,
+    resolve_export_profile_spec,
     trim_video,
     validate_timeline_export_spec,
 )
@@ -2023,6 +2029,408 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
                 },
             )
         self.assertEqual(ctx_oversized_tl.exception.status_code, 400)
+
+    def test_phase45_export_profiles_validation_and_aspect_ratios(self) -> None:
+        with self.assertRaises(VideoProcessingError) as bad_prof:
+            resolve_export_profile_spec("ultra_slow", "720p")
+        self.assertEqual(bad_prof.exception.status_code, 400)
+
+        with self.assertRaises(VideoProcessingError) as bad_enc:
+            normalize_encoding_mode("tpu")
+        self.assertEqual(bad_enc.exception.status_code, 400)
+
+        p_fast, res_fast, spec_fast = resolve_export_profile_spec("fast_preview", "1080p")
+        self.assertEqual(p_fast, "fast_preview")
+        self.assertEqual(res_fast, "720p")
+        self.assertEqual(spec_fast["x264_preset"], "ultrafast")
+        self.assertEqual(spec_fast["crf"], 26)
+
+        p_bal, res_bal, spec_bal = resolve_export_profile_spec("balanced", "720p")
+        self.assertEqual(p_bal, "balanced")
+        self.assertEqual(res_bal, "1080p")
+        self.assertEqual(spec_bal["x264_preset"], "veryfast")
+        self.assertEqual(spec_bal["crf"], 22)
+
+        p_hq, res_hq, spec_hq = resolve_export_profile_spec("high_quality", "720p")
+        self.assertEqual(p_hq, "high_quality")
+        self.assertEqual(res_hq, "1080p")
+        self.assertEqual(spec_hq["x264_preset"], "medium")
+        self.assertEqual(spec_hq["crf"], 19)
+
+        clip_src = self._make_clip("profile_src.mp4", duration=1.5, size="640x360", with_audio=True)
+        expected_dims = [
+            ("fast_preview", "16:9", 1280, 720),
+            ("fast_preview", "9:16", 720, 1280),
+            ("fast_preview", "1:1", 720, 720),
+            ("balanced", "9:16", 1080, 1920),
+            ("high_quality", "1:1", 1080, 1080),
+        ]
+        for idx, (profile_id, ar, exp_w, exp_h) in enumerate(expected_dims):
+            out_path = self.test_root / f"prof_{idx}_{profile_id}.mp4"
+            meta = export_timeline_mp4(
+                [clip_src],
+                out_path,
+                export_profile=profile_id,  # type: ignore[arg-type]
+                encoding_mode="cpu",
+                fps=24,
+                aspect_ratio=ar,  # type: ignore[arg-type]
+                timeline_spec={
+                    "format": "mp4",
+                    "exportProfile": profile_id,
+                    "encodingMode": "cpu",
+                    "project": {"aspectRatio": ar, "resolution": "1080p", "fps": 24},
+                    "tracks": [
+                        {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    ],
+                    "clips": [
+                        {
+                            "id": "v1_1",
+                            "trackId": "track_v1",
+                            "kind": "video",
+                            "sourceName": "profile_src.mp4",
+                            "timelineStartSec": 0.0,
+                            "timelineEndSec": 1.5,
+                            "durationSec": 1.5,
+                            "sourceInSec": 0.0,
+                            "sourceOutSec": 1.5,
+                            "speed": 1.0,
+                            "volume": 1.0,
+                            "opacity": 1.0,
+                            "fileIndex": 0,
+                        }
+                    ],
+                },
+            )
+            self.assertTrue(out_path.exists())
+            self.assertEqual(meta["video"]["width"], exp_w)
+            self.assertEqual(meta["video"]["height"], exp_h)
+            self.assertEqual(meta["export_profile"], profile_id)
+            self.assertEqual(meta["encoder_used"], "libx264")
+            self.assertFalse(meta["hardware_fallback_used"])
+            self.assertAlmostEqual(meta["duration_seconds"], 1.5, delta=0.3)
+
+    def test_phase45_hardware_encoder_detection_and_fallback(self) -> None:
+        clear_hardware_encoder_cache()
+        try:
+            # 1) False-positive hardware encoders (compiled in ffmpeg -encoders, fail 1-frame init) must be excluded
+            with mock.patch("app.services.ffmpeg_service.subprocess.run") as mock_run:
+                mock_run.return_value = subprocess.CompletedProcess(
+                    args=["ffmpeg"],
+                    returncode=1,
+                    stdout="",
+                    stderr="Cannot load libcuda.so.1 / Unknown encoder",
+                )
+                caps_none = detect_hardware_h264_encoders(self.ffmpeg, force_refresh=True)
+                self.assertEqual(caps_none["available_hardware_encoders"], [])
+                self.assertEqual(caps_none["recommended_encoder"], "libx264")
+                self.assertEqual(mock_run.call_count, 3)
+
+            # 2) Valid QSV 1-frame smoke test succeeds and enforces nv12 pixel format
+            seen_cmds: list[list[str]] = []
+
+            def fake_hw_probe(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+                seen_cmds.append([str(x) for x in cmd])
+                if "h264_qsv" in cmd:
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+                return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Device unavailable")
+
+            with mock.patch("app.services.ffmpeg_service.subprocess.run", side_effect=fake_hw_probe):
+                caps_qsv = detect_hardware_h264_encoders(self.ffmpeg, force_refresh=True)
+                self.assertEqual(caps_qsv["available_hardware_encoders"], ["h264_qsv"])
+                self.assertEqual(caps_qsv["recommended_encoder"], "h264_qsv")
+                self.assertTrue(caps_qsv["encoders"]["h264_qsv"]["available"])  # type: ignore[index]
+                self.assertFalse(caps_qsv["encoders"]["h264_nvenc"]["available"])  # type: ignore[index]
+                qsv_cmd = next(c for c in seen_cmds if "h264_qsv" in c)
+                self.assertIn("nv12", qsv_cmd)
+
+            # 3) Runtime hardware failure falls back gracefully to libx264 when encoding_mode='gpu'/'auto'
+            clip_src = self._make_clip("hw_fallback_src.mp4", duration=1.5, size="640x360", with_audio=False)
+            out_fallback = self.test_root / "hw_fallback_out.mp4"
+            from app.services.ffmpeg_service import _run_ffmpeg as real_run_ffmpeg
+
+            attempted_encoders: list[str] = []
+
+            def flaky_gpu_run(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if "h264_nvenc" in cmd:
+                    attempted_encoders.append("h264_nvenc")
+                    raise VideoProcessingError("Simulated NVENC runtime session error", status_code=422)
+                if "libx264" in cmd:
+                    attempted_encoders.append("libx264")
+                return real_run_ffmpeg(cmd, *args, **kwargs)
+
+            mock_hw_caps = {
+                "software_encoder": "libx264",
+                "available_hardware_encoders": ["h264_nvenc"],
+                "recommended_encoder": "h264_nvenc",
+                "encoders": {"h264_nvenc": {"available": True, "label": "NVIDIA NVENC", "detail": "Ready"}},
+            }
+            with (
+                mock.patch("app.services.ffmpeg_service.detect_hardware_h264_encoders", return_value=mock_hw_caps),
+                mock.patch("app.services.ffmpeg_service._run_ffmpeg", side_effect=flaky_gpu_run),
+            ):
+                fb_meta = export_timeline_mp4(
+                    [clip_src],
+                    out_fallback,
+                    export_profile="fast_preview",
+                    encoding_mode="gpu",
+                    fps=24,
+                    timeline_spec={
+                        "format": "mp4",
+                        "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                        "tracks": [
+                            {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                        ],
+                        "clips": [
+                            {
+                                "id": "v1_1",
+                                "trackId": "track_v1",
+                                "kind": "video",
+                                "sourceName": "hw_fallback_src.mp4",
+                                "timelineStartSec": 0.0,
+                                "timelineEndSec": 1.5,
+                                "durationSec": 1.5,
+                                "sourceInSec": 0.0,
+                                "sourceOutSec": 1.5,
+                                "speed": 1.0,
+                                "volume": 1.0,
+                                "opacity": 1.0,
+                                "fileIndex": 0,
+                            }
+                        ],
+                    },
+                )
+            self.assertEqual(attempted_encoders, ["h264_nvenc", "libx264"])
+            self.assertEqual(fb_meta["encoder_used"], "libx264")
+            self.assertTrue(fb_meta["hardware_fallback_used"])
+            self.assertTrue(out_fallback.exists())
+        finally:
+            clear_hardware_encoder_cache()
+
+    def test_phase45_single_pass_profiling_overlays_subtitles_and_audio_sync(self) -> None:
+        clip_a = self._make_clip("v1_sp_a.mp4", duration=2.5, size="640x360", with_audio=True)
+        clip_b = self._make_clip("v1_sp_b.mp4", duration=2.5, size="640x360", with_audio=True)
+        overlay_img = self.test_root / "ov_logo.png"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=cyan:s=240x180:d=1",
+                "-frames:v",
+                "1",
+                str(overlay_img),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        bgm_mp3 = self.test_root / "bgm_track.mp3"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=6.0",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                str(bgm_mp3),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
+        out_dir = self.test_root / "isolated_out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_mp4 = out_dir / "phase45_full_single_pass.mp4"
+
+        seen_cmds: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def spy_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+            seen_cmds.append([str(x) for x in cmd])
+            return real_popen(cmd, *args, **kwargs)
+
+        log_records: list[str] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                log_records.append(self.format(record))
+
+        ffmpeg_logger = logging.getLogger("video_processor.ffmpeg")
+        handler = _ListHandler()
+        prev_level = ffmpeg_logger.level
+        ffmpeg_logger.setLevel(logging.INFO)
+        ffmpeg_logger.addHandler(handler)
+        try:
+            with mock.patch("app.services.ffmpeg_service.subprocess.Popen", side_effect=spy_popen):
+                meta = export_timeline_mp4(
+                    [clip_a, clip_b, overlay_img, bgm_mp3],
+                    out_mp4,
+                    export_profile="fast_preview",
+                    encoding_mode="cpu",
+                    fps=24,
+                    aspect_ratio="16:9",
+                    timeline_spec={
+                        "format": "mp4",
+                        "exportProfile": "fast_preview",
+                        "encodingMode": "cpu",
+                        "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                        "tracks": [
+                            {"id": "track_t1", "name": "T1 Text", "type": "text", "muted": False, "locked": False},
+                            {"id": "track_v2", "name": "V2 Overlay", "type": "overlay", "muted": False, "locked": False},
+                            {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                            {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                        ],
+                        "clips": [
+                            {
+                                "id": "v1_1",
+                                "trackId": "track_v1",
+                                "kind": "video",
+                                "sourceName": "v1_sp_a.mp4",
+                                "timelineStartSec": 0.0,
+                                "timelineEndSec": 2.0,
+                                "durationSec": 2.0,
+                                "sourceInSec": 0.5,
+                                "sourceOutSec": 2.5,
+                                "speed": 1.0,
+                                "volume": 0.8,
+                                "opacity": 1.0,
+                                "transitionOut": {"type": "fade", "durationSec": 0.4},
+                                "effects": {"preset": "cinematic"},
+                                "fileIndex": 0,
+                            },
+                            {
+                                "id": "v1_2",
+                                "trackId": "track_v1",
+                                "kind": "video",
+                                "sourceName": "v1_sp_b.mp4",
+                                "timelineStartSec": 2.0,
+                                "timelineEndSec": 3.5,
+                                "durationSec": 1.5,
+                                "sourceInSec": 0.0,
+                                "sourceOutSec": 2.25,
+                                "speed": 1.5,
+                                "volume": 0.8,
+                                "opacity": 1.0,
+                                "fileIndex": 1,
+                            },
+                            {
+                                "id": "v2_1",
+                                "trackId": "track_v2",
+                                "kind": "image",
+                                "sourceName": "ov_logo.png",
+                                "timelineStartSec": 0.2,
+                                "timelineEndSec": 2.6,
+                                "durationSec": 2.4,
+                                "sourceInSec": 0.0,
+                                "sourceOutSec": 2.4,
+                                "speed": 1.0,
+                                "volume": 1.0,
+                                "opacity": 0.85,
+                                "overlayTransform": {"x": 85.0, "y": 15.0, "widthPct": 22.0, "heightPct": 22.0, "scale": 1.0, "lockAspectRatio": True},
+                                "fileIndex": 2,
+                            },
+                            {
+                                "id": "t1_1",
+                                "trackId": "track_t1",
+                                "kind": "text",
+                                "sourceName": "Title",
+                                "timelineStartSec": 0.2,
+                                "timelineEndSec": 2.5,
+                                "durationSec": 2.3,
+                                "opacity": 1.0,
+                                "textStyle": {"text": "বাংলা ওভারলে", "fontSize": 34, "color": "#FFFFFF", "x": 50, "y": 20, "align": "center"},
+                            },
+                            {
+                                "id": "a1_1",
+                                "trackId": "track_a1",
+                                "kind": "audio",
+                                "sourceName": "bgm_track.mp3",
+                                "timelineStartSec": 0.0,
+                                "timelineEndSec": 3.0,
+                                "durationSec": 3.0,
+                                "sourceInSec": 1.0,
+                                "sourceOutSec": 4.0,
+                                "speed": 1.0,
+                                "volume": 0.9,
+                                "fadeInSec": 0.3,
+                                "fadeOutSec": 0.3,
+                                "duckingEnabled": True,
+                                "duckingAmount": 0.5,
+                                "fileIndex": 3,
+                            },
+                        ],
+                        "burnSubtitles": True,
+                        "subtitles": [{"id": "s1", "start": 0.3, "end": 2.2, "text": "সাবটাইটেল পরীক্ষা"}],
+                        "speechIntervals": [{"start": 0.3, "end": 2.2}],
+                    },
+                )
+        finally:
+            ffmpeg_logger.removeHandler(handler)
+            ffmpeg_logger.setLevel(prev_level)
+
+        self.assertTrue(out_mp4.exists())
+        # Verify single visual pass + single audio mix/copy pass (= exactly 2 FFmpeg calls total; subprocess.run also uses Popen)
+        ffmpeg_cmds = [c for c in seen_cmds if "ffmpeg" in Path(c[0]).name]
+        self.assertEqual(len(ffmpeg_cmds), 2, f"Expected 2 FFmpeg passes, saw {len(ffmpeg_cmds)}: {ffmpeg_cmds}")
+        self.assertIn("libx264", ffmpeg_cmds[0])
+        self.assertIn("-c:v", ffmpeg_cmds[1])
+        self.assertIn("copy", ffmpeg_cmds[1])
+
+        # Expected V1 total with 0.4s seam overlap: 2.0 + 1.5 - 0.4 = 3.1s
+        self.assertAlmostEqual(meta["duration_seconds"], 3.1, delta=0.35)
+        self.assertEqual(meta["video"]["width"], 1280)
+        self.assertEqual(meta["video"]["height"], 720)
+        self.assertTrue(meta["has_audio"])
+        self.assertGreater(self._measure_pcm_rms(out_mp4, 0.5, 1.5), 0.03)
+
+        # Verify temp _timeline_work directory was completely cleaned up
+        self.assertEqual([p.name for p in out_dir.iterdir()], ["phase45_full_single_pass.mp4"])
+
+        # Verify performance telemetry structure and sanitized log output (no temp file paths)
+        perf = meta["performance"]
+        self.assertGreater(perf["total_export_sec"], 0.0)
+        self.assertGreater(perf["ffmpeg_execution_sec"], 0.0)
+        self.assertGreaterEqual(perf["total_export_sec"], perf["ffmpeg_execution_sec"])
+        for stage_key in (
+            "metadata_probing",
+            "v1_clip_preparation_and_trimming",
+            "playback_speed_processing",
+            "effects_and_transitions",
+            "v2_overlay_compositing",
+            "t1_text_rendering",
+            "visual_single_pass_encode",
+            "audio_segment_pretrimming",
+            "audio_mixing_and_ducking",
+            "final_encoding_and_muxing",
+        ):
+            self.assertIn(stage_key, perf["stages"])
+
+        self.assertTrue(any("MP4 export profile=fast_preview encoder=libx264" in line for line in log_records))
+        for line in log_records:
+            self.assertNotIn(str(self.test_root), line)
+            self.assertNotIn("api_key", line.lower())
+
+    def test_phase45_fastapi_health_and_export_profile_endpoints(self) -> None:
+        try:
+            from fastapi.testclient import TestClient  # type: ignore[import-not-found]
+            from app.main import app
+        except Exception as exc:
+            self.skipTest(f"FastAPI TestClient unavailable: {exc}")
+
+        with TestClient(app) as client:
+            health_res = client.get("/health")
+            self.assertEqual(health_res.status_code, 200)
+            body = health_res.json()
+            self.assertIn("hardware_encoders", body)
+            self.assertIn("recommended_encoder", body)
+            self.assertIn("export_profiles", body)
+            self.assertIn("fast_preview", body["export_profiles"])
 
 
 if __name__ == "__main__":

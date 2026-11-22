@@ -113,6 +113,11 @@ export async function videoProcessorStatusController(
       aspectRatioConversion: processorReady,
       exportMp4: processorReady,
       localSubtitles: processor.reachable && processor.fasterWhisperAvailable,
+      hardwareEncoding: processor.reachable && processor.hardwareEncoders.length > 0,
+      hardwareEncoders: processor.hardwareEncoders,
+      recommendedEncoder: processor.recommendedEncoder,
+      encoderCapabilities: processor.encoderCapabilities,
+      exportProfiles: processor.exportProfiles,
     },
   });
 }
@@ -384,6 +389,8 @@ export async function mergeVideosController(
 
 interface ParsedTimelineExportSpec {
   format?: string;
+  exportProfile?: string;
+  encodingMode?: string;
   project?: {
     name?: string;
     aspectRatio?: string;
@@ -480,6 +487,9 @@ const VALID_EFFECT_PRESETS = new Set([
   "vivid",
 ]);
 
+const VALID_EXPORT_PROFILES = new Set(["fast_preview", "balanced", "high_quality"]);
+const VALID_ENCODING_MODES = new Set(["auto", "cpu", "gpu"]);
+
 function validateTimelineExportSpec(
   spec: ParsedTimelineExportSpec,
   uploadedFileCount: number,
@@ -489,6 +499,13 @@ function validateTimelineExportSpec(
   const fmt = (spec.format || "mp4").toLowerCase();
   if (fmt !== "mp4") {
     return `Format '${fmt}' is not supported. Synchronous FFmpeg export supports MP4 (H.264) only.`;
+  }
+
+  if (spec.exportProfile !== undefined && !VALID_EXPORT_PROFILES.has(String(spec.exportProfile).trim().toLowerCase())) {
+    return `Unsupported exportProfile '${spec.exportProfile}'. Choose 'fast_preview', 'balanced', or 'high_quality'.`;
+  }
+  if (spec.encodingMode !== undefined && !VALID_ENCODING_MODES.has(String(spec.encodingMode).trim().toLowerCase())) {
+    return `Unsupported encodingMode '${spec.encodingMode}'. Choose 'auto', 'cpu', or 'gpu'.`;
   }
 
   const projRes = spec.project?.resolution || requestedResolution;
@@ -799,6 +816,34 @@ export async function exportMp4VideoController(
       return;
     }
 
+    const rawProfile =
+      typeof req.body?.exportProfile === "string"
+        ? req.body.exportProfile.trim().toLowerCase()
+        : typeof req.body?.export_profile === "string"
+          ? req.body.export_profile.trim().toLowerCase()
+          : "";
+    if (rawProfile && !VALID_EXPORT_PROFILES.has(rawProfile)) {
+      res.status(400).json({
+        error: `Unsupported exportProfile '${rawProfile}'. Choose 'fast_preview', 'balanced', or 'high_quality'.`,
+      });
+      return;
+    }
+    const exportProfile = rawProfile || undefined;
+
+    const rawEncodingMode =
+      typeof req.body?.encodingMode === "string"
+        ? req.body.encodingMode.trim().toLowerCase()
+        : typeof req.body?.encoding_mode === "string"
+          ? req.body.encoding_mode.trim().toLowerCase()
+          : "";
+    if (rawEncodingMode && !VALID_ENCODING_MODES.has(rawEncodingMode)) {
+      res.status(400).json({
+        error: `Unsupported encodingMode '${rawEncodingMode}'. Choose 'auto', 'cpu', or 'gpu'.`,
+      });
+      return;
+    }
+    const encodingMode = rawEncodingMode || "auto";
+
     const rawRes = typeof req.body?.resolution === "string" ? req.body.resolution.trim() : "720p";
     if (rawRes.toUpperCase() === "4K" || rawRes === "3840x2160") {
       res.status(400).json({
@@ -807,9 +852,16 @@ export async function exportMp4VideoController(
       return;
     }
     const resolution =
-      rawRes === "1080p" || rawRes === "1920x1080" || rawRes === "1080x1920" || rawRes === "1080x1080"
-        ? "1080p"
-        : "720p";
+      exportProfile === "fast_preview"
+        ? "720p"
+        : exportProfile === "balanced" || exportProfile === "high_quality"
+          ? "1080p"
+          : rawRes === "1080p" ||
+              rawRes === "1920x1080" ||
+              rawRes === "1080x1920" ||
+              rawRes === "1080x1080"
+            ? "1080p"
+            : "720p";
 
     const fps = Number(req.body?.fps ?? 30);
     if (!Number.isFinite(fps) || ![24, 30, 60].includes(fps)) {
@@ -893,6 +945,8 @@ export async function exportMp4VideoController(
         resolution,
         fps,
         aspect_ratio: aspectRatio,
+        ...(exportProfile ? { export_profile: exportProfile } : {}),
+        encoding_mode: encodingMode,
         ...(normalizedSpecString ? { timeline_spec: normalizedSpecString } : {}),
       },
       defaultOutputFilename: "export.mp4",
@@ -910,6 +964,13 @@ export async function exportMp4VideoController(
     res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.setHeader("X-Export-Client-Job-Id", clientJobId);
+    if (result.exportProfile) {
+      res.setHeader("X-Export-Profile", result.exportProfile);
+    }
+    if (result.encoderUsed) {
+      res.setHeader("X-Export-Encoder", result.encoderUsed);
+    }
+    res.setHeader("X-Export-Fallback", result.hardwareFallbackUsed ? "1" : "0");
     res.send(result.buffer);
   } catch (err) {
     sendProcessorError(res, err, "Failed to export MP4 video.");
