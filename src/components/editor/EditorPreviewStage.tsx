@@ -94,6 +94,56 @@ const TransportTimecode = React.memo(function TransportTimecode({
   );
 });
 
+interface A1AudioTrackElementProps {
+  clipId: string;
+  objectUrl: string;
+  clipName: string;
+  onRegister: (clipId: string, el: HTMLAudioElement) => void;
+  onUnregister: (clipId: string, el: HTMLAudioElement | null) => void;
+  onLoadedMetadata: (clipId: string, el: HTMLAudioElement) => void;
+  onCanPlay: (clipId: string, el: HTMLAudioElement) => void;
+  onSeeked: (el: HTMLAudioElement) => void;
+  onError: (clipName: string) => void;
+}
+
+export const A1AudioTrackElement = React.memo(function A1AudioTrackElement({
+  clipId,
+  objectUrl,
+  clipName,
+  onRegister,
+  onUnregister,
+  onLoadedMetadata,
+  onCanPlay,
+  onSeeked,
+  onError,
+}: A1AudioTrackElementProps) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Use a stable useRef object and unmount-only cleanup so 60Hz parent re-renders
+  // never detach the callback ref and strip src/abort playback.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    onRegister(clipId, el);
+    return () => {
+      onUnregister(clipId, el);
+    };
+  }, [clipId, onRegister, onUnregister]);
+
+  return (
+    <audio
+      ref={audioRef}
+      src={objectUrl}
+      preload="auto"
+      onLoadedMetadata={(e) => onLoadedMetadata(clipId, e.currentTarget)}
+      onCanPlay={(e) => onCanPlay(clipId, e.currentTarget)}
+      onSeeked={(e) => onSeeked(e.currentTarget)}
+      onError={() => onError(clipName)}
+      className="hidden"
+    />
+  );
+});
+
 export const EditorPreviewStage = React.memo(function EditorPreviewStage({
   project,
   playbackClock,
@@ -137,13 +187,30 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
 
   const lastSyncedVideoClipIdRef = useRef<string | null>(null);
   const lastSyncedV2ClipIdRef = useRef<string | null>(null);
-  const lastSyncedAudioMapRef = useRef<Map<string, boolean>>(new Map());
-  const lastGainMapRef = useRef<WeakMap<HTMLMediaElement, { gain: number; muted: boolean }>>(
-    new WeakMap()
-  );
+  const lastSyncedAudioMapRef = useRef<
+    Map<
+      string,
+      { active: boolean; objectUrl: string; inPoint: number; startTime: number; speed: number }
+    >
+  >(new Map());
+  const lastGainMapRef = useRef<
+    WeakMap<HTMLMediaElement, { gain: number; muted: boolean; ctxRunning: boolean }>
+  >(new WeakMap());
   const pendingSeekMapRef = useRef<WeakMap<HTMLMediaElement, number>>(new WeakMap());
+  const playInFlightRef = useRef<WeakSet<HTMLMediaElement>>(new WeakSet());
+  const lastPlayOrSeekAtRef = useRef<WeakMap<HTMLMediaElement, number>>(new WeakMap());
+  const prevPlayheadTimeRef = useRef<number>(playheadTime);
   const projectRef = useRef(project);
   projectRef.current = project;
+  const a1AudioClipsRef = useRef<TimelineClip[]>([]);
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const masterVolumeRef = useRef(masterVolume);
+  masterVolumeRef.current = masterVolume;
+  const masterMutedRef = useRef(masterMuted);
+  masterMutedRef.current = masterMuted;
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
 
   const trackById = useMemo(() => {
     const map = new Map<string, TimelineTrack>();
@@ -212,6 +279,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       ),
     [project.clips]
   );
+  a1AudioClipsRef.current = a1AudioClips;
 
   const speechIntervals = useMemo(
     () => buildSpeechIntervals(project.subtitles),
@@ -225,6 +293,13 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       !activeV1Clip.muted &&
       activeV1Clip.volume > 0.01
   );
+
+  const a1TrackMutedRef = useRef(Boolean(a1Track?.muted));
+  a1TrackMutedRef.current = Boolean(a1Track?.muted);
+  const speechIntervalsRef = useRef(speechIntervals);
+  speechIntervalsRef.current = speechIntervals;
+  const v1AudibleAtTimeRef = useRef(v1AudibleAtTime);
+  v1AudibleAtTimeRef.current = v1AudibleAtTime;
 
   const subtitleStyle = useMemo(() => getSubtitleStyle(project), [project]);
 
@@ -332,6 +407,53 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     }
   }, [standbyVideoRef, upcomingV1VideoClip, activeSlot, slotUrls]);
 
+  const resumeAudioContext = useCallback((createIfMissing = false) => {
+    if (typeof window === "undefined") return;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+
+    try {
+      if (!audioCtxRef.current && createIfMissing) {
+        audioCtxRef.current = new AudioCtx();
+      }
+      if (audioCtxRef.current && audioCtxRef.current.state === "suspended") {
+        void audioCtxRef.current.resume().catch(() => undefined);
+      }
+    } catch {
+      // Ignore AudioContext initialization failures in restricted environments
+    }
+  }, []);
+
+  // Unlock suspended AudioContext synchronously on transport/Space user gestures
+  useEffect(() => {
+    const handleUserGesture = (ev: Event) => {
+      if (ev.type === "keydown") {
+        const kev = ev as KeyboardEvent;
+        const target = kev.target as HTMLElement | null;
+        const inInput =
+          target &&
+          (target.tagName === "INPUT" ||
+            target.tagName === "TEXTAREA" ||
+            target.tagName === "SELECT");
+        if (inInput || kev.code !== "Space") return;
+        resumeAudioContext(true);
+        return;
+      }
+      if (audioCtxRef.current?.state === "suspended") {
+        resumeAudioContext(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handleUserGesture, { capture: true, passive: true });
+    window.addEventListener("keydown", handleUserGesture, { capture: true });
+    return () => {
+      window.removeEventListener("pointerdown", handleUserGesture, { capture: true });
+      window.removeEventListener("keydown", handleUserGesture, { capture: true });
+    };
+  }, [resumeAudioContext]);
+
   const ensureMediaGainNode = useCallback((el: HTMLMediaElement): GainNode | null => {
     const existing = mediaGainMapRef.current.get(el);
     if (existing) return existing.gain;
@@ -358,6 +480,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
   }, []);
 
   const applyPitchPreservation = useCallback((el: HTMLMediaElement, rate: number) => {
+    const safeRate = Number.isFinite(rate) && rate > 0 ? Math.min(4, Math.max(0.25, rate)) : 1;
     const pitchEl = el as HTMLMediaElement & {
       preservesPitch?: boolean;
       webkitPreservesPitch?: boolean;
@@ -366,14 +489,19 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     if (pitchEl.preservesPitch !== true) pitchEl.preservesPitch = true;
     if (pitchEl.webkitPreservesPitch !== true) pitchEl.webkitPreservesPitch = true;
     if (pitchEl.mozPreservesPitch !== true) pitchEl.mozPreservesPitch = true;
-    if (Math.abs(el.playbackRate - rate) > 0.005) {
-      el.playbackRate = rate;
+    if (Math.abs(el.playbackRate - safeRate) > 0.005) {
+      el.playbackRate = safeRate;
     }
   }, []);
 
   const seekMediaSafely = useCallback((el: HTMLMediaElement, targetTime: number) => {
+    if (!Number.isFinite(targetTime)) return;
     const durationLimit = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : targetTime;
     const clamped = Math.max(0, Math.min(durationLimit, targetTime));
+    lastPlayOrSeekAtRef.current.set(
+      el,
+      typeof performance !== "undefined" ? performance.now() : Date.now()
+    );
     if (el.seeking) {
       pendingSeekMapRef.current.set(el, clamped);
       return;
@@ -392,6 +520,10 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     pendingSeekMapRef.current.delete(el);
     if (Math.abs(el.currentTime - pending) > 0.025 && el.readyState >= 1) {
       try {
+        lastPlayOrSeekAtRef.current.set(
+          el,
+          typeof performance !== "undefined" ? performance.now() : Date.now()
+        );
         el.currentTime = pending;
       } catch {
         // Ignore queued seek errors
@@ -400,26 +532,74 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
   }, []);
 
   const applyClipAudioGain = useCallback(
-    (el: HTMLMediaElement, effectiveGain: number, isMuted: boolean) => {
+    (
+      el: HTMLMediaElement,
+      effectiveGain: number,
+      isMuted: boolean,
+      allowCreateGainNode = true
+    ) => {
       const targetVal = isMuted ? 0 : Math.max(0, Math.min(2, effectiveGain));
+      const existingNode = mediaGainMapRef.current.get(el)?.gain ?? null;
+      const ctx = audioCtxRef.current;
+      const ctxRunning = Boolean(ctx && ctx.state === "running");
+
       const prev = lastGainMapRef.current.get(el);
-      if (prev && prev.muted === isMuted && Math.abs(prev.gain - targetVal) < 0.002) {
+      if (
+        prev &&
+        prev.muted === isMuted &&
+        prev.ctxRunning === ctxRunning &&
+        Math.abs(prev.gain - targetVal) < 0.002
+      ) {
         return;
       }
-      lastGainMapRef.current.set(el, { gain: targetVal, muted: isMuted });
+      lastGainMapRef.current.set(el, { gain: targetVal, muted: isMuted, ctxRunning });
 
-      const gainNode = ensureMediaGainNode(el);
+      const gainNode = existingNode ?? (allowCreateGainNode ? ensureMediaGainNode(el) : null);
       if (el.muted !== isMuted) {
         el.muted = isMuted;
       }
       if (gainNode && audioCtxRef.current) {
+        const activeCtx = audioCtxRef.current;
         if (el.volume !== 1) el.volume = 1;
-        gainNode.gain.setTargetAtTime(targetVal, audioCtxRef.current.currentTime, 0.015);
+        if (activeCtx.state === "running") {
+          gainNode.gain.setTargetAtTime(targetVal, activeCtx.currentTime, 0.015);
+        } else {
+          // While suspended (frozen currentTime), assign value directly so unmuting/resuming has zero lag
+          gainNode.gain.setValueAtTime(targetVal, activeCtx.currentTime);
+          gainNode.gain.value = targetVal;
+        }
       } else {
         el.volume = isMuted ? 0 : Math.min(1, Math.max(0, targetVal));
       }
     },
     [ensureMediaGainNode]
+  );
+
+  const startMediaPlaybackSafely = useCallback(
+    (el: HTMLMediaElement) => {
+      if (!el.paused || playInFlightRef.current.has(el)) return;
+      resumeAudioContext(false);
+      lastPlayOrSeekAtRef.current.set(
+        el,
+        typeof performance !== "undefined" ? performance.now() : Date.now()
+      );
+      try {
+        const playResult = el.play();
+        if (playResult && typeof playResult.then === "function") {
+          playInFlightRef.current.add(el);
+          void playResult
+            .catch(() => {
+              // Ignore transient AbortError / autoplay rejections; next gesture or sync retries cleanly
+            })
+            .finally(() => {
+              playInFlightRef.current.delete(el);
+            });
+        }
+      } catch {
+        playInFlightRef.current.delete(el);
+      }
+    },
+    [resumeAudioContext]
   );
 
   // Release AudioContext & cached media elements cleanly on unmount
@@ -465,11 +645,12 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     }
 
     const clipChanged = lastSyncedVideoClipIdRef.current !== primaryVisualClip.id;
+    const safeSpeed = Number.isFinite(primaryVisualClip.speed) && primaryVisualClip.speed > 0 ? primaryVisualClip.speed : 1;
+    const safeInPoint = Number.isFinite(primaryVisualClip.inPoint) ? primaryVisualClip.inPoint : 0;
     const targetSourceTime =
-      primaryVisualClip.inPoint +
-      (playheadTime - primaryVisualClip.startTime) * primaryVisualClip.speed;
+      safeInPoint + (playheadTime - primaryVisualClip.startTime) * safeSpeed;
 
-    applyPitchPreservation(vid, playbackRate * primaryVisualClip.speed);
+    applyPitchPreservation(vid, playbackRate * safeSpeed);
     const { effectiveGain, isMuted } = computeEffectiveClipGain({
       clip: primaryVisualClip,
       timelineTimeSec: playheadTime,
@@ -477,10 +658,16 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       masterVolume,
       masterMuted,
     });
-    applyClipAudioGain(vid, effectiveGain, isMuted);
+    applyClipAudioGain(vid, effectiveGain, isMuted, isPlaying);
 
-    const tolerance = clipChanged || !isPlaying ? 0.025 : 0.12;
-    if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const recentlyStarted = now - (lastPlayOrSeekAtRef.current.get(vid) ?? 0) < 220;
+    const tolerance = clipChanged || !isPlaying ? 0.025 : 0.14;
+    if (
+      vid.readyState >= 1 &&
+      (clipChanged || !isPlaying || !recentlyStarted) &&
+      Math.abs(vid.currentTime - targetSourceTime) > tolerance
+    ) {
       seekMediaSafely(vid, targetSourceTime);
       lastSyncedVideoClipIdRef.current = primaryVisualClip.id;
     } else if (vid.readyState >= 1 && clipChanged) {
@@ -488,10 +675,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     }
 
     if (isPlaying && vid.paused) {
-      if (audioCtxRef.current?.state === "suspended") {
-        void audioCtxRef.current.resume().catch(() => {});
-      }
-      void vid.play().catch(() => {});
+      startMediaPlaybackSafely(vid);
     } else if (!isPlaying && !vid.paused) {
       vid.pause();
     }
@@ -507,6 +691,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     applyPitchPreservation,
     applyClipAudioGain,
     seekMediaSafely,
+    startMediaPlaybackSafely,
   ]);
 
   useEffect(() => {
@@ -530,10 +715,12 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     }
 
     const clipChanged = lastSyncedV2ClipIdRef.current !== activeV2Clip.id;
+    const safeSpeed = Number.isFinite(activeV2Clip.speed) && activeV2Clip.speed > 0 ? activeV2Clip.speed : 1;
+    const safeInPoint = Number.isFinite(activeV2Clip.inPoint) ? activeV2Clip.inPoint : 0;
     const targetSourceTime =
-      activeV2Clip.inPoint + (playheadTime - activeV2Clip.startTime) * activeV2Clip.speed;
+      safeInPoint + (playheadTime - activeV2Clip.startTime) * safeSpeed;
 
-    applyPitchPreservation(vid, playbackRate * activeV2Clip.speed);
+    applyPitchPreservation(vid, playbackRate * safeSpeed);
     const { effectiveGain, isMuted } = computeEffectiveClipGain({
       clip: activeV2Clip,
       timelineTimeSec: playheadTime,
@@ -541,10 +728,16 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       masterVolume,
       masterMuted,
     });
-    applyClipAudioGain(vid, effectiveGain, isMuted);
+    applyClipAudioGain(vid, effectiveGain, isMuted, isPlaying);
 
-    const tolerance = clipChanged || !isPlaying ? 0.025 : 0.12;
-    if (vid.readyState >= 1 && Math.abs(vid.currentTime - targetSourceTime) > tolerance) {
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const recentlyStarted = now - (lastPlayOrSeekAtRef.current.get(vid) ?? 0) < 220;
+    const tolerance = clipChanged || !isPlaying ? 0.025 : 0.14;
+    if (
+      vid.readyState >= 1 &&
+      (clipChanged || !isPlaying || !recentlyStarted) &&
+      Math.abs(vid.currentTime - targetSourceTime) > tolerance
+    ) {
       seekMediaSafely(vid, targetSourceTime);
       lastSyncedV2ClipIdRef.current = activeV2Clip.id;
     } else if (vid.readyState >= 1 && clipChanged) {
@@ -552,10 +745,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     }
 
     if (isPlaying && vid.paused) {
-      if (audioCtxRef.current?.state === "suspended") {
-        void audioCtxRef.current.resume().catch(() => {});
-      }
-      void vid.play().catch(() => {});
+      startMediaPlaybackSafely(vid);
     } else if (!isPlaying && !vid.paused) {
       vid.pause();
     }
@@ -571,11 +761,110 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     applyPitchPreservation,
     applyClipAudioGain,
     seekMediaSafely,
+    startMediaPlaybackSafely,
   ]);
 
   useEffect(() => {
     syncV2VideoElement();
   }, [syncV2VideoElement]);
+
+  // Synchronize a single A1 audio element cleanly (used by both RAF sync & loadedmetadata/canplay)
+  const syncSingleAudioClip = useCallback(
+    (
+      audioClip: TimelineClip,
+      aud: HTMLAudioElement,
+      currentTimelineTime: number,
+      isTimelineJump: boolean
+    ) => {
+      const safeInPoint = Number.isFinite(audioClip.inPoint) ? Math.max(0, audioClip.inPoint) : 0;
+      const safeSpeed = Number.isFinite(audioClip.speed) && audioClip.speed > 0 ? audioClip.speed : 1;
+      const playing = isPlayingRef.current;
+
+      const isActiveAtPlayhead =
+        currentTimelineTime >= audioClip.startTime &&
+        currentTimelineTime < audioClip.startTime + audioClip.duration;
+      const prevSync = lastSyncedAudioMapRef.current.get(audioClip.id);
+      const urlChanged = Boolean(prevSync && prevSync.objectUrl !== audioClip.objectUrl);
+
+      if (urlChanged) {
+        lastGainMapRef.current.delete(aud);
+      }
+
+      if (!isActiveAtPlayhead) {
+        lastSyncedAudioMapRef.current.set(audioClip.id, {
+          active: false,
+          objectUrl: audioClip.objectUrl,
+          inPoint: safeInPoint,
+          startTime: audioClip.startTime,
+          speed: safeSpeed,
+        });
+        if (!aud.paused) aud.pause();
+        applyClipAudioGain(aud, 0, true, false);
+        // Pre-seek upcoming audio clip right before it enters the playhead window
+        if (
+          audioClip.startTime > currentTimelineTime &&
+          audioClip.startTime - currentTimelineTime <= 2.5 &&
+          aud.readyState >= 1
+        ) {
+          if (Math.abs(aud.currentTime - safeInPoint) > 0.05) {
+            seekMediaSafely(aud, safeInPoint);
+          }
+        }
+        return;
+      }
+
+      const wasActive = Boolean(prevSync?.active) && !urlChanged;
+      const clipTimingChanged = Boolean(
+        prevSync &&
+          (Math.abs(prevSync.inPoint - safeInPoint) > 0.005 ||
+            Math.abs(prevSync.startTime - audioClip.startTime) > 0.005 ||
+            Math.abs(prevSync.speed - safeSpeed) > 0.005)
+      );
+
+      const targetSourceTime =
+        safeInPoint + (currentTimelineTime - audioClip.startTime) * safeSpeed;
+      applyPitchPreservation(aud, playbackRateRef.current * safeSpeed);
+
+      const { effectiveGain, isMuted } = computeEffectiveClipGain({
+        clip: audioClip,
+        timelineTimeSec: currentTimelineTime,
+        trackMuted: a1TrackMutedRef.current,
+        masterVolume: masterVolumeRef.current,
+        masterMuted: masterMutedRef.current,
+        speechIntervals: speechIntervalsRef.current,
+        v1AudibleAtTime: v1AudibleAtTimeRef.current,
+      });
+      applyClipAudioGain(aud, effectiveGain, isMuted, playing);
+
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const recentlyStartedOrSeeked = now - (lastPlayOrSeekAtRef.current.get(aud) ?? 0) < 250;
+      const needsExactSeek = !wasActive || !playing || isTimelineJump || clipTimingChanged || urlChanged;
+      const tolerance = needsExactSeek ? 0.025 : 0.28;
+
+      if (
+        aud.readyState >= 1 &&
+        (needsExactSeek || !recentlyStartedOrSeeked) &&
+        Math.abs(aud.currentTime - targetSourceTime) > tolerance
+      ) {
+        seekMediaSafely(aud, targetSourceTime);
+      }
+
+      lastSyncedAudioMapRef.current.set(audioClip.id, {
+        active: true,
+        objectUrl: audioClip.objectUrl,
+        inPoint: safeInPoint,
+        startTime: audioClip.startTime,
+        speed: safeSpeed,
+      });
+
+      if (playing && aud.paused) {
+        startMediaPlaybackSafely(aud);
+      } else if (!playing && !aud.paused) {
+        aud.pause();
+      }
+    },
+    [applyClipAudioGain, applyPitchPreservation, seekMediaSafely, startMediaPlaybackSafely]
+  );
 
   // Synchronize A1 Audio clips via Web Audio GainNodes
   useEffect(() => {
@@ -586,57 +875,13 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       }
     }
 
+    const isTimelineJump = Math.abs(playheadTime - prevPlayheadTimeRef.current) > 0.25;
+    prevPlayheadTimeRef.current = playheadTime;
+
     for (const audioClip of a1AudioClips) {
       const aud = audioElsRef.current.get(audioClip.id);
       if (!aud) continue;
-
-      const isActiveAtPlayhead =
-        playheadTime >= audioClip.startTime &&
-        playheadTime < audioClip.startTime + audioClip.duration;
-      const wasActive = lastSyncedAudioMapRef.current.get(audioClip.id) ?? false;
-
-      if (!isActiveAtPlayhead) {
-        lastSyncedAudioMapRef.current.set(audioClip.id, false);
-        if (!aud.paused) aud.pause();
-        applyClipAudioGain(aud, 0, true);
-        // Pre-seek upcoming audio clip right before it enters the playhead window
-        if (audioClip.startTime > playheadTime && audioClip.startTime - playheadTime <= 2.5 && aud.readyState >= 1) {
-          if (Math.abs(aud.currentTime - audioClip.inPoint) > 0.05) {
-            seekMediaSafely(aud, audioClip.inPoint);
-          }
-        }
-        continue;
-      }
-
-      const targetSourceTime =
-        audioClip.inPoint + (playheadTime - audioClip.startTime) * audioClip.speed;
-      applyPitchPreservation(aud, playbackRate * audioClip.speed);
-
-      const { effectiveGain, isMuted } = computeEffectiveClipGain({
-        clip: audioClip,
-        timelineTimeSec: playheadTime,
-        trackMuted: Boolean(a1Track?.muted),
-        masterVolume,
-        masterMuted,
-        speechIntervals,
-        v1AudibleAtTime,
-      });
-      applyClipAudioGain(aud, effectiveGain, isMuted);
-
-      const tolerance = !wasActive || !isPlaying ? 0.025 : 0.12;
-      if (aud.readyState >= 1 && Math.abs(aud.currentTime - targetSourceTime) > tolerance) {
-        seekMediaSafely(aud, targetSourceTime);
-      }
-      lastSyncedAudioMapRef.current.set(audioClip.id, true);
-
-      if (isPlaying && aud.paused) {
-        if (audioCtxRef.current?.state === "suspended") {
-          void audioCtxRef.current.resume().catch(() => {});
-        }
-        void aud.play().catch(() => {});
-      } else if (!isPlaying && !aud.paused) {
-        aud.pause();
-      }
+      syncSingleAudioClip(audioClip, aud, playheadTime, isTimelineJump);
     }
   }, [
     a1AudioClips,
@@ -648,10 +893,53 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     a1Track?.muted,
     speechIntervals,
     v1AudibleAtTime,
-    applyPitchPreservation,
-    applyClipAudioGain,
-    seekMediaSafely,
+    syncSingleAudioClip,
   ]);
+
+  const handleRegisterAudioElement = useCallback((clipId: string, el: HTMLAudioElement) => {
+    audioElsRef.current.set(clipId, el);
+    const clip = a1AudioClipsRef.current.find((c) => c.id === clipId);
+    if (clip) {
+      syncSingleAudioClip(clip, el, playbackClock.getTime(), true);
+    }
+  }, [playbackClock, syncSingleAudioClip]);
+
+  const handleUnregisterAudioElement = useCallback((clipId: string, el: HTMLAudioElement | null) => {
+    const target = el ?? audioElsRef.current.get(clipId) ?? null;
+    if (target) {
+      try {
+        target.pause();
+        target.removeAttribute("src");
+        target.load();
+      } catch {
+        // Ignore cleanup errors
+      }
+      pendingSeekMapRef.current.delete(target);
+      playInFlightRef.current.delete(target);
+      lastGainMapRef.current.delete(target);
+    }
+    audioElsRef.current.delete(clipId);
+    lastSyncedAudioMapRef.current.delete(clipId);
+  }, []);
+
+  const handleAudioMediaReady = useCallback(
+    (clipId: string, el: HTMLAudioElement) => {
+      const clip = a1AudioClipsRef.current.find((c) => c.id === clipId);
+      if (clip) {
+        syncSingleAudioClip(clip, el, playbackClock.getTime(), true);
+      }
+    },
+    [playbackClock, syncSingleAudioClip]
+  );
+
+  const handleAudioMediaError = useCallback(
+    (clipName: string) => {
+      onMediaError(
+        `Browser could not decode audio clip "${clipName}". Use MP3, WAV, or AAC M4A.`
+      );
+    },
+    [onMediaError]
+  );
 
   const prevAdjacentV1Clip = useMemo<TimelineClip | null>(() => {
     if (!primaryVisualClip || primaryVisualClip.trackId !== "track_v1") {
@@ -1115,34 +1403,17 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
 
           {/* Synchronized Web Audio elements for A1 Audio track clips */}
           {a1AudioClips.map((audioClip) => (
-            <audio
+            <A1AudioTrackElement
               key={audioClip.id}
-              ref={(el) => {
-                if (el) {
-                  audioElsRef.current.set(audioClip.id, el);
-                } else {
-                  const old = audioElsRef.current.get(audioClip.id);
-                  if (old) {
-                    try {
-                      old.pause();
-                      old.removeAttribute("src");
-                      old.load();
-                    } catch {
-                      // Ignore cleanup errors
-                    }
-                  }
-                  audioElsRef.current.delete(audioClip.id);
-                }
-              }}
-              src={audioClip.objectUrl}
-              preload="auto"
-              onSeeked={(e) => flushPendingSeek(e.currentTarget)}
-              onError={() =>
-                onMediaError(
-                  `Browser could not decode audio clip "${audioClip.name}". Use MP3, WAV, or AAC M4A.`
-                )
-              }
-              className="hidden"
+              clipId={audioClip.id}
+              objectUrl={audioClip.objectUrl}
+              clipName={audioClip.name}
+              onRegister={handleRegisterAudioElement}
+              onUnregister={handleUnregisterAudioElement}
+              onLoadedMetadata={handleAudioMediaReady}
+              onCanPlay={handleAudioMediaReady}
+              onSeeked={flushPendingSeek}
+              onError={handleAudioMediaError}
             />
           ))}
 
@@ -1158,6 +1429,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
           playbackClock={playbackClock}
           totalDuration={totalDuration}
           onSeek={(t) => {
+            resumeAudioContext(false);
             onSetIsPlaying(false);
             onSeek(t);
           }}
@@ -1175,6 +1447,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             <button
               type="button"
               onClick={() => {
+                resumeAudioContext(false);
                 onSetIsPlaying(false);
                 onSeek(0);
               }}
@@ -1185,7 +1458,10 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             </button>
             <button
               type="button"
-              onClick={() => onStepFrame(-1)}
+              onClick={() => {
+                resumeAudioContext(false);
+                onStepFrame(-1);
+              }}
               className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white"
               title="Step back 1 frame"
             >
@@ -1193,7 +1469,10 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             </button>
             <button
               type="button"
-              onClick={onTogglePlay}
+              onClick={() => {
+                resumeAudioContext(true);
+                onTogglePlay();
+              }}
               disabled={totalDuration <= 0}
               className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 text-white hover:from-violet-500 hover:to-blue-500 disabled:opacity-40 transition-colors"
               title="Play / Pause (Space)"
@@ -1203,7 +1482,10 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             </button>
             <button
               type="button"
-              onClick={() => onStepFrame(1)}
+              onClick={() => {
+                resumeAudioContext(false);
+                onStepFrame(1);
+              }}
               className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white"
               title="Step forward 1 frame"
             >
@@ -1212,6 +1494,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             <button
               type="button"
               onClick={() => {
+                resumeAudioContext(false);
                 onSetIsPlaying(false);
                 onSeek(totalDuration);
               }}
@@ -1227,7 +1510,10 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={onToggleMasterMuted}
+                onClick={() => {
+                  resumeAudioContext(false);
+                  onToggleMasterMuted();
+                }}
                 className="p-1 text-zinc-400 hover:text-white"
                 aria-label={masterMuted ? "Unmute" : "Mute"}
               >
