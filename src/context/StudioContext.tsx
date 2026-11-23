@@ -61,6 +61,7 @@ import {
   reorderClipToIndex,
   splitClipAtTimestamp,
 } from "../utils/timeline";
+import { cloneKeyframes } from "../utils/keyframes";
 import {
   applyAiOperationsToProject,
   type AiEditOperation,
@@ -211,6 +212,7 @@ function cloneProject(project: Project): Project {
       ...c,
       // waveformPeaks are immutable normalized samples; keep reference to avoid O(N*160) allocation per drag/undo snapshot
       waveformPeaks: c.waveformPeaks,
+      keyframes: cloneKeyframes(c.keyframes),
       transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
       transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
       effects: c.effects ? { ...c.effects } : undefined,
@@ -644,9 +646,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         return {
           ...c,
           id: nextClipId,
+          keyframes: cloneKeyframes(c.keyframes),
           transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
           transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
           effects: c.effects ? { ...c.effects } : undefined,
+          overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
           textStyle: c.textStyle ? { ...c.textStyle } : undefined,
         };
       });

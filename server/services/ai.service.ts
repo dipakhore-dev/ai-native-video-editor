@@ -27,6 +27,8 @@ export interface TimelineMetadataInput {
     speed: number;
     volume: number;
     opacity?: number;
+    rotation?: number;
+    keyframes?: Array<Record<string, unknown>>;
     effects?: Record<string, unknown>;
     transitionIn?: Record<string, unknown>;
     transitionOut?: Record<string, unknown>;
@@ -86,9 +88,17 @@ Only use these operation types:
    Fields: optional "clipId", optional "preset" ("top-left" | "top-center" | "top-right" | "center" | "bottom-left" | "bottom-right" | "pip" | "watermark" | "fullscreen"), optional "x" (0..100), optional "y" (0..100), optional "widthPct" (5..100), optional "heightPct" (5..100), optional "scale" (0.1..2.0), optional "lockAspectRatio" boolean, and "reason".
    - For "Move the logo to the top-right corner", target the track_v2 overlay clip ID and set "preset": "top-right".
    - For "Put overlay in picture-in-picture mode", set "preset": "pip".
-14. "unsupported": use whenever the user asks for anything requiring offline/specialized media AI not available in timeline ops (such as generating/transcribing subtitles or captions from audio — remind them to use the Generate Subtitles panel — background noise removal, face blurring, AI object removal, or rendering/exporting MP4 files). Set "requestedAction", "reason", and "requiresBackendProcessing": true.
+14. "set_clip_keyframes": animate a property over time using clip-relative keyframes (0s to clip duration).
+   Fields: optional "clipId", "property" ("x" | "y" | "scale" | "rotation" | "opacity" | "volume"), optional "fromValue", optional "toValue", optional "startOffsetSec" (default 0), optional "endOffsetSec" (default clip duration), optional "easing" ("linear" | "ease-in" | "ease-out" | "ease-in-out" | "hold", default "ease-in-out"), optional "keyframes" array of { "timeSec", "value", optional "easing" }, and "reason".
+   Bounds: x/y 0..100 (percent), scale 0.1..2.0 (1.0=100%), rotation -360..360 (degrees), opacity 0..1, volume 0..2.
+   - CRITICAL: MUST provide either BOTH "fromValue" and "toValue", OR a non-empty "keyframes" array.
+   - For "Slowly zoom in the video", target primary video clip and set "property": "scale", "fromValue": 1.0, "toValue": 1.25, "easing": "ease-in-out".
+   - For "Slide logo in from the left", target track_v2 overlay clip and set "property": "x", "fromValue": 10, "toValue": 84, "startOffsetSec": 0, "endOffsetSec": 1.5, "easing": "ease-out".
+   - For "Fade volume down after 5 seconds", target track_a1 (or target clip) and set "property": "volume", "fromValue": 1.0, "toValue": 0.25, "startOffsetSec": 5, "endOffsetSec": 7.
+15. "clear_clip_keyframes": remove keyframe animations from a clip ("clipId" optional, "property" optional to clear one property or omit to clear all, "reason").
+16. "unsupported": use whenever the user asks for anything requiring offline/specialized media AI not available in timeline ops (such as generating/transcribing subtitles or captions from audio — remind them to use the Generate Subtitles panel — background noise removal, face blurring, AI object removal, or rendering/exporting MP4 files). Set "requestedAction", "reason", and "requiresBackendProcessing": true.
 
-Always inspect the provided timelineMetadata carefully (trackId, clip names, selectedClipId, current effects/opacity/overlayTransform). Match target clip IDs accurately: "first clip" -> earliest track_v1 clip id; "selected clip" -> selectedClipId; "logo"/"watermark"/"overlay"/"PiP" -> track_v2 clip id. Only include fields relevant to each operation's type, and ALWAYS include the requested numeric or preset value.
+Always inspect the provided timelineMetadata carefully (trackId, clip names, selectedClipId, current effects/opacity/overlayTransform/keyframes). Match target clip IDs accurately: "first clip" -> earliest track_v1 clip id; "selected clip" -> selectedClipId; "logo"/"watermark"/"overlay"/"PiP" -> track_v2 clip id; music/audio volume -> track_a1 clip id. Only include fields relevant to each operation's type, and ALWAYS include the requested numeric or preset value.
 
 Return ONLY valid JSON matching:
 {
@@ -100,7 +110,8 @@ Concrete examples:
 - "Apply cinematic filter to the first clip." -> {"summary":"Apply cinematic filter to the first clip.","operations":[{"type":"set_clip_effects","clipId":"v1-clip-1","targetScope":"clip","preset":"cinematic","reason":"Apply cinematic preset to first clip."}]}
 - "Add a 1-second cross dissolve between clips." -> {"summary":"Add a 1-second cross dissolve between V1 clips.","operations":[{"type":"set_clip_transition","targetScope":"between_v1_clips","edge":"out","transitionType":"dissolve","durationSec":1.0,"reason":"Add 1s cross dissolve between clips."}]}
 - "Increase brightness of the selected clip." -> {"summary":"Increase brightness of selected clip.","operations":[{"type":"set_clip_effects","clipId":"v1-clip-1","targetScope":"clip","brightnessDelta":0.15,"reason":"Increase brightness of selected clip."}]}
-- "Move the logo to the top-right corner." -> {"summary":"Move logo overlay to top-right.","operations":[{"type":"set_overlay_transform","clipId":"v2-logo","preset":"top-right","reason":"Place logo at top-right corner."}]}`;
+- "Move the logo to the top-right corner." -> {"summary":"Move logo overlay to top-right.","operations":[{"type":"set_overlay_transform","clipId":"v2-logo","preset":"top-right","reason":"Place logo at top-right corner."}]}
+- "Slowly zoom in on the first video clip." -> {"summary":"Slowly zoom in on the first clip.","operations":[{"type":"set_clip_keyframes","clipId":"v1-clip-1","property":"scale","fromValue":1.0,"toValue":1.25,"easing":"ease-in-out","reason":"Animate scale from 1.0x to 1.25x over clip duration."}]}`;
 
   const callGemini = async (extraReminder?: string) =>
     ai.models.generateContent({
@@ -143,6 +154,13 @@ Concrete examples:
         op.lockAspectRatio === undefined
       ) {
         return "Every 'set_overlay_transform' operation MUST include at least one transform property (preset, x, y, widthPct, heightPct, scale, or lockAspectRatio).";
+      }
+      if (
+        op.type === "set_clip_keyframes" &&
+        (!op.keyframes || op.keyframes.length === 0) &&
+        (op.fromValue === undefined || op.toValue === undefined)
+      ) {
+        return "Every 'set_clip_keyframes' operation MUST include either a non-empty 'keyframes' array or both 'fromValue' and 'toValue'.";
       }
     }
     return null;

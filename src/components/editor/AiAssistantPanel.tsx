@@ -44,8 +44,10 @@ import {
   updateOverlayBoxDimensions,
 } from "../../utils/overlays";
 import { formatTimecode } from "../../utils/media";
+import { clampClipRotation } from "../../utils/keyframes";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import type { TimelinePlaybackClock } from "../../utils/timelineClock";
+import { ClipKeyframeInspector } from "./ClipKeyframeInspector";
 import { SubtitlesPanel } from "./SubtitlesPanel";
 
 export type EditorPanelTab = "inspector" | "assistant" | "subtitles";
@@ -144,6 +146,8 @@ export const AiAssistantPanel = React.memo(function AiAssistantPanel({
           speed: c.speed,
           volume: c.volume,
           opacity: c.opacity,
+          ...(Math.abs(c.rotation ?? 0) > 0.05 ? { rotation: c.rotation } : {}),
+          ...(c.keyframes?.length ? { keyframes: c.keyframes } : {}),
           ...(c.effects ? { effects: { ...c.effects } } : {}),
           ...(c.transitionIn ? { transitionIn: { ...c.transitionIn } } : {}),
           ...(c.transitionOut ? { transitionOut: { ...c.transitionOut } } : {}),
@@ -688,27 +692,59 @@ export const AiAssistantPanel = React.memo(function AiAssistantPanel({
               )}
 
               {selectedClip.kind !== "audio" && (
-                <div>
-                  <div className="flex items-center justify-between text-[11px] mb-1">
-                    <span className="text-zinc-400">Opacity</span>
-                    <span className="font-mono text-zinc-200 tabular-nums">
-                      {Math.round(selectedClip.opacity * 100)}%
-                    </span>
+                <div className="space-y-3">
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] mb-1">
+                      <span className="text-zinc-400">Opacity</span>
+                      <span className="font-mono text-zinc-200 tabular-nums">
+                        {Math.round(selectedClip.opacity * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={selectedClip.opacity}
+                      onChange={(e) =>
+                        updateClip(selectedClip.id, { opacity: Number(e.target.value) })
+                      }
+                      className="w-full accent-blue-500"
+                      aria-label="Clip opacity"
+                    />
                   </div>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={1}
-                    step={0.05}
-                    value={selectedClip.opacity}
-                    onChange={(e) =>
-                      updateClip(selectedClip.id, { opacity: Number(e.target.value) })
-                    }
-                    className="w-full accent-blue-500"
-                    aria-label="Clip opacity"
-                  />
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] mb-1">
+                      <span className="text-zinc-400">Rotation</span>
+                      <span className="font-mono text-zinc-200 tabular-nums">
+                        {Math.round(selectedClip.rotation ?? 0)}°
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={-180}
+                      max={180}
+                      step={1}
+                      value={Math.max(-180, Math.min(180, selectedClip.rotation ?? 0))}
+                      onChange={(e) =>
+                        updateClip(selectedClip.id, {
+                          rotation: clampClipRotation(Number(e.target.value)),
+                        })
+                      }
+                      className="w-full accent-amber-400"
+                      aria-label="Clip rotation"
+                    />
+                  </div>
                 </div>
               )}
+
+              <ClipKeyframeInspector
+                clip={selectedClip}
+                playheadTime={playheadTime}
+                playbackClock={playbackClock}
+                onSeek={onSeek}
+                onUpdateClip={updateClip}
+              />
 
               {selectedClip.trackId === "track_v2" &&
                 (selectedClip.kind === "image" || selectedClip.kind === "video") &&

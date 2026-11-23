@@ -20,6 +20,14 @@ import {
   normalizeTransition,
 } from "../../utils/effects";
 import { formatTimecode } from "../../utils/media";
+import {
+  clampKeyframeTime,
+  cloneKeyframes,
+  evaluateClipKeyframes,
+  evaluateClipProperty,
+  hasVolumeKeyframesWithSound,
+  upsertClipKeyframe,
+} from "../../utils/keyframes";
 import { computeEffectiveOverlayBox, normalizeOverlayTransform } from "../../utils/overlays";
 import { getSubtitleStyle, hexToRgba } from "../../utils/subtitles";
 import { usePlaybackTime, type TimelinePlaybackClock } from "../../utils/timelineClock";
@@ -291,7 +299,13 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       activeV1Clip.kind === "video" &&
       !v1Track?.muted &&
       !activeV1Clip.muted &&
-      activeV1Clip.volume > 0.01
+      (hasVolumeKeyframesWithSound(activeV1Clip)
+        ? evaluateClipProperty(
+            activeV1Clip,
+            "volume",
+            Math.max(0, playheadTime - activeV1Clip.startTime)
+          ) > 0.01
+        : activeV1Clip.volume > 0.01)
   );
 
   const a1TrackMutedRef = useRef(Boolean(a1Track?.muted));
@@ -964,8 +978,39 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       playheadTime,
       prevAdjacentV1Clip
     );
+    const localTime = Math.max(0, playheadTime - primaryVisualClip.startTime);
+    const kfVals = evaluateClipKeyframes(primaryVisualClip, localTime);
+    const hasCustomMotion =
+      Math.abs(kfVals.x - 50) > 0.05 ||
+      Math.abs(kfVals.y - 50) > 0.05 ||
+      Math.abs(kfVals.scale - 1) > 0.005 ||
+      Math.abs(kfVals.rotation) > 0.05;
+
+    const kfTransformParts: string[] = [];
+    if (Math.abs(kfVals.x - 50) > 0.05 || Math.abs(kfVals.y - 50) > 0.05) {
+      kfTransformParts.push(`translate(${(kfVals.x - 50).toFixed(2)}%, ${(kfVals.y - 50).toFixed(2)}%)`);
+    }
+    if (Math.abs(kfVals.scale - 1) > 0.005) {
+      kfTransformParts.push(`scale(${kfVals.scale.toFixed(3)})`);
+    }
+    if (Math.abs(kfVals.rotation) > 0.05) {
+      kfTransformParts.push(`rotate(${kfVals.rotation.toFixed(2)}deg)`);
+    }
+    const kfTransform = kfTransformParts.join(" ");
+    const combinedTransform = [transStyle.transform, hasCustomMotion ? kfTransform : ""]
+      .filter(Boolean)
+      .join(" ");
+
+    const transFactor =
+      typeof transStyle.opacity === "number" && primaryVisualClip.opacity > 0.001
+        ? transStyle.opacity / primaryVisualClip.opacity
+        : 1;
+    const effectiveOpacity = Number(Math.max(0, Math.min(1, kfVals.opacity * transFactor)).toFixed(3));
+
     return {
       ...transStyle,
+      opacity: effectiveOpacity,
+      ...(combinedTransform ? { transform: combinedTransform } : {}),
       ...(filter !== "none" ? { filter } : {}),
     };
   }, [primaryVisualClip, playheadTime, prevAdjacentV1Clip]);
@@ -995,12 +1040,19 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       clips: curProj.clips.map((c) => ({
         ...c,
         waveformPeaks: c.waveformPeaks,
+        keyframes: cloneKeyframes(c.keyframes),
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
         transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
         transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
         effects: c.effects ? normalizeEffects(c.effects) : undefined,
+        overlayTransform: c.overlayTransform ? { ...c.overlayTransform } : undefined,
       })),
     };
+
+    const hasPosKeyframes = Boolean(
+      clip.keyframes?.some((kf) => kf.property === "x" || kf.property === "y")
+    );
+    const localTimeAtDrag = clampKeyframeTime(playbackClock.getTime() - clip.startTime, clip.duration);
 
     const rect = previewFrameRef.current.getBoundingClientRect();
     let moved = false;
@@ -1009,9 +1061,24 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
     let dragRaf = 0;
 
     const commitCoords = (cx: number, cy: number) => {
-      const xPct = Math.min(90, Math.max(10, ((cx - rect.left) / rect.width) * 100));
-      const yPct = Math.min(90, Math.max(10, ((cy - rect.top) / rect.height) * 100));
-      onUpdateTextStyle(clip.id, { x: Number(xPct.toFixed(1)), y: Number(yPct.toFixed(1)) }, false);
+      const xPct = Number(Math.min(90, Math.max(10, ((cx - rect.left) / rect.width) * 100)).toFixed(1));
+      const yPct = Number(Math.min(90, Math.max(10, ((cy - rect.top) / rect.height) * 100)).toFixed(1));
+      if (hasPosKeyframes) {
+        const latest = projectRef.current.clips.find((c) => c.id === clip.id);
+        let nextKfs = upsertClipKeyframe(
+          latest?.keyframes ?? clip.keyframes,
+          { property: "x", timeSec: localTimeAtDrag, value: xPct },
+          clip.duration
+        ).keyframes;
+        nextKfs = upsertClipKeyframe(
+          nextKfs,
+          { property: "y", timeSec: localTimeAtDrag, value: yPct },
+          clip.duration
+        ).keyframes;
+        onUpdateClip(clip.id, { keyframes: nextKfs }, false);
+      } else {
+        onUpdateTextStyle(clip.id, { x: xPct, y: yPct }, false);
+      }
     };
 
     const onMove = (moveEv: MouseEvent) => {
@@ -1056,6 +1123,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       clips: curProj.clips.map((c) => ({
         ...c,
         waveformPeaks: c.waveformPeaks,
+        keyframes: cloneKeyframes(c.keyframes),
         textStyle: c.textStyle ? { ...c.textStyle } : undefined,
         transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
         transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
@@ -1064,11 +1132,17 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       })),
     };
 
+    const hasPosKeyframes = Boolean(
+      clip.keyframes?.some((kf) => kf.property === "x" || kf.property === "y")
+    );
+    const localTimeAtDrag = clampKeyframeTime(playbackClock.getTime() - clip.startTime, clip.duration);
+    const evaluatedAtDrag = evaluateClipKeyframes(clip, localTimeAtDrag);
+
     const rect = previewFrameRef.current.getBoundingClientRect();
     const startMouseX = e.clientX;
     const startMouseY = e.clientY;
-    const startX = beforeTransform.x;
-    const startY = beforeTransform.y;
+    const startX = hasPosKeyframes ? evaluatedAtDrag.x : beforeTransform.x;
+    const startY = hasPosKeyframes ? evaluatedAtDrag.y : beforeTransform.y;
     let moved = false;
     let pendingX = e.clientX;
     let pendingY = e.clientY;
@@ -1080,19 +1154,35 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
       if (Math.abs(dxPct) > 0.2 || Math.abs(dyPct) > 0.2) {
         moved = true;
       }
-      const nextX = Math.min(100, Math.max(0, startX + dxPct));
-      const nextY = Math.min(100, Math.max(0, startY + dyPct));
-      onUpdateClip(
-        clip.id,
-        {
-          overlayTransform: normalizeOverlayTransform({
-            ...beforeTransform,
-            x: Number(nextX.toFixed(1)),
-            y: Number(nextY.toFixed(1)),
-          }),
-        },
-        false
-      );
+      const nextX = Number(Math.min(100, Math.max(0, startX + dxPct)).toFixed(1));
+      const nextY = Number(Math.min(100, Math.max(0, startY + dyPct)).toFixed(1));
+
+      if (hasPosKeyframes) {
+        const latest = projectRef.current.clips.find((c) => c.id === clip.id);
+        let nextKfs = upsertClipKeyframe(
+          latest?.keyframes ?? clip.keyframes,
+          { property: "x", timeSec: localTimeAtDrag, value: nextX },
+          clip.duration
+        ).keyframes;
+        nextKfs = upsertClipKeyframe(
+          nextKfs,
+          { property: "y", timeSec: localTimeAtDrag, value: nextY },
+          clip.duration
+        ).keyframes;
+        onUpdateClip(clip.id, { keyframes: nextKfs }, false);
+      } else {
+        onUpdateClip(
+          clip.id,
+          {
+            overlayTransform: normalizeOverlayTransform({
+              ...beforeTransform,
+              x: nextX,
+              y: nextY,
+            }),
+          },
+          false
+        );
+      }
     };
 
     const onMove = (moveEv: MouseEvent) => {
@@ -1272,10 +1362,27 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             !activeV2Clip.needsRelink &&
             activeV2Clip.objectUrl &&
             (() => {
-              const ovBox = computeEffectiveOverlayBox(activeV2Clip.overlayTransform);
+              const v2LocalTime = Math.max(0, playheadTime - activeV2Clip.startTime);
+              const v2Kf = evaluateClipKeyframes(activeV2Clip, v2LocalTime);
+              const ovBox = computeEffectiveOverlayBox(
+                normalizeOverlayTransform({
+                  ...(activeV2Clip.overlayTransform ?? {}),
+                  x: v2Kf.x,
+                  y: v2Kf.y,
+                  scale: v2Kf.scale,
+                })
+              );
               const v2TransStyle = computeClipTransitionStyle(activeV2Clip, playheadTime);
+              const v2TransFactor =
+                typeof v2TransStyle.opacity === "number" && activeV2Clip.opacity > 0.001
+                  ? v2TransStyle.opacity / activeV2Clip.opacity
+                  : 1;
+              const v2EffectiveOpacity = Number(
+                Math.max(0, Math.min(1, v2Kf.opacity * v2TransFactor)).toFixed(3)
+              );
               const v2Filter = buildPreviewCssFilter(activeV2Clip.effects);
               const isV2Selected = activeV2Clip.id === selectedClipId;
+              const v2Rotate = Math.abs(v2Kf.rotation) > 0.05 ? ` rotate(${v2Kf.rotation.toFixed(2)}deg)` : "";
               return (
                 <div
                   onMouseDown={(e) => handleV2OverlayDrag(e, activeV2Clip)}
@@ -1284,7 +1391,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
                     top: `${ovBox.y}%`,
                     width: `${ovBox.widthPct}%`,
                     height: `${ovBox.heightPct}%`,
-                    transform: "translate(-50%, -50%)",
+                    transform: `translate(-50%, -50%)${v2Rotate}`,
                   }}
                   className={`absolute z-[5] cursor-move select-none ${
                     isV2Selected ? "ring-1 ring-blue-400/90" : "hover:ring-1 hover:ring-blue-400/40"
@@ -1310,6 +1417,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
                       playsInline
                       style={{
                         ...v2TransStyle,
+                        opacity: v2EffectiveOpacity,
                         ...(v2Filter !== "none" ? { filter: v2Filter } : {}),
                       }}
                       className={`h-full w-full pointer-events-none ${
@@ -1322,6 +1430,7 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
                       alt={activeV2Clip.name}
                       style={{
                         ...v2TransStyle,
+                        opacity: v2EffectiveOpacity,
                         ...(v2Filter !== "none" ? { filter: v2Filter } : {}),
                       }}
                       className={`h-full w-full pointer-events-none ${
@@ -1338,21 +1447,42 @@ export const EditorPreviewStage = React.memo(function EditorPreviewStage({
             const style = textClip.textStyle;
             if (!style) return null;
             const isSelected = textClip.id === selectedClipId;
+            const tLocalTime = Math.max(0, playheadTime - textClip.startTime);
+            const tKf = evaluateClipKeyframes(textClip, tLocalTime);
             const transStyle = computeClipTransitionStyle(textClip, playheadTime);
+            const tTransFactor =
+              typeof transStyle.opacity === "number" && textClip.opacity > 0.001
+                ? transStyle.opacity / textClip.opacity
+                : 1;
+            const tEffectiveOpacity = Number(
+              Math.max(0, Math.min(1, tKf.opacity * tTransFactor)).toFixed(3)
+            );
+            const kfMotion = [
+              Math.abs(tKf.scale - 1) > 0.005 ? `scale(${tKf.scale.toFixed(3)})` : "",
+              Math.abs(tKf.rotation) > 0.05 ? `rotate(${tKf.rotation.toFixed(2)}deg)` : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+            const fullTransform = [
+              "translate(-50%, -50%)",
+              kfMotion,
+              transStyle.transform || "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+
             return (
               <div
                 key={textClip.id}
                 onMouseDown={(e) => handleTextOverlayDrag(e, textClip)}
                 style={{
-                  left: `${style.x}%`,
-                  top: `${style.y}%`,
-                  transform: transStyle.transform
-                    ? `translate(-50%, -50%) ${transStyle.transform}`
-                    : "translate(-50%, -50%)",
+                  left: `${tKf.x}%`,
+                  top: `${tKf.y}%`,
+                  transform: fullTransform,
                   fontSize: `${Math.max(12, Math.round(style.fontSize * 0.65))}px`,
                   color: style.color,
                   backgroundColor: `rgba(9, 9, 11, ${style.backgroundOpacity})`,
-                  opacity: transStyle.opacity ?? textClip.opacity,
+                  opacity: tEffectiveOpacity,
                   ...(transStyle.clipPath ? { clipPath: transStyle.clipPath } : {}),
                   textAlign: style.align,
                 }}

@@ -2432,6 +2432,388 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
             self.assertIn("export_profiles", body)
             self.assertIn("fast_preview", body["export_profiles"])
 
+    def _measure_region_rgb_mean(
+        self,
+        video_path: Path,
+        timestamp_sec: float,
+        *,
+        w: int,
+        h: int,
+        rx: int,
+        ry: int,
+        rw: int,
+        rh: int,
+    ) -> tuple[float, float, float]:
+        proc = subprocess.run(
+            [
+                self.ffmpeg,
+                "-v",
+                "error",
+                "-ss",
+                f"{timestamp_sec:.3f}",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-s",
+                f"{w}x{h}",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ],
+            capture_output=True,
+            check=True,
+        )
+        raw = proc.stdout
+        self.assertGreaterEqual(len(raw), w * h * 3)
+        r_sum = g_sum = b_sum = count = 0
+        for yy in range(max(0, ry), min(h, ry + rh)):
+            for xx in range(max(0, rx), min(w, rx + rw)):
+                idx = (yy * w + xx) * 3
+                r_sum += raw[idx]
+                g_sum += raw[idx + 1]
+                b_sum += raw[idx + 2]
+                count += 1
+        self.assertGreater(count, 0)
+        return (r_sum / count, g_sum / count, b_sum / count)
+
+    def test_phase52_keyframe_validation_and_bounds(self) -> None:
+        base_spec = {
+            "format": "mp4",
+            "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+            "tracks": [{"id": "track_v1", "name": "V1", "type": "video", "muted": False, "locked": False}],
+            "clips": [
+                {
+                    "id": "v1_ok",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "clip.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 3.0,
+                    "durationSec": 3.0,
+                    "sourceInSec": 0.0,
+                    "sourceOutSec": 3.0,
+                    "speed": 1.0,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "rotation": -15.0,
+                    "keyframes": [
+                        {"id": "k1", "property": "scale", "timeSec": 0.0, "value": 1.0, "easing": "ease-in-out"},
+                        {"id": "k2", "property": "scale", "timeSec": 3.0, "value": 1.4, "easing": "linear"},
+                    ],
+                    "fileIndex": 0,
+                }
+            ],
+        }
+        res = validate_timeline_export_spec(base_spec, num_files=1)
+        self.assertEqual(res[0], "720p")
+
+        invalid_clips = [
+            {**base_spec["clips"][0], "rotation": 400.0},
+            {**base_spec["clips"][0], "keyframes": [{"property": "skew", "timeSec": 0, "value": 1, "easing": "linear"}]},
+            {**base_spec["clips"][0], "keyframes": [{"property": "opacity", "timeSec": -0.5, "value": 0.5, "easing": "linear"}]},
+            {**base_spec["clips"][0], "keyframes": [{"property": "opacity", "timeSec": 0.0, "value": 1.5, "easing": "linear"}]},
+            {**base_spec["clips"][0], "keyframes": [{"property": "scale", "timeSec": 0.0, "value": 1.0, "easing": "bounce"}]},
+            {**base_spec["clips"][0], "keyframes": [{"property": "x", "timeSec": 0.0, "value": float("nan"), "easing": "linear"}]},
+        ]
+        for bad_clip in invalid_clips:
+            with self.assertRaises(VideoProcessingError) as ctx:
+                validate_timeline_export_spec({**base_spec, "clips": [bad_clip]}, num_files=1)
+            self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_phase52_v2_overlay_keyframes_and_rotation_export(self) -> None:
+        v1_black = self.test_root / "v1_dark.mp4"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=640x360:r=24:d=2.2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(v1_black),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        red_box = self.test_root / "red_overlay.png"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=#FF1010:s=200x200:d=1",
+                "-frames:v",
+                "1",
+                str(red_box),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        out_mp4 = self.test_root / "phase52_v2_keyframes.mp4"
+        meta = export_timeline_mp4(
+            [v1_black, red_box],
+            out_mp4,
+            export_profile="fast_preview",
+            encoding_mode="cpu",
+            fps=24,
+            aspect_ratio="16:9",
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v2", "name": "V2 Overlay", "type": "overlay", "muted": False, "locked": False},
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_1",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v1_dark.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.2,
+                        "durationSec": 2.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.2,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "v2_anim",
+                        "trackId": "track_v2",
+                        "kind": "image",
+                        "sourceName": "red_overlay.png",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.2,
+                        "durationSec": 2.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.2,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 0.0,
+                        "rotation": 0.0,
+                        "overlayTransform": {
+                            "x": 20.0,
+                            "y": 25.0,
+                            "widthPct": 22.0,
+                            "heightPct": 22.0,
+                            "scale": 1.0,
+                            "lockAspectRatio": True,
+                        },
+                        "keyframes": [
+                            {"id": "x0", "property": "x", "timeSec": 0.0, "value": 18.0, "easing": "linear"},
+                            {"id": "x1", "property": "x", "timeSec": 2.0, "value": 82.0, "easing": "linear"},
+                            {"id": "y0", "property": "y", "timeSec": 0.0, "value": 24.0, "easing": "linear"},
+                            {"id": "y1", "property": "y", "timeSec": 2.0, "value": 76.0, "easing": "linear"},
+                            {"id": "s0", "property": "scale", "timeSec": 0.0, "value": 0.9, "easing": "ease-out"},
+                            {"id": "s1", "property": "scale", "timeSec": 2.0, "value": 1.4, "easing": "linear"},
+                            {"id": "r0", "property": "rotation", "timeSec": 0.0, "value": 0.0, "easing": "linear"},
+                            {"id": "r1", "property": "rotation", "timeSec": 2.0, "value": 45.0, "easing": "linear"},
+                            {"id": "o0", "property": "opacity", "timeSec": 0.0, "value": 0.35, "easing": "linear"},
+                            {"id": "o1", "property": "opacity", "timeSec": 2.0, "value": 1.0, "easing": "linear"},
+                        ],
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_mp4.exists())
+        self.assertAlmostEqual(meta["duration_seconds"], 2.2, delta=0.35)
+        # Early frame (~0.15s): red box sits around (x~23%, y~28%) in top-left quadrant while bottom-right is black
+        tl_early = self._measure_region_rgb_mean(out_mp4, 0.15, w=320, h=180, rx=62, ry=40, rw=20, rh=20)
+        br_early = self._measure_region_rgb_mean(out_mp4, 0.15, w=320, h=180, rx=245, ry=120, rw=30, rh=30)
+        self.assertGreater(tl_early[0], 70.0)
+        self.assertLess(br_early[0], 15.0)
+        # Late frame (~1.95s): red box moved to bottom-right quadrant with full opacity (much brighter than early top-left)
+        tl_late = self._measure_region_rgb_mean(out_mp4, 1.95, w=320, h=180, rx=62, ry=40, rw=20, rh=20)
+        br_late = self._measure_region_rgb_mean(out_mp4, 1.95, w=320, h=180, rx=245, ry=120, rw=30, rh=30)
+        self.assertLess(tl_late[0], 15.0)
+        self.assertGreater(br_late[0], 170.0)
+        self.assertGreater(br_late[0], tl_early[0] * 1.5)
+
+    def test_phase52_v1_and_t1_bengali_keyframe_export(self) -> None:
+        v1_blue = self.test_root / "v1_blue.mp4"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=#2266EE:s=640x360:r=24:d=2.0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(v1_blue),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        out_mp4 = self.test_root / "phase52_v1_t1_keyframes.mp4"
+        meta = export_timeline_mp4(
+            [v1_blue],
+            out_mp4,
+            export_profile="fast_preview",
+            encoding_mode="cpu",
+            fps=24,
+            aspect_ratio="16:9",
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_t1", "name": "T1 Text", "type": "text", "muted": False, "locked": False},
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_anim",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v1_blue.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.0,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "rotation": 0.0,
+                        "keyframes": [
+                            {"id": "v1_op0", "property": "opacity", "timeSec": 0.0, "value": 0.2, "easing": "linear"},
+                            {"id": "v1_op1", "property": "opacity", "timeSec": 1.8, "value": 1.0, "easing": "linear"},
+                            {"id": "v1_sc0", "property": "scale", "timeSec": 0.0, "value": 0.7, "easing": "ease-in-out"},
+                            {"id": "v1_sc1", "property": "scale", "timeSec": 1.8, "value": 1.0, "easing": "linear"},
+                        ],
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "t1_bn_anim",
+                        "trackId": "track_t1",
+                        "kind": "text",
+                        "sourceName": "বাংলা অ্যানিমেশন",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.0,
+                        "durationSec": 2.0,
+                        "opacity": 1.0,
+                        "rotation": 8.0,
+                        "textStyle": {
+                            "text": "বাংলা অ্যানিমেশন",
+                            "fontSize": 36,
+                            "color": "#FFFFFF",
+                            "backgroundColor": "#09090B",
+                            "backgroundOpacity": 0.7,
+                            "x": 50,
+                            "y": 25,
+                            "align": "center",
+                        },
+                        "keyframes": [
+                            {"id": "t1_y0", "property": "y", "timeSec": 0.0, "value": 25.0, "easing": "ease-in-out"},
+                            {"id": "t1_y1", "property": "y", "timeSec": 1.8, "value": 75.0, "easing": "linear"},
+                            {"id": "t1_r0", "property": "rotation", "timeSec": 0.0, "value": -10.0, "easing": "linear"},
+                            {"id": "t1_r1", "property": "rotation", "timeSec": 1.8, "value": 10.0, "easing": "linear"},
+                            {"id": "t1_o0", "property": "opacity", "timeSec": 0.0, "value": 0.3, "easing": "linear"},
+                            {"id": "t1_o1", "property": "opacity", "timeSec": 1.5, "value": 1.0, "easing": "linear"},
+                        ],
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_mp4.exists())
+        self.assertAlmostEqual(meta["duration_seconds"], 2.0, delta=0.35)
+        # Early frame (~0.1s) should have much lower center blue intensity than late frame (~1.8s)
+        c_early = self._measure_region_rgb_mean(out_mp4, 0.1, w=320, h=180, rx=130, ry=75, rw=40, rh=30)
+        c_late = self._measure_region_rgb_mean(out_mp4, 1.8, w=320, h=180, rx=130, ry=75, rw=40, rh=30)
+        self.assertGreater(c_late[2], c_early[2] * 2.0)
+
+    def test_phase52_audio_volume_keyframe_rms_export(self) -> None:
+        v1_silent = self._make_clip("v1_aud_kf.mp4", duration=2.2, size="640x360", with_audio=False)
+        tone_wav = self.test_root / "tone_440.wav"
+        subprocess.run(
+            [
+                self.ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2.5",
+                str(tone_wav),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        out_mp4 = self.test_root / "phase52_audio_volume_keyframes.mp4"
+        meta = export_timeline_mp4(
+            [v1_silent, tone_wav],
+            out_mp4,
+            export_profile="fast_preview",
+            encoding_mode="cpu",
+            fps=24,
+            timeline_spec={
+                "format": "mp4",
+                "project": {"aspectRatio": "16:9", "resolution": "720p", "fps": 24},
+                "tracks": [
+                    {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+                    {"id": "track_a1", "name": "A1 Audio", "type": "audio", "muted": False, "locked": False},
+                ],
+                "clips": [
+                    {
+                        "id": "v1_1",
+                        "trackId": "track_v1",
+                        "kind": "video",
+                        "sourceName": "v1_aud_kf.mp4",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.2,
+                        "durationSec": 2.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.2,
+                        "speed": 1.0,
+                        "volume": 1.0,
+                        "opacity": 1.0,
+                        "fileIndex": 0,
+                    },
+                    {
+                        "id": "a1_kf_ramp",
+                        "trackId": "track_a1",
+                        "kind": "audio",
+                        "sourceName": "tone_440.wav",
+                        "timelineStartSec": 0.0,
+                        "timelineEndSec": 2.2,
+                        "durationSec": 2.2,
+                        "sourceInSec": 0.0,
+                        "sourceOutSec": 2.2,
+                        "speed": 1.0,
+                        # Base volume=0 tests that keyframed volume > 0 still passes inclusion checks
+                        "volume": 0.0,
+                        "muted": False,
+                        "keyframes": [
+                            {"id": "av0", "property": "volume", "timeSec": 0.0, "value": 0.05, "easing": "linear"},
+                            {"id": "av1", "property": "volume", "timeSec": 1.8, "value": 1.4, "easing": "linear"},
+                        ],
+                        "fileIndex": 1,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(out_mp4.exists())
+        self.assertTrue(meta["has_audio"])
+        early_rms = self._measure_pcm_rms(out_mp4, 0.05, 0.30)
+        late_rms = self._measure_pcm_rms(out_mp4, 1.45, 0.50)
+        self.assertGreater(late_rms, 0.06)
+        self.assertGreater(late_rms, early_rms * 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()

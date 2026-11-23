@@ -13,6 +13,15 @@ import {
   clampVolume,
 } from "./audio";
 import { hasCustomEffects, normalizeEffects, normalizeTransition } from "./effects";
+import {
+  adjustKeyframesForTrimEnd,
+  adjustKeyframesForTrimStart,
+  clampClipRotation,
+  cloneKeyframes,
+  scaleKeyframesForSpeed,
+  sliceKeyframesForSplit,
+  sortAndDedupeKeyframes,
+} from "./keyframes";
 import { hasCustomOverlayTransform, normalizeOverlayTransform } from "./overlays";
 
 export function createDefaultTracks(): TimelineTrack[] {
@@ -76,11 +85,13 @@ export function computeSpeedAdjustedClip(
   const nextTransitionOut = clip.transitionOut
     ? normalizeTransition(clip.transitionOut, nextDuration)
     : undefined;
+  const scaledKeyframes = scaleKeyframesForSpeed(clip.keyframes, clip.duration, nextDuration);
 
   return {
     ...clip,
     speed: safeNextSpeed,
     duration: nextDuration,
+    keyframes: scaledKeyframes,
     ...(clip.fadeInSec !== undefined
       ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, nextDuration) }
       : {}),
@@ -186,16 +197,24 @@ export function splitClipAtTimestamp(
   const rightTransitionOut = target.transitionOut
     ? normalizeTransition(target.transitionOut, rightDuration)
     : undefined;
+  const { leftKeyframes, rightKeyframes } = sliceKeyframesForSplit(
+    target,
+    leftDuration,
+    leftDuration,
+    rightDuration
+  );
 
   const leftClip: TimelineClip = {
     ...target,
     duration: leftDuration,
     fadeInSec: clampFadeSeconds(target.fadeInSec, leftDuration),
     fadeOutSec: 0,
+    keyframes: leftKeyframes,
     ...(leftTransitionIn ? { transitionIn: leftTransitionIn } : {}),
     transitionOut: undefined,
     effects: target.effects ? { ...target.effects } : undefined,
     overlayTransform: target.overlayTransform ? { ...target.overlayTransform } : undefined,
+    textStyle: target.textStyle ? { ...target.textStyle } : undefined,
   };
 
   const rightClip: TimelineClip = {
@@ -206,6 +225,7 @@ export function splitClipAtTimestamp(
     inPoint: rightInPoint,
     fadeInSec: 0,
     fadeOutSec: clampFadeSeconds(target.fadeOutSec, rightDuration),
+    keyframes: rightKeyframes,
     transitionIn: undefined,
     ...(rightTransitionOut ? { transitionOut: rightTransitionOut } : {}),
     effects: target.effects ? { ...target.effects } : undefined,
@@ -457,6 +477,7 @@ export function duplicateClipWithoutOverlap(
     ...target,
     id: copyId,
     startTime: copyStart,
+    keyframes: cloneKeyframes(target.keyframes),
     transitionIn: target.transitionIn ? { ...target.transitionIn } : undefined,
     transitionOut: target.transitionOut ? { ...target.transitionOut } : undefined,
     effects: target.effects ? { ...target.effects } : undefined,
@@ -507,10 +528,14 @@ export function trimClipStart(
       : Math.max(0, Number((clip.inPoint + delta * clip.speed).toFixed(2)));
 
   const resolvedDuration = Math.max(0.5, nextDuration);
+  const adjustedKeyframes = clip.keyframes
+    ? adjustKeyframesForTrimStart(clip, delta, resolvedDuration)
+    : undefined;
   return {
     startTime: clampedStart,
     duration: resolvedDuration,
     inPoint: nextInPoint,
+    ...(clip.keyframes !== undefined ? { keyframes: adjustedKeyframes } : {}),
     ...(clip.fadeInSec !== undefined
       ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, resolvedDuration) }
       : {}),
@@ -540,9 +565,13 @@ export function trimClipEnd(
 
   const maxDur = Math.min(sourceMaxDur, neighborMaxDur);
   const clamped = Number(Math.min(maxDur, Math.max(0.5, Number(desiredDuration.toFixed(2)))).toFixed(2));
+  const adjustedKeyframes = clip.keyframes
+    ? adjustKeyframesForTrimEnd(clip, clamped)
+    : undefined;
 
   return {
     duration: clamped,
+    ...(clip.keyframes !== undefined ? { keyframes: adjustedKeyframes } : {}),
     ...(clip.fadeInSec !== undefined
       ? { fadeInSec: clampFadeSeconds(clip.fadeInSec, clamped) }
       : {}),
@@ -637,6 +666,12 @@ export function buildStructuredTimelineSpec(
             }
           : {}),
         opacity: c.opacity,
+        ...(Math.abs(clampClipRotation(c.rotation, 0)) > 0.05
+          ? { rotation: clampClipRotation(c.rotation, 0) }
+          : {}),
+        ...(c.keyframes && c.keyframes.length > 0
+          ? { keyframes: sortAndDedupeKeyframes(c.keyframes, dur) }
+          : {}),
         ...(tIn.type !== "none" ? { transitionIn: tIn } : {}),
         ...(tOut.type !== "none" ? { transitionOut: tOut } : {}),
         ...(hasCustomEffects(normEffects) ? { effects: normEffects } : {}),

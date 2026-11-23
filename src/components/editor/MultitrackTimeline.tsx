@@ -30,6 +30,7 @@ import {
   normalizeTransition,
 } from "../../utils/effects";
 import { formatTimecode } from "../../utils/media";
+import { cloneKeyframes, formatKeyframeValueDisplay, KEYFRAME_PROPERTY_SPECS } from "../../utils/keyframes";
 import { trimClipEnd, trimClipStart } from "../../utils/timeline";
 import { usePlaybackTime, type TimelinePlaybackClock } from "../../utils/timelineClock";
 import { WaveformCanvas } from "./WaveformCanvas";
@@ -57,6 +58,7 @@ function cloneClipForSnapshot(c: TimelineClip): TimelineClip {
     ...c,
     // Keep immutable waveformPeaks array by reference
     waveformPeaks: c.waveformPeaks,
+    keyframes: cloneKeyframes(c.keyframes),
     textStyle: c.textStyle ? { ...c.textStyle } : undefined,
     transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
     transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
@@ -171,6 +173,8 @@ interface TimelineClipItemProps {
   isSelected: boolean;
   isDragging: boolean;
   activeTool: "select" | "razor";
+  onSelectClip: (clipId: string | null) => void;
+  onSeek: (time: number) => void;
   onClipMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
   onTrimLeftMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
   onTrimRightMouseDown: (e: React.MouseEvent<HTMLDivElement>, clip: TimelineClip, trackLocked: boolean) => void;
@@ -185,13 +189,16 @@ const TimelineClipItem = React.memo(function TimelineClipItem({
   isSelected,
   isDragging,
   activeTool,
+  onSelectClip,
+  onSeek,
   onClipMouseDown,
   onTrimLeftMouseDown,
   onTrimRightMouseDown,
 }: TimelineClipItemProps) {
   const leftPx = clip.startTime * zoomPxPerSec;
   const widthPx = Math.max(28, clip.duration * zoomPxPerSec);
-  const isClipMuted = Boolean(clip.muted || trackMuted || clip.volume <= 0.001);
+  const hasVolumeKf = Boolean(clip.keyframes?.some((k) => k.property === "volume"));
+  const isClipMuted = Boolean(clip.muted || trackMuted || (!hasVolumeKf && clip.volume <= 0.001));
   const targetBars = Math.max(14, Math.min(140, Math.round(widthPx / 3.5)));
 
   const waveformBars = useMemo(
@@ -374,6 +381,31 @@ const TimelineClipItem = React.memo(function TimelineClipItem({
           )}
         </div>
       </div>
+
+      {/* Keyframe Diamond Markers */}
+      {clip.keyframes && clip.keyframes.length > 0 && clip.duration > 0 && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0.5 h-3 z-[2]">
+          {clip.keyframes.map((kf) => {
+            const pct = Math.max(2, Math.min(98, (kf.timeSec / clip.duration) * 100));
+            return (
+              <button
+                key={kf.id}
+                type="button"
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  onSelectClip(clip.id);
+                  onSeek(Number((clip.startTime + kf.timeSec).toFixed(2)));
+                }}
+                onClick={(e) => e.stopPropagation()}
+                style={{ left: `${pct}%` }}
+                className="pointer-events-auto absolute top-1/2 -translate-x-1/2 -translate-y-1/2 h-2 w-2 rotate-45 bg-amber-400 border border-zinc-950 hover:scale-125 transition-transform"
+                title={`${KEYFRAME_PROPERTY_SPECS[kf.property].shortLabel} @ ${kf.timeSec.toFixed(2)}s = ${formatKeyframeValueDisplay(kf.property, kf.value)} (${kf.easing})`}
+                aria-label={`Jump to ${kf.property} keyframe at ${kf.timeSec.toFixed(2)}s`}
+              />
+            );
+          })}
+        </div>
+      )}
 
       {/* Right Trim Handle */}
       {!trackLocked && (
@@ -1091,6 +1123,8 @@ export const MultitrackTimeline = React.memo(function MultitrackTimeline({
                       isSelected={clip.id === selectedClipId}
                       isDragging={clip.id === draggingClipId}
                       activeTool={activeTool}
+                      onSelectClip={onSelectClip}
+                      onSeek={onSeek}
                       onClipMouseDown={handleClipMouseDown}
                       onTrimLeftMouseDown={handleTrimLeftMouseDown}
                       onTrimRightMouseDown={handleTrimRightMouseDown}

@@ -24,6 +24,8 @@ export const AssistantRequestSchema = z.object({
         speed: z.number(),
         volume: z.number(),
         opacity: z.number().optional(),
+        rotation: z.number().optional(),
+        keyframes: z.array(z.record(z.string(), z.unknown())).optional(),
         effects: z.record(z.string(), z.unknown()).optional(),
         transitionIn: z.record(z.string(), z.unknown()).optional(),
         transitionOut: z.record(z.string(), z.unknown()).optional(),

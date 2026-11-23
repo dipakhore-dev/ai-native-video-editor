@@ -43,6 +43,32 @@ export const OverlayTransformSchema = z.object({
   lockAspectRatio: z.boolean().default(true),
 });
 
+export const ClipKeyframeSchema = z
+  .object({
+    id: z.string().min(1).max(120),
+    timeSec: z.number().finite().min(0).max(86400),
+    property: z.enum(["x", "y", "scale", "rotation", "opacity", "volume"]),
+    value: z.number().finite(),
+    easing: z.enum(["linear", "ease-in", "ease-out", "ease-in-out", "hold"]).default("linear"),
+  })
+  .superRefine((kf, ctx) => {
+    const bounds: Record<string, [number, number]> = {
+      x: [0, 100],
+      y: [0, 100],
+      scale: [0.1, 2],
+      rotation: [-360, 360],
+      opacity: [0, 1],
+      volume: [0, 2],
+    };
+    const [min, max] = bounds[kf.property] ?? [-360, 360];
+    if (kf.value < min || kf.value > max) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Keyframe value for ${kf.property} must be between ${min} and ${max}.`,
+      });
+    }
+  });
+
 export const TimelineClipSchema = z.object({
   id: z.string().min(1),
   assetId: z.string().min(1),
@@ -61,6 +87,8 @@ export const TimelineClipSchema = z.object({
   duckingAmount: z.number().min(0).max(0.95).optional().default(0.6),
   speed: z.number().min(0.5).max(2).default(1),
   opacity: z.number().min(0).max(1).default(1),
+  rotation: z.number().min(-360).max(360).optional(),
+  keyframes: z.array(ClipKeyframeSchema).max(256).optional(),
   transitionIn: ClipTransitionSchema.optional(),
   transitionOut: ClipTransitionSchema.optional(),
   effects: ClipVisualEffectsSchema.optional(),

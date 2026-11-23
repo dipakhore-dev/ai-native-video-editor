@@ -100,6 +100,29 @@ export interface OverlayTransform {
   lockAspectRatio: boolean;
 }
 
+export type KeyframeProperty =
+  | "x"
+  | "y"
+  | "scale"
+  | "rotation"
+  | "opacity"
+  | "volume";
+
+export type KeyframeEasing =
+  | "linear"
+  | "ease-in"
+  | "ease-out"
+  | "ease-in-out"
+  | "hold";
+
+export interface ClipKeyframe {
+  id: string;
+  timeSec: number; // relative to clip start (0 .. clip.duration)
+  property: KeyframeProperty;
+  value: number;
+  easing: KeyframeEasing;
+}
+
 export interface TimelineClip {
   id: string;
   assetId: string;
@@ -118,6 +141,8 @@ export interface TimelineClip {
   duckingAmount?: number; // 0 to 0.95 (fraction attenuated during speech)
   speed: number; // 0.5 to 2
   opacity: number; // 0 to 1
+  rotation?: number; // -360 to 360 degrees
+  keyframes?: ClipKeyframe[];
   transitionIn?: ClipTransition;
   transitionOut?: ClipTransition;
   effects?: ClipVisualEffects;
@@ -204,6 +229,8 @@ export interface RenderTimelineClipSpec {
   duckingEnabled?: boolean;
   duckingAmount?: number;
   opacity: number;
+  rotation?: number;
+  keyframes?: ClipKeyframe[];
   transitionIn?: ClipTransition;
   transitionOut?: ClipTransition;
   effects?: ClipVisualEffects;

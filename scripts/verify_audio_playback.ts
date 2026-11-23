@@ -71,7 +71,7 @@ class MockNode {
   get firstChild() {
     return this.childNodes[0] ?? null;
   }
-  get nextSibling() {
+  get nextSibling(): MockNode | null {
     if (!this.parentNode) return null;
     const idx = this.parentNode.childNodes.indexOf(this);
     return idx >= 0 ? this.parentNode.childNodes[idx + 1] ?? null : null;
@@ -512,9 +512,16 @@ async function testEditorPreviewStageAudioLifecycle() {
     });
   };
 
+  const flushEffects = async () => {
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 15));
+    await Promise.resolve();
+  };
+
   try {
     // 1. Initial mount (paused): AudioContext should NOT be prematurely created while paused
     renderStage();
+    await flushEffects();
     assert.equal(doc.createdAudios.length, 1, "Expected 1 <audio> element for A1 clip");
     const audioEl = doc.createdAudios[0];
     assert.equal(audioEl.src, "blob:a1-music", "<audio> must keep its src after mount");
@@ -536,7 +543,7 @@ async function testEditorPreviewStageAudioLifecycle() {
     assert.equal(MockAudioContext.instances[0].state, "running", "AudioContext created inside Play click must be running");
 
     renderStage();
-    await Promise.resolve();
+    await flushEffects();
     assert.equal(audioEl.events.removeSrcCount, 0, "Playing transition must NOT strip audio src");
     assert.equal(audioEl.events.loadCount, 0, "Playing transition must NOT call load()");
     assert.equal(audioEl.src, "blob:a1-music");
@@ -556,6 +563,7 @@ async function testEditorPreviewStageAudioLifecycle() {
         clock.setTime(t);
       });
     }
+    await flushEffects();
     assert.equal(
       audioEl.events.removeSrcCount,
       0,
@@ -573,6 +581,7 @@ async function testEditorPreviewStageAudioLifecycle() {
     flushSync(() => {
       clock.setTime(5.0, true);
     });
+    await flushEffects();
     assert.ok(
       audioEl.events.seeks.some((s) => Math.abs(s - 5.0) < 0.05),
       "Jumping timeline to 5.0s must seek A1 audio to 5.0s"
@@ -593,14 +602,17 @@ async function testEditorPreviewStageAudioLifecycle() {
     flushSync(() => {
       clock.setTime(14.5, true);
     });
+    await flushEffects();
     assert.equal(audioEl.paused, true, "A1 audio must pause once playhead passes clip end");
 
     // 5. Seek back to 2.0s, test trim & split & speed & mutes
     isPlaying = false;
     renderStage();
+    await flushEffects();
     flushSync(() => {
       clock.setTime(2.0, true);
     });
+    await flushEffects();
 
     // Trim start of A1 clip -> shifts startTime to 1.0 and inPoint to 1.0
     const trimPatch = trimClipStart(project.clips[1], 1.0, [project.clips[1]]);
@@ -610,7 +622,7 @@ async function testEditorPreviewStageAudioLifecycle() {
     };
     isPlaying = true;
     renderStage();
-    await Promise.resolve();
+    await flushEffects();
     assert.equal(audioEl.paused, false);
     assert.ok(
       audioEl.events.seeks.some((s) => Math.abs(s - 2.0) < 0.05),
@@ -622,6 +634,7 @@ async function testEditorPreviewStageAudioLifecycle() {
     playbackRate = 1.5;
     project = { ...project, clips: speedRes.clips };
     renderStage();
+    await flushEffects();
     assert.equal(audioEl.preservesPitch, true);
     assert.ok(Math.abs(audioEl.playbackRate - 2.25) < 0.01);
 
@@ -631,11 +644,12 @@ async function testEditorPreviewStageAudioLifecycle() {
     assert.equal(splitRes.didSplit, true);
     project = { ...project, clips: splitRes.clips };
     renderStage();
+    await flushEffects();
     assert.equal(doc.createdAudios.length, 2, "Split A1 clip must mount right-half <audio> element");
     flushSync(() => {
       clock.setTime(4.5, true);
     });
-    await Promise.resolve();
+    await flushEffects();
     const rightAudioEl = doc.createdAudios[1];
     assert.equal(audioEl.paused, true, "Left split A1 half must pause at t=4.5");
     assert.equal(rightAudioEl.paused, false, "Right split A1 half must play at t=4.5");
@@ -647,6 +661,7 @@ async function testEditorPreviewStageAudioLifecycle() {
       tracks: project.tracks.map((t) => (t.id === "track_a1" ? { ...t, muted: true } : t)),
     };
     renderStage();
+    await flushEffects();
     assert.equal(rightAudioEl.muted, true, "Track A1 mute must mute active audio element");
 
     project = {
@@ -654,27 +669,33 @@ async function testEditorPreviewStageAudioLifecycle() {
       tracks: project.tracks.map((t) => (t.id === "track_a1" ? { ...t, muted: false } : t)),
     };
     renderStage();
+    await flushEffects();
     assert.equal(rightAudioEl.muted, false, "Unmuting Track A1 must unmute active audio element");
 
     masterMuted = true;
     renderStage();
+    await flushEffects();
     assert.equal(rightAudioEl.muted, true, "Master mute must mute active audio element");
 
     masterMuted = false;
     renderStage();
+    await flushEffects();
     assert.equal(rightAudioEl.muted, false, "Unmuting master must restore active audio element");
 
     // 6. Unmount / delete clip cleanup DOES remove src cleanly when actually unmounted
     project = { ...project, clips: [project.clips[0]] };
     renderStage();
+    await flushEffects();
     assert.ok(audioEl.events.removeSrcCount >= 1, "Unmounting deleted audio clip must clean up src");
     assert.ok(rightAudioEl.events.removeSrcCount >= 1, "Unmounting deleted split audio clip must clean up src");
 
     flushSync(() => {
       root.unmount();
     });
+    await flushEffects();
     assert.equal(MockAudioContext.instances[0].closedCalls, 1, "Unmounting stage must close AudioContext");
   } finally {
+    await flushEffects();
     (globalThis as Record<string, unknown>).window = origWindow;
     (globalThis as Record<string, unknown>).document = origDocument;
   }

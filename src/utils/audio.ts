@@ -1,4 +1,5 @@
 import type { SpeechInterval, SubtitleSegment, TimelineClip } from "../types/studio";
+import { evaluateClipProperty } from "./keyframes";
 import { waveformCache } from "./mediaCache";
 
 export const SUPPORTED_AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"] as const;
@@ -348,12 +349,21 @@ export function computeEffectiveClipGain(params: {
     v1AudibleAtTime = false,
   } = params;
 
-  const isMuted = Boolean(masterMuted || trackMuted || clip.muted || clip.volume <= 0.001);
+  const localTime = Math.max(0, timelineTimeSec - clip.startTime);
+  const hasVolumeKeyframes = Boolean(
+    clip.keyframes?.some((kf) => kf.property === "volume")
+  );
+  const evaluatedVolume = hasVolumeKeyframes
+    ? evaluateClipProperty(clip, "volume", localTime)
+    : clampVolume(clip.volume, 1);
+
+  const isMuted = Boolean(
+    masterMuted || trackMuted || clip.muted || (!hasVolumeKeyframes && clip.volume <= 0.001)
+  );
   if (isMuted) {
     return { effectiveGain: 0, isMuted: true };
   }
 
-  const localTime = Math.max(0, timelineTimeSec - clip.startTime);
   const fade = computeClipFadeEnvelope(
     localTime,
     clip.duration,
@@ -371,7 +381,7 @@ export function computeEffectiveClipGain(params: {
         )
       : 1;
 
-  const base = clampVolume(clip.volume, 1);
+  const base = clampVolume(evaluatedVolume, 1);
   const master = Math.max(0, Math.min(1, masterVolume));
   const effectiveGain = Number(Math.max(0, Math.min(2, master * base * fade * duck)).toFixed(4));
 

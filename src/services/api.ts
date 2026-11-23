@@ -8,6 +8,7 @@ import type {
   TimelineClip,
 } from "../types/studio";
 import { AiEditPlanSchema, type AiEditPlan } from "../utils/aiOperations";
+import { clampClipRotation, sortAndDedupeKeyframes } from "../utils/keyframes";
 import { createDefaultTracks, ensureProjectTracks } from "../utils/timeline";
 
 export interface ApiResult<T> {
@@ -112,6 +113,14 @@ export interface TimelineMetadataPayload {
     speed: number;
     volume: number;
     opacity?: number;
+    rotation?: number;
+    keyframes?: Array<{
+      id: string;
+      timeSec: number;
+      property: string;
+      value: number;
+      easing: string;
+    }>;
     effects?: Record<string, unknown>;
     transitionIn?: Record<string, unknown>;
     transitionOut?: Record<string, unknown>;
@@ -529,6 +538,12 @@ export function mapServerProjectToStudioProject(dto: ServerProjectDto): Project 
       ...(c.transitionOut ? { transitionOut: { ...c.transitionOut } } : {}),
       ...(c.effects ? { effects: { ...c.effects } } : {}),
       ...(c.overlayTransform ? { overlayTransform: { ...c.overlayTransform } } : {}),
+      ...(Number.isFinite(Number(c.rotation)) && Math.abs(Number(c.rotation)) > 0.05
+        ? { rotation: clampClipRotation(Number(c.rotation), 0) }
+        : {}),
+      ...(Array.isArray(c.keyframes) && c.keyframes.length > 0
+        ? { keyframes: sortAndDedupeKeyframes(c.keyframes, c.duration) }
+        : {}),
       ...(c.sourceWidth ? { sourceWidth: c.sourceWidth } : {}),
       ...(c.sourceHeight ? { sourceHeight: c.sourceHeight } : {}),
       objectUrl: "",
@@ -542,7 +557,13 @@ export function mapServerProjectToStudioProject(dto: ServerProjectDto): Project 
   };
 }
 
-function serializeClipForServer(clip: TimelineClip) {
+export function serializeClipForServer(clip: TimelineClip) {
+  const normalizedKeyframes =
+    clip.keyframes && clip.keyframes.length > 0
+      ? sortAndDedupeKeyframes(clip.keyframes, Math.max(0.1, Number(clip.duration.toFixed(2))))
+      : undefined;
+  const clampedRotation = clampClipRotation(clip.rotation, 0);
+
   return {
     id: clip.id,
     assetId: clip.assetId,
@@ -565,6 +586,10 @@ function serializeClipForServer(clip: TimelineClip) {
       : {}),
     speed: Math.min(2, Math.max(0.5, Number(clip.speed.toFixed(2)))),
     opacity: Math.min(1, Math.max(0, Number(clip.opacity.toFixed(3)))),
+    ...(Math.abs(clampedRotation) > 0.05 ? { rotation: clampedRotation } : {}),
+    ...(normalizedKeyframes && normalizedKeyframes.length > 0
+      ? { keyframes: normalizedKeyframes }
+      : {}),
     ...(clip.transitionIn ? { transitionIn: clip.transitionIn } : {}),
     ...(clip.transitionOut ? { transitionOut: clip.transitionOut } : {}),
     ...(clip.effects ? { effects: clip.effects } : {}),

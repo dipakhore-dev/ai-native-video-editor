@@ -41,6 +41,14 @@ export interface IOverlayTransformSubdoc {
   lockAspectRatio: boolean;
 }
 
+export interface IClipKeyframeSubdoc {
+  id: string;
+  timeSec: number;
+  property: "x" | "y" | "scale" | "rotation" | "opacity" | "volume";
+  value: number;
+  easing: "linear" | "ease-in" | "ease-out" | "ease-in-out" | "hold";
+}
+
 export interface ITimelineClipSubdoc {
   id: string;
   assetId: string;
@@ -59,6 +67,8 @@ export interface ITimelineClipSubdoc {
   duckingAmount?: number;
   speed: number;
   opacity: number;
+  rotation?: number;
+  keyframes?: IClipKeyframeSubdoc[];
   transitionIn?: IClipTransitionSubdoc;
   transitionOut?: IClipTransitionSubdoc;
   effects?: IClipVisualEffectsSubdoc;
@@ -174,6 +184,25 @@ const OverlayTransformSchema = new Schema<IOverlayTransformSubdoc>(
   { _id: false }
 );
 
+const ClipKeyframeSchema = new Schema<IClipKeyframeSubdoc>(
+  {
+    id: { type: String, required: true },
+    timeSec: { type: Number, required: true, min: 0 },
+    property: {
+      type: String,
+      enum: ["x", "y", "scale", "rotation", "opacity", "volume"],
+      required: true,
+    },
+    value: { type: Number, required: true },
+    easing: {
+      type: String,
+      enum: ["linear", "ease-in", "ease-out", "ease-in-out", "hold"],
+      default: "linear",
+    },
+  },
+  { _id: false }
+);
+
 const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
   {
     id: { type: String, required: true },
@@ -193,6 +222,8 @@ const TimelineClipSchema = new Schema<ITimelineClipSubdoc>(
     duckingAmount: { type: Number, default: 0.6, min: 0, max: 0.95 },
     speed: { type: Number, default: 1, min: 0.5, max: 2 },
     opacity: { type: Number, default: 1, min: 0, max: 1 },
+    rotation: { type: Number, default: 0, min: -360, max: 360 },
+    keyframes: { type: [ClipKeyframeSchema], required: false, default: undefined },
     transitionIn: { type: ClipTransitionSchema, required: false },
     transitionOut: { type: ClipTransitionSchema, required: false },
     effects: { type: ClipVisualEffectsSchema, required: false },

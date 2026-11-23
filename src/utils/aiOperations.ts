@@ -1,6 +1,15 @@
 import { z } from "zod";
-import type { Project, TimelineClip } from "../types/studio";
+import type { KeyframeProperty, Project, TimelineClip } from "../types/studio";
 import { normalizeEffects, normalizeTransition } from "./effects";
+import {
+  clampKeyframeTime,
+  clampPropertyValue,
+  clearPropertyKeyframes,
+  cloneKeyframes,
+  getSupportedKeyframeProperties,
+  KEYFRAME_PROPERTY_SPECS,
+  upsertClipKeyframe,
+} from "./keyframes";
 import {
   applyOverlayPreset,
   normalizeOverlayTransform,
@@ -147,6 +156,53 @@ export const SetOverlayTransformOpSchema = z.object({
   reason: z.string().min(1),
 });
 
+export const KeyframePropertyEnum = z.enum([
+  "x",
+  "y",
+  "scale",
+  "rotation",
+  "opacity",
+  "volume",
+]);
+
+export const KeyframeEasingEnum = z.enum([
+  "linear",
+  "ease-in",
+  "ease-out",
+  "ease-in-out",
+  "hold",
+]);
+
+export const SetClipKeyframesOpSchema = z.object({
+  type: z.literal("set_clip_keyframes"),
+  clipId: z.string().optional(),
+  property: KeyframePropertyEnum,
+  fromValue: z.number().min(-360).max(360).optional(),
+  toValue: z.number().min(-360).max(360).optional(),
+  startOffsetSec: z.number().min(0).max(3600).optional(),
+  endOffsetSec: z.number().min(0).max(3600).optional(),
+  easing: KeyframeEasingEnum.optional().default("ease-in-out"),
+  keyframes: z
+    .array(
+      z.object({
+        timeSec: z.number().min(0).max(3600),
+        value: z.number().min(-360).max(360),
+        easing: KeyframeEasingEnum.optional(),
+      })
+    )
+    .min(1)
+    .max(32)
+    .optional(),
+  reason: z.string().min(1),
+});
+
+export const ClearClipKeyframesOpSchema = z.object({
+  type: z.literal("clear_clip_keyframes"),
+  clipId: z.string().optional(),
+  property: KeyframePropertyEnum.optional(),
+  reason: z.string().min(1),
+});
+
 export const UnsupportedOpSchema = z.object({
   type: z.literal("unsupported"),
   requestedAction: z.string().min(1),
@@ -168,6 +224,8 @@ export const AiEditOperationSchema = z.discriminatedUnion("type", [
   SetClipTransitionOpSchema,
   SetClipOpacityOpSchema,
   SetOverlayTransformOpSchema,
+  SetClipKeyframesOpSchema,
+  ClearClipKeyframesOpSchema,
   UnsupportedOpSchema,
 ]);
 
@@ -225,6 +283,35 @@ function findOverlayClip(
     .filter((c) => c.trackId === "track_v2" && (c.kind === "image" || c.kind === "video"))
     .sort((a, b) => a.startTime - b.startTime);
   return v2Sorted[0] ?? null;
+}
+
+function findKeyframeTargetClip(
+  clips: TimelineClip[],
+  property: KeyframeProperty,
+  clipId?: string,
+  fallbackClipId?: string | null
+): TimelineClip | null {
+  if (clipId) {
+    const exact = clips.find((c) => c.id === clipId);
+    if (exact) return exact;
+  }
+  if (fallbackClipId) {
+    const selected = clips.find(
+      (c) => c.id === fallbackClipId && getSupportedKeyframeProperties(c).includes(property)
+    );
+    if (selected) return selected;
+  }
+  if (property === "volume") {
+    const a1First = clips
+      .filter((c) => c.trackId === "track_a1")
+      .sort((a, b) => a.startTime - b.startTime)[0];
+    if (a1First) return a1First;
+  }
+  return findTargetClip(
+    clips.filter((c) => getSupportedKeyframeProperties(c).includes(property)),
+    undefined,
+    fallbackClipId
+  );
 }
 
 export function describeAiOperation(op: AiEditOperation, project: Project): string {
@@ -322,6 +409,24 @@ export function describeAiOperation(op: AiEditOperation, project: Project): stri
       if (op.heightPct !== undefined) details.push(`height ${op.heightPct}%`);
       return `Update ${label} transform (${details.join(", ") || "overlay settings"})`;
     }
+    case "set_clip_keyframes": {
+      const target = findKeyframeTargetClip(project.clips, op.property, op.clipId);
+      const label = target ? `"${target.name}"` : "clip";
+      const propLabel = KEYFRAME_PROPERTY_SPECS[op.property]?.label ?? op.property;
+      if (op.keyframes && op.keyframes.length > 0) {
+        return `Animate ${propLabel} on ${label} across ${op.keyframes.length} keyframes`;
+      }
+      return `Animate ${propLabel} on ${label} from ${op.fromValue ?? "start"} to ${
+        op.toValue ?? "end"
+      } (${op.easing ?? "ease-in-out"})`;
+    }
+    case "clear_clip_keyframes": {
+      const target = findTargetClip(project.clips, op.clipId);
+      const label = target ? `"${target.name}"` : "clip";
+      return op.property
+        ? `Clear ${op.property} keyframes on ${label}`
+        : `Clear all keyframes on ${label}`;
+    }
     case "unsupported":
       return `Unsupported: ${op.requestedAction}`;
   }
@@ -337,6 +442,7 @@ export function applyAiOperationsToProject(
     tracks: ensureProjectTracks(project.tracks).map((t) => ({ ...t })),
     clips: project.clips.map((c) => ({
       ...c,
+      keyframes: cloneKeyframes(c.keyframes),
       transitionIn: c.transitionIn ? { ...c.transitionIn } : undefined,
       transitionOut: c.transitionOut ? { ...c.transitionOut } : undefined,
       effects: c.effects ? { ...c.effects } : undefined,
@@ -748,6 +854,93 @@ export function applyAiOperationsToProject(
                   : {}),
               }
             : c
+        ),
+      };
+      appliedCount++;
+      continue;
+    }
+
+    if (op.type === "set_clip_keyframes") {
+      const target = findKeyframeTargetClip(next.clips, op.property, op.clipId, selectedClipId);
+      if (!target) {
+        skippedMessages.push(`No clip found to animate "${op.property}".`);
+        continue;
+      }
+      if (!getSupportedKeyframeProperties(target).includes(op.property)) {
+        skippedMessages.push(
+          `Clip "${target.name}" (${target.kind}) does not support "${op.property}" keyframes.`
+        );
+        continue;
+      }
+
+      let workingKeyframes = cloneKeyframes(target.keyframes) ?? [];
+      if (op.keyframes && op.keyframes.length > 0) {
+        for (const entry of op.keyframes) {
+          workingKeyframes = upsertClipKeyframe(
+            workingKeyframes,
+            {
+              property: op.property,
+              timeSec: clampKeyframeTime(entry.timeSec, target.duration),
+              value: clampPropertyValue(op.property, entry.value),
+              easing: entry.easing ?? op.easing ?? "ease-in-out",
+            },
+            target.duration
+          ).keyframes;
+        }
+      } else if (op.fromValue !== undefined && op.toValue !== undefined) {
+        const startOffset = clampKeyframeTime(op.startOffsetSec ?? 0, target.duration);
+        let endOffset = clampKeyframeTime(op.endOffsetSec ?? target.duration, target.duration);
+        if (endOffset <= startOffset && target.duration > 0.05) {
+          endOffset = target.duration;
+        }
+        workingKeyframes = upsertClipKeyframe(
+          workingKeyframes,
+          {
+            property: op.property,
+            timeSec: startOffset,
+            value: clampPropertyValue(op.property, op.fromValue),
+            easing: op.easing ?? "ease-in-out",
+          },
+          target.duration
+        ).keyframes;
+        workingKeyframes = upsertClipKeyframe(
+          workingKeyframes,
+          {
+            property: op.property,
+            timeSec: endOffset,
+            value: clampPropertyValue(op.property, op.toValue),
+            easing: "linear",
+          },
+          target.duration
+        ).keyframes;
+      } else {
+        skippedMessages.push(
+          `Keyframes for "${op.property}" on "${target.name}" require fromValue/toValue or an explicit keyframes array.`
+        );
+        continue;
+      }
+
+      next = {
+        ...next,
+        clips: next.clips.map((c) =>
+          c.id === target.id ? { ...c, keyframes: workingKeyframes } : c
+        ),
+      };
+      appliedCount++;
+      continue;
+    }
+
+    if (op.type === "clear_clip_keyframes") {
+      const target = findTargetClip(next.clips, op.clipId, selectedClipId);
+      if (!target) {
+        skippedMessages.push("No clip found to clear keyframes.");
+        continue;
+      }
+      const remaining = clearPropertyKeyframes(target.keyframes, op.property);
+      next = {
+        ...next,
+        clips: next.clips.map((c) =>
+          c.id === target.id ? { ...c, keyframes: remaining } : c
         ),
       };
       appliedCount++;

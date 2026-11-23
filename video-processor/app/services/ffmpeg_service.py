@@ -1250,6 +1250,199 @@ def _build_visual_effects_filter_steps(
     return steps
 
 
+_KEYFRAME_BOUNDS: dict[str, tuple[float, float]] = {
+    "x": (0.0, 100.0),
+    "y": (0.0, 100.0),
+    "scale": (0.1, 2.0),
+    "rotation": (-360.0, 360.0),
+    "opacity": (0.0, 1.0),
+    "volume": (0.0, 2.0),
+}
+_VALID_KEYFRAME_EASINGS = {"linear", "ease-in", "ease-out", "ease-in-out", "hold"}
+
+
+def _clamp_kf_value(prop: str, value: float) -> float:
+    lo, hi = _KEYFRAME_BOUNDS.get(prop, (0.0, 100.0))
+    return max(lo, min(hi, float(value)))
+
+
+def _normalize_clip_keyframes(
+    raw_keyframes: object,
+    duration_sec: float | None = None,
+) -> dict[str, list[dict]]:
+    if not isinstance(raw_keyframes, list) or len(raw_keyframes) == 0:
+        return {}
+    grouped_dedupe: dict[tuple[str, str], dict] = {}
+    max_t = float(duration_sec) if (duration_sec is not None and duration_sec > 0) else None
+    for item in raw_keyframes:
+        if not isinstance(item, dict):
+            continue
+        prop = str(item.get("property") or "").strip()
+        if prop not in _KEYFRAME_BOUNDS:
+            continue
+        try:
+            t_val = float(item.get("timeSec", 0.0))
+            v_val = float(item.get("value", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(t_val) or not math.isfinite(v_val):
+            continue
+        clamped_t = max(0.0, t_val)
+        if max_t is not None:
+            clamped_t = min(max_t, clamped_t)
+        clamped_t = round(clamped_t, 3)
+        easing = str(item.get("easing") or "linear").strip()
+        if easing not in _VALID_KEYFRAME_EASINGS:
+            easing = "linear"
+        grouped_dedupe[(prop, f"{clamped_t:.3f}")] = {
+            "property": prop,
+            "timeSec": clamped_t,
+            "value": _clamp_kf_value(prop, v_val),
+            "easing": easing,
+        }
+
+    grouped: dict[str, list[dict]] = {}
+    for entry in grouped_dedupe.values():
+        grouped.setdefault(entry["property"], []).append(entry)
+    for prop, items in grouped.items():
+        items.sort(key=lambda kf: float(kf["timeSec"]))
+    return grouped
+
+
+def _is_prop_animated(prop_kfs: Sequence[dict]) -> bool:
+    if len(prop_kfs) < 2:
+        return False
+    first_v = float(prop_kfs[0]["value"])
+    return any(abs(float(k["value"]) - first_v) > 1e-4 for k in prop_kfs[1:])
+
+
+def _resolve_kf_scalar(prop_kfs: Sequence[dict], default_val: float, prop: str) -> float:
+    if prop_kfs:
+        return _clamp_kf_value(prop, float(prop_kfs[0]["value"]))
+    return _clamp_kf_value(prop, float(default_val))
+
+
+def _has_keyframe_or_default_above(
+    kf_map: dict[str, list[dict]],
+    prop: str,
+    default_val: float,
+    threshold: float,
+) -> bool:
+    kfs = kf_map.get(prop)
+    if kfs:
+        return any(float(k["value"]) > threshold for k in kfs)
+    return float(default_val) > threshold
+
+
+def _apply_kf_easing(p: float, easing: str) -> float:
+    c = max(0.0, min(1.0, float(p)))
+    if easing == "hold":
+        return 1.0 if c >= 1.0 else 0.0
+    if easing == "ease-in":
+        return c * c
+    if easing == "ease-out":
+        return 1.0 - (1.0 - c) * (1.0 - c)
+    if easing == "ease-in-out":
+        return 2.0 * c * c if c < 0.5 else 1.0 - ((-2.0 * c + 2.0) ** 2) / 2.0
+    return c
+
+
+def _evaluate_kf_value(
+    prop_kfs: Sequence[dict],
+    local_t: float,
+    default_val: float,
+    prop: str,
+) -> float:
+    safe_default = _clamp_kf_value(prop, default_val)
+    if not prop_kfs:
+        return safe_default
+    if len(prop_kfs) == 1:
+        return _clamp_kf_value(prop, float(prop_kfs[0]["value"]))
+    t = max(0.0, float(local_t))
+    if t <= float(prop_kfs[0]["timeSec"]):
+        return _clamp_kf_value(prop, float(prop_kfs[0]["value"]))
+    last = prop_kfs[-1]
+    if t >= float(last["timeSec"]):
+        return _clamp_kf_value(prop, float(last["value"]))
+    for i in range(len(prop_kfs) - 1):
+        k0 = prop_kfs[i]
+        k1 = prop_kfs[i + 1]
+        t0 = float(k0["timeSec"])
+        t1 = float(k1["timeSec"])
+        if t0 <= t <= t1:
+            span = t1 - t0
+            if span <= 1e-4:
+                return _clamp_kf_value(prop, float(k1["value"]))
+            p = (t - t0) / span
+            eased = _apply_kf_easing(p, str(k0.get("easing") or "linear"))
+            v0 = float(k0["value"])
+            v1 = float(k1["value"])
+            return _clamp_kf_value(prop, v0 + (v1 - v0) * eased)
+    return _clamp_kf_value(prop, float(last["value"]))
+
+
+def _build_ffmpeg_keyframe_expr(
+    prop_kfs: Sequence[dict],
+    default_val: float,
+    *,
+    time_offset: float = 0.0,
+    time_var: str = "t",
+) -> str:
+    if not prop_kfs:
+        return f"{float(default_val):.4f}"
+    if len(prop_kfs) == 1 or not _is_prop_animated(prop_kfs):
+        return f"{float(prop_kfs[0]['value']):.4f}"
+
+    # Filter consecutive keyframes with distinct timestamps (keeping latest value per timestamp)
+    distinct: list[dict] = []
+    for kf in prop_kfs:
+        if distinct and abs(float(kf["timeSec"]) - float(distinct[-1]["timeSec"])) <= 1e-4:
+            distinct[-1] = kf
+        else:
+            distinct.append(kf)
+
+    if len(distinct) == 1 or not _is_prop_animated(distinct):
+        return f"{float(distinct[0]['value']):.4f}"
+
+    lt = f"({time_var}-{float(time_offset):.4f})" if abs(time_offset) > 1e-4 else time_var
+    terms: list[str] = []
+    t_first = float(distinct[0]["timeSec"])
+    v_first = float(distinct[0]["value"])
+    terms.append(f"if(lte({lt}\\,{t_first:.4f})\\,{v_first:.4f}\\,0)")
+
+    for i in range(len(distinct) - 1):
+        k0 = distinct[i]
+        k1 = distinct[i + 1]
+        t0 = float(k0["timeSec"])
+        t1 = float(k1["timeSec"])
+        v0 = float(k0["value"])
+        v1 = float(k1["value"])
+        span = max(1e-4, t1 - t0)
+        easing = str(k0.get("easing") or "linear")
+        p_expr = f"clip(({lt}-{t0:.4f})/{span:.4f}\\,0\\,1)"
+        if easing == "hold":
+            seg_expr = f"{v0:.4f}"
+        elif easing == "linear":
+            seg_expr = f"({v0:.4f}+({v1 - v0:.4f})*{p_expr})"
+        elif easing == "ease-in":
+            seg_expr = f"({v0:.4f}+({v1 - v0:.4f})*pow({p_expr}\\,2))"
+        elif easing == "ease-out":
+            seg_expr = f"({v0:.4f}+({v1 - v0:.4f})*(1-pow(1-{p_expr}\\,2)))"
+        elif easing == "ease-in-out":
+            seg_expr = (
+                f"({v0:.4f}+({v1 - v0:.4f})*"
+                f"if(lt({p_expr}\\,0.5)\\,2*pow({p_expr}\\,2)\\,1-pow(-2*{p_expr}+2\\,2)/2))"
+            )
+        else:
+            seg_expr = f"({v0:.4f}+({v1 - v0:.4f})*{p_expr})"
+        terms.append(f"if(gt({lt}\\,{t0:.4f})*lte({lt}\\,{t1:.4f})\\,{seg_expr}\\,0)")
+
+    t_last = float(distinct[-1]["timeSec"])
+    v_last = float(distinct[-1]["value"])
+    terms.append(f"if(gt({lt}\\,{t_last:.4f})\\,{v_last:.4f}\\,0)")
+    return f"({'+'.join(terms)})"
+
+
 def _build_atempo_filters(speed: float) -> list[str]:
     safe = max(0.25, min(4.0, float(speed)))
     if abs(safe - 1.0) <= 0.005:
@@ -1276,17 +1469,25 @@ def _build_audio_clip_chain(
     fade_in: float,
     fade_out: float,
     speed: float = 1.0,
+    volume_kfs: Sequence[dict] | None = None,
 ) -> str:
     safe_speed = max(0.5, min(2.0, float(speed or 1.0)))
     src_span = max(0.05, src_out - src_in)
     seg_dur = max(0.05, src_span / safe_speed)
     eff_in, eff_out = _resolve_effective_fades(seg_dur, fade_in, fade_out)
+    vol_kfs = list(volume_kfs or ())
+    if _is_prop_animated(vol_kfs):
+        vol_expr = _build_ffmpeg_keyframe_expr(vol_kfs, volume, time_offset=0.0, time_var="t")
+        vol_filter = f"volume='{vol_expr}':eval=frame"
+    else:
+        scalar_vol = _resolve_kf_scalar(vol_kfs, volume, "volume")
+        vol_filter = f"volume={max(0.0, min(2.0, scalar_vol)):.4f}"
     filters = [
         f"atrim=start={src_in:.3f}:end={src_out:.3f}",
         "asetpts=PTS-STARTPTS",
         "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
         *_build_atempo_filters(safe_speed),
-        f"volume={max(0.0, min(2.0, volume)):.4f}",
+        vol_filter,
     ]
     if eff_in > 0.01:
         filters.append(f"afade=t=in:st=0:d={eff_in:.3f}:curve=tri")
@@ -1375,35 +1576,128 @@ def _render_unified_visual_mp4(
                 chain_steps.append("setpts=PTS-STARTPTS")
         chain_steps.append(f"fps={safe_fps}")
 
+        kf_map = seg.get("keyframes") if isinstance(seg.get("keyframes"), dict) else {}
+        x_kfs = kf_map.get("x", [])
+        y_kfs = kf_map.get("y", [])
+        scale_kfs = kf_map.get("scale", [])
+        rot_kfs = kf_map.get("rotation", [])
+        op_kfs = kf_map.get("opacity", [])
+
+        base_rot = float(seg.get("rotation", 0.0) or 0.0)
+        base_op = float(seg.get("opacity", 1.0))
+
+        v1_x_anim = _is_prop_animated(x_kfs)
+        v1_y_anim = _is_prop_animated(y_kfs)
+        v1_sc_anim = _is_prop_animated(scale_kfs)
+        v1_rot_anim = _is_prop_animated(rot_kfs)
+        v1_op_anim = _is_prop_animated(op_kfs)
+
+        scalar_x = _resolve_kf_scalar(x_kfs, 50.0, "x")
+        scalar_y = _resolve_kf_scalar(y_kfs, 50.0, "y")
+        scalar_sc = _resolve_kf_scalar(scale_kfs, 1.0, "scale")
+        scalar_rot = _resolve_kf_scalar(rot_kfs, base_rot, "rotation")
+        scalar_op = _resolve_kf_scalar(op_kfs, base_op, "opacity")
+
+        v1_needs_transform = (
+            v1_x_anim
+            or v1_y_anim
+            or v1_sc_anim
+            or v1_rot_anim
+            or v1_op_anim
+            or abs(scalar_x - 50.0) > 0.05
+            or abs(scalar_y - 50.0) > 0.05
+            or abs(scalar_sc - 1.0) > 0.005
+            or abs(scalar_rot) > 0.05
+        )
+
         fx_steps = _build_visual_effects_filter_steps(
             seg.get("effects"),
-            opacity=float(seg.get("opacity", 1.0)),
+            opacity=1.0 if v1_needs_transform else scalar_op,
             is_overlay=False,
         )
         if fx_steps:
             has_effects_or_tr = True
             chain_steps.extend(fx_steps)
 
-        if idx == 0:
-            edge_in_type, edge_in_dur = _normalize_transition(
-                seg.get("transition_in"), seg_dur * 0.45
-            )
-            if edge_in_type != "none":
-                has_effects_or_tr = True
-                chain_steps.append(f"fade=t=in:st=0:d={edge_in_dur:.3f}")
-        if idx == len(v1_segments) - 1:
-            edge_out_type, edge_out_dur = _normalize_transition(
-                seg.get("transition_out"), seg_dur * 0.45
-            )
-            if edge_out_type != "none":
-                has_effects_or_tr = True
-                fade_st = max(0.0, seg_dur - edge_out_dur)
-                chain_steps.append(f"fade=t=out:st={fade_st:.3f}:d={edge_out_dur:.3f}")
-
-        chain_steps.extend(["format=yuv420p", "settb=AVTB", "setpts=PTS-STARTPTS"])
         is_single_no_post = len(v1_segments) == 1 and not v2_overlays and ass_path is None
         out_label = "[outv]" if is_single_no_post else ("[v1_base]" if len(v1_segments) == 1 else f"[v{idx}]")
-        filter_parts.append(f"[{idx}:v]{','.join(chain_steps)}{out_label}")
+
+        if v1_needs_transform:
+            has_effects_or_tr = True
+            # Ensure clip timestamps start at 0 before frame-evaluated transform expressions
+            chain_steps.append("setpts=PTS-STARTPTS")
+            if v1_sc_anim:
+                sc_expr = _build_ffmpeg_keyframe_expr(scale_kfs, 1.0, time_offset=0.0, time_var="t")
+                chain_steps.append(
+                    f"scale=w='max(4,trunc(iw*({sc_expr})/2)*2)':h='max(4,trunc(ih*({sc_expr})/2)*2)':eval=frame"
+                )
+            elif abs(scalar_sc - 1.0) > 0.005:
+                sw = max(4, int(round(width * scalar_sc / 2.0) * 2))
+                sh = max(4, int(round(height * scalar_sc / 2.0) * 2))
+                chain_steps.append(f"scale={sw}:{sh},setsar=1")
+
+            chain_steps.append("format=rgba")
+            if v1_op_anim:
+                op_expr_t = _build_ffmpeg_keyframe_expr(op_kfs, base_op, time_offset=0.0, time_var="T")
+                chain_steps.append(
+                    f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({op_expr_t})'"
+                )
+            elif scalar_op < 0.995:
+                chain_steps.append(f"colorchannelmixer=aa={scalar_op:.3f}")
+
+            if v1_rot_anim or abs(scalar_rot) > 0.05:
+                rot_expr = _build_ffmpeg_keyframe_expr(rot_kfs, base_rot, time_offset=0.0, time_var="t")
+                chain_steps.append(
+                    f"rotate=a='({rot_expr})*PI/180':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0"
+                )
+
+            fg_lbl = f"[v1fg_{idx}]"
+            bg_lbl = f"[v1bg_{idx}]"
+            filter_parts.append(f"[{idx}:v]{','.join(chain_steps)}{fg_lbl}")
+            filter_parts.append(
+                f"color=c=black:s={width}x{height}:r={safe_fps}:d={seg_dur:.3f}{bg_lbl}"
+            )
+
+            x_expr = _build_ffmpeg_keyframe_expr(x_kfs, 50.0, time_offset=0.0, time_var="t")
+            y_expr = _build_ffmpeg_keyframe_expr(y_kfs, 50.0, time_offset=0.0, time_var="t")
+            post_comp_steps: list[str] = []
+            if idx == 0:
+                edge_in_type, edge_in_dur = _normalize_transition(
+                    seg.get("transition_in"), seg_dur * 0.45
+                )
+                if edge_in_type != "none":
+                    post_comp_steps.append(f"fade=t=in:st=0:d={edge_in_dur:.3f}")
+            if idx == len(v1_segments) - 1:
+                edge_out_type, edge_out_dur = _normalize_transition(
+                    seg.get("transition_out"), seg_dur * 0.45
+                )
+                if edge_out_type != "none":
+                    fade_st = max(0.0, seg_dur - edge_out_dur)
+                    post_comp_steps.append(f"fade=t=out:st={fade_st:.3f}:d={edge_out_dur:.3f}")
+            post_comp_steps.extend(["format=yuv420p", "settb=AVTB", "setpts=PTS-STARTPTS"])
+            filter_parts.append(
+                f"{bg_lbl}{fg_lbl}overlay=x='round((W-w)/2+(({x_expr})-50)/100*W)':"
+                f"y='round((H-h)/2+(({y_expr})-50)/100*H)':shortest=1,{','.join(post_comp_steps)}{out_label}"
+            )
+        else:
+            if idx == 0:
+                edge_in_type, edge_in_dur = _normalize_transition(
+                    seg.get("transition_in"), seg_dur * 0.45
+                )
+                if edge_in_type != "none":
+                    has_effects_or_tr = True
+                    chain_steps.append(f"fade=t=in:st=0:d={edge_in_dur:.3f}")
+            if idx == len(v1_segments) - 1:
+                edge_out_type, edge_out_dur = _normalize_transition(
+                    seg.get("transition_out"), seg_dur * 0.45
+                )
+                if edge_out_type != "none":
+                    has_effects_or_tr = True
+                    fade_st = max(0.0, seg_dur - edge_out_dur)
+                    chain_steps.append(f"fade=t=out:st={fade_st:.3f}:d={edge_out_dur:.3f}")
+
+            chain_steps.extend(["format=yuv420p", "settb=AVTB", "setpts=PTS-STARTPTS"])
+            filter_parts.append(f"[{idx}:v]{','.join(chain_steps)}{out_label}")
 
     seam_overlaps = [d if t != "none" else 0.0 for t, d in seam_transitions]
     expected_v1_dur = max(
@@ -1484,24 +1778,75 @@ def _render_unified_visual_mp4(
                 f"setpts=(PTS-STARTPTS)/{ov_speed:.6f}+{tl_start:.3f}/TB",
             ]
 
-        x_frac, y_frac, box_w, box_h, lock_aspect = _normalize_overlay_transform(
-            ov.get("overlay_transform"),
-            width,
-            height,
-        )
-        if lock_aspect:
-            scale_step = f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease"
-        else:
-            scale_step = f"scale={box_w}:{box_h},setsar=1"
+        kf_map = ov.get("keyframes") if isinstance(ov.get("keyframes"), dict) else {}
+        ov_t = ov.get("overlay_transform") if isinstance(ov.get("overlay_transform"), dict) else {}
+        x_kfs = kf_map.get("x", [])
+        y_kfs = kf_map.get("y", [])
+        scale_kfs = kf_map.get("scale", [])
+        rot_kfs = kf_map.get("rotation", [])
+        op_kfs = kf_map.get("opacity", [])
 
-        ov_steps.extend([scale_step, f"fps={safe_fps}"])
+        base_x = float(ov_t.get("x", 50.0))
+        base_y = float(ov_t.get("y", 50.0))
+        base_scale = float(ov_t.get("scale", 1.0))
+        base_rot = float(ov.get("rotation", 0.0) or 0.0)
+        base_op = float(ov.get("opacity", 1.0))
+
+        sc_anim = _is_prop_animated(scale_kfs)
+        rot_anim = _is_prop_animated(rot_kfs)
+        op_anim = _is_prop_animated(op_kfs)
+
+        scalar_x = _resolve_kf_scalar(x_kfs, base_x, "x")
+        scalar_y = _resolve_kf_scalar(y_kfs, base_y, "y")
+        scalar_scale = _resolve_kf_scalar(scale_kfs, base_scale, "scale")
+        scalar_rot = _resolve_kf_scalar(rot_kfs, base_rot, "rotation")
+        scalar_op = _resolve_kf_scalar(op_kfs, base_op, "opacity")
+
+        if sc_anim:
+            # Normalize base 1x overlay dimensions, then animate scale cleanly per frame
+            _, _, box_w_1x, box_h_1x, lock_aspect = _normalize_overlay_transform(
+                {**ov_t, "scale": 1.0},
+                width,
+                height,
+            )
+            if lock_aspect:
+                ov_steps.append(f"scale={box_w_1x}:{box_h_1x}:force_original_aspect_ratio=decrease")
+            else:
+                ov_steps.extend([f"scale={box_w_1x}:{box_h_1x}", "setsar=1"])
+            sc_expr = _build_ffmpeg_keyframe_expr(scale_kfs, base_scale, time_offset=tl_start, time_var="t")
+            ov_steps.append(
+                f"scale=w='max(4,trunc(iw*({sc_expr})/2)*2)':h='max(4,trunc(ih*({sc_expr})/2)*2)':eval=frame"
+            )
+        else:
+            _, _, box_w, box_h, lock_aspect = _normalize_overlay_transform(
+                {**ov_t, "scale": scalar_scale},
+                width,
+                height,
+            )
+            if lock_aspect:
+                ov_steps.append(f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease")
+            else:
+                ov_steps.extend([f"scale={box_w}:{box_h}", "setsar=1"])
+
+        ov_steps.append(f"fps={safe_fps}")
         ov_steps.extend(
             _build_visual_effects_filter_steps(
                 ov.get("effects"),
-                opacity=float(ov.get("opacity", 1.0)),
+                opacity=1.0 if op_anim else scalar_op,
                 is_overlay=True,
             )
         )
+        if op_anim:
+            op_expr_t = _build_ffmpeg_keyframe_expr(op_kfs, base_op, time_offset=tl_start, time_var="T")
+            ov_steps.append(
+                f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({op_expr_t})'"
+            )
+
+        if rot_anim or abs(scalar_rot) > 0.05:
+            rot_expr = _build_ffmpeg_keyframe_expr(rot_kfs, base_rot, time_offset=tl_start, time_var="t")
+            ov_steps.append(
+                f"rotate=a='({rot_expr})*PI/180':ow='hypot(iw,ih)':oh='hypot(iw,ih)':c=black@0"
+            )
 
         tr_in_type, tr_in_dur = _normalize_transition(ov.get("transition_in"), clip_dur * 0.45)
         tr_out_type, tr_out_dur = _normalize_transition(ov.get("transition_out"), clip_dur * 0.45)
@@ -1517,8 +1862,16 @@ def _render_unified_visual_mp4(
             "[comp_v]" if is_last_ov else f"[base{idx + 1}]"
         )
         filter_parts.append(f"[{in_idx}:v]{','.join(ov_steps)}{ov_lbl}")
+        if _is_prop_animated(x_kfs):
+            x_expr = f"({_build_ffmpeg_keyframe_expr(x_kfs, base_x, time_offset=tl_start, time_var='t')})/100"
+        else:
+            x_expr = f"{scalar_x / 100.0:.5f}"
+        if _is_prop_animated(y_kfs):
+            y_expr = f"({_build_ffmpeg_keyframe_expr(y_kfs, base_y, time_offset=tl_start, time_var='t')})/100"
+        else:
+            y_expr = f"{scalar_y / 100.0:.5f}"
         filter_parts.append(
-            f"{cur_comp_label}{ov_lbl}overlay=x='round(W*{x_frac:.5f}-w/2)':y='round(H*{y_frac:.5f}-h/2)':enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
+            f"{cur_comp_label}{ov_lbl}overlay=x='round(W*{x_expr}-w/2)':y='round(H*{y_expr}-h/2)':enable='between(t,{tl_start:.3f},{tl_end:.3f})':eof_action=pass{next_lbl}"
         )
         cur_comp_label = next_lbl
 
@@ -1878,6 +2231,62 @@ def validate_timeline_export_spec(
                 if sc < 0.1 or sc > 2.0:
                     raise VideoProcessingError(f"Clip '{name}' overlay scale must be between 0.1 and 2.0.", status_code=400)
 
+        raw_rotation = clip.get("rotation")
+        if raw_rotation is not None:
+            rot_val = _require_finite_float(raw_rotation, f"Clip '{name}' rotation")
+            if rot_val < -360.0 or rot_val > 360.0:
+                raise VideoProcessingError(
+                    f"Clip '{name}' rotation must be between -360 and 360 degrees.",
+                    status_code=400,
+                )
+
+        raw_kfs = clip.get("keyframes")
+        if raw_kfs is not None:
+            if not isinstance(raw_kfs, list):
+                raise VideoProcessingError(f"Clip '{name}' keyframes must be an array.", status_code=400)
+            if len(raw_kfs) > 256:
+                raise VideoProcessingError(
+                    f"Clip '{name}' exceeds maximum supported keyframe count (256).",
+                    status_code=400,
+                )
+            for kf_idx, kf in enumerate(raw_kfs):
+                if not isinstance(kf, dict):
+                    raise VideoProcessingError(
+                        f"Clip '{name}' keyframe #{kf_idx + 1} must be an object.",
+                        status_code=400,
+                    )
+                kf_prop = str(kf.get("property") or "").strip()
+                if kf_prop not in _KEYFRAME_BOUNDS:
+                    raise VideoProcessingError(
+                        f"Clip '{name}' keyframe #{kf_idx + 1} has unsupported property '{kf_prop}'.",
+                        status_code=400,
+                    )
+                kf_time = _require_finite_float(
+                    kf.get("timeSec"),
+                    f"Clip '{name}' keyframe #{kf_idx + 1} timeSec",
+                )
+                if kf_time < 0.0:
+                    raise VideoProcessingError(
+                        f"Clip '{name}' keyframe #{kf_idx + 1} timeSec must be >= 0.",
+                        status_code=400,
+                    )
+                kf_val = _require_finite_float(
+                    kf.get("value"),
+                    f"Clip '{name}' keyframe #{kf_idx + 1} value",
+                )
+                lo, hi = _KEYFRAME_BOUNDS[kf_prop]
+                if kf_val < lo or kf_val > hi:
+                    raise VideoProcessingError(
+                        f"Clip '{name}' keyframe #{kf_idx + 1} '{kf_prop}' value ({kf_val}) must be between {lo} and {hi}.",
+                        status_code=400,
+                    )
+                kf_easing = str(kf.get("easing") or "linear").strip()
+                if kf_easing not in _VALID_KEYFRAME_EASINGS:
+                    raise VideoProcessingError(
+                        f"Clip '{name}' keyframe #{kf_idx + 1} has unsupported easing '{kf_easing}'.",
+                        status_code=400,
+                    )
+
     if len(v1_clips) == 0:
         raise VideoProcessingError(
             "Timeline must contain at least one video or image clip on track V1 to export MP4.",
@@ -2198,6 +2607,7 @@ def export_timeline_mp4(
                 )
 
         total_v1_duration += seg_dur
+        v1_kf_map = _normalize_clip_keyframes(clip.get("keyframes"), seg_dur)
         v1_prepared_clips.append({
             "src_path": src_path,
             "src_meta": src_meta,
@@ -2211,6 +2621,8 @@ def export_timeline_mp4(
             "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
             "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
             "opacity": float(clip.get("opacity", 1.0)),
+            "rotation": float(clip.get("rotation", 0.0) or 0.0),
+            "keyframes": v1_kf_map,
             "transition_in": clip.get("transitionIn"),
             "transition_out": clip.get("transitionOut"),
             "effects": clip.get("effects"),
@@ -2250,11 +2662,13 @@ def export_timeline_mp4(
     active_v2_overlays: list[dict] = []
     if not v2_track_muted:
         for idx, clip in enumerate(sorted_v2):
-            if float(clip.get("opacity", 1.0)) <= 0.005:
-                continue
             tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
             tl_dur = max(0.1, float(clip.get("durationSec", 1.0)))
             tl_end = min(expected_v1_dur, tl_start + tl_dur)
+            v2_kf_map = _normalize_clip_keyframes(clip.get("keyframes"), tl_dur)
+            base_op = float(clip.get("opacity", 1.0))
+            if not _has_keyframe_or_default_above(v2_kf_map, "opacity", base_op, 0.005):
+                continue
             if tl_start >= expected_v1_dur - 0.02 or tl_end - tl_start < 0.05:
                 continue
             f_idx = v2_file_indices[idx]
@@ -2288,11 +2702,13 @@ def export_timeline_mp4(
                 "src_in": src_in,
                 "src_out": src_out,
                 "speed": ov_speed,
-                "opacity": float(clip.get("opacity", 1.0)),
+                "opacity": base_op,
+                "rotation": float(clip.get("rotation", 0.0) or 0.0),
                 "volume": float(clip.get("volume", 1.0)),
                 "muted": bool(clip.get("muted", False)) or v2_track_muted or is_image,
                 "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
                 "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
+                "keyframes": v2_kf_map,
                 "transition_in": clip.get("transitionIn"),
                 "transition_out": clip.get("transitionOut"),
                 "effects": clip.get("effects"),
@@ -2303,7 +2719,10 @@ def export_timeline_mp4(
     a1_track_muted = "track_a1" in muted_tracks
     if not a1_track_muted:
         for idx, clip in enumerate(sorted_a1):
-            if bool(clip.get("muted", False)) or float(clip.get("volume", 1.0)) <= 0.001:
+            a1_pre_kfs = _normalize_clip_keyframes(clip.get("keyframes"), float(clip.get("durationSec", 0.0)) or None)
+            if bool(clip.get("muted", False)) or not _has_keyframe_or_default_above(
+                a1_pre_kfs, "volume", float(clip.get("volume", 1.0)), 0.001
+            ):
                 continue
             tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
             if tl_start >= total_v1_duration - 0.02:
@@ -2361,12 +2780,15 @@ def export_timeline_mp4(
             if tl_start >= expected_v1_dur - 0.02 or tl_end - tl_start < 0.05:
                 continue
             opacity = float(clip.get("opacity", 1.0))
-            if opacity <= 0.005:
+            t1_kf_map = _normalize_clip_keyframes(clip.get("keyframes"), tl_dur)
+            if not _has_keyframe_or_default_above(t1_kf_map, "opacity", opacity, 0.005):
                 continue
             active_t1_overlays.append({
                 "start": tl_start,
                 "end": tl_end,
                 "opacity": opacity,
+                "rotation": float(clip.get("rotation", 0.0) or 0.0),
+                "keyframes": t1_kf_map,
                 "transition_in": clip.get("transitionIn"),
                 "transition_out": clip.get("transitionOut"),
                 "textStyle": {**t_style, "text": text_val},
@@ -2420,8 +2842,6 @@ def export_timeline_mp4(
             if a1_track_muted or bool(clip.get("muted", False)):
                 continue
             vol = float(clip.get("volume", 1.0))
-            if vol <= 0.001:
-                continue
             tl_start = max(0.0, float(clip.get("timelineStartSec", 0.0)))
             if tl_start >= expected_v1_dur - 0.02:
                 continue
@@ -2443,6 +2863,10 @@ def export_timeline_mp4(
             effective_out = min(src_out, src_duration) if src_duration > 0 else src_out
             if effective_out - src_in < 0.05:
                 continue
+            seg_rendered_dur = max(0.05, (effective_out - src_in) / a1_speed)
+            a1_kf_map = _normalize_clip_keyframes(clip.get("keyframes"), seg_rendered_dur)
+            if not _has_keyframe_or_default_above(a1_kf_map, "volume", vol, 0.001):
+                continue
 
             active_a1_clips.append({
                 "src_path": src_path,
@@ -2452,6 +2876,7 @@ def export_timeline_mp4(
                 "tl_start": tl_start,
                 "speed": a1_speed,
                 "volume": vol,
+                "keyframes": a1_kf_map,
                 "fade_in": float(clip.get("fadeInSec", 0.0) or 0.0),
                 "fade_out": float(clip.get("fadeOutSec", 0.0) or 0.0),
                 "ducking_enabled": bool(clip.get("duckingEnabled", False)),
@@ -2461,7 +2886,14 @@ def export_timeline_mp4(
             })
 
         v1_has_any_audible = any(
-            bool(item["src_meta"].get("has_audio")) and not item["muted"] and item["volume"] > 0.001
+            bool(item["src_meta"].get("has_audio"))
+            and not item["muted"]
+            and _has_keyframe_or_default_above(
+                item.get("keyframes") or {},
+                "volume",
+                item["volume"],
+                0.001,
+            )
             for item in v1_prepared_clips
         )
         active_v2_audio_clips = [
@@ -2470,7 +2902,12 @@ def export_timeline_mp4(
             if not item["is_image"]
             and bool(item["src_meta"].get("has_audio"))
             and not item["muted"]
-            and item["volume"] > 0.001
+            and _has_keyframe_or_default_above(
+                item.get("keyframes") or {},
+                "volume",
+                item["volume"],
+                0.001,
+            )
         ]
         has_output_audio = v1_has_any_audible or len(active_a1_clips) > 0 or len(active_v2_audio_clips) > 0
 
@@ -2557,7 +2994,11 @@ def export_timeline_mp4(
                 for s_idx, item in enumerate(v1_prepared_clips):
                     seg_dur = float(item["seg_dur"])
                     has_src_audio = bool(item["src_meta"].get("has_audio"))
-                    if not has_src_audio or item["muted"] or item["volume"] <= 0.001:
+                    v1_item_kfs = item.get("keyframes") or {}
+                    v1_has_vol = _has_keyframe_or_default_above(
+                        v1_item_kfs, "volume", item["volume"], 0.001
+                    )
+                    if not has_src_audio or item["muted"] or not v1_has_vol:
                         audio_filters.append(
                             f"anullsrc=channel_layout=stereo:sample_rate=44100:d={seg_dur:.3f}[v1a_{s_idx}]"
                         )
@@ -2587,6 +3028,7 @@ def export_timeline_mp4(
                             fade_in=item["fade_in"],
                             fade_out=item["fade_out"],
                             speed=item["speed"],
+                            volume_kfs=v1_item_kfs.get("volume"),
                         )
                         audio_filters.append(f"{chain}[v1a_{s_idx}]")
                     v1_seg_labels.append(f"[v1a_{s_idx}]")
@@ -2673,6 +3115,7 @@ def export_timeline_mp4(
                     fade_in=item["fade_in"],
                     fade_out=item["fade_out"],
                     speed=item["speed"],
+                    volume_kfs=(item.get("keyframes") or {}).get("volume"),
                 )
                 cur_label = f"[a1_base_{a_idx}]"
                 audio_filters.append(f"{base_chain}{cur_label}")
@@ -2734,6 +3177,7 @@ def export_timeline_mp4(
                     fade_in=item["fade_in"],
                     fade_out=item["fade_out"],
                     speed=item["speed"],
+                    volume_kfs=(item.get("keyframes") or {}).get("volume"),
                 )
                 cur_label = f"[v2a_base_{v2_idx}]"
                 audio_filters.append(f"{base_chain}{cur_label}")
@@ -2759,12 +3203,18 @@ def export_timeline_mp4(
 
             any_boost = (
                 any(
-                    item["volume"] > 1.02
+                    _has_keyframe_or_default_above(item.get("keyframes") or {}, "volume", item["volume"], 1.02)
                     for item in v1_prepared_clips
                     if not item["muted"]
                 )
-                or any(c["volume"] > 1.02 for c in active_a1_clips)
-                or any(c["volume"] > 1.02 for c in active_v2_audio_clips)
+                or any(
+                    _has_keyframe_or_default_above(c.get("keyframes") or {}, "volume", c["volume"], 1.02)
+                    for c in active_a1_clips
+                )
+                or any(
+                    _has_keyframe_or_default_above(c.get("keyframes") or {}, "volume", c["volume"], 1.02)
+                    for c in active_v2_audio_clips
+                )
             )
 
             if len(mix_inputs) == 1:
@@ -3020,48 +3470,126 @@ def _write_ass_subtitles(
     ]
     event_lines: list[str] = []
 
-    # Layer 1: T1 Text Overlay clips (rendered with \pos(x,y) + optional fade)
+    # Layer 1: T1 Text Overlay clips (rendered with \pos(x,y), optional scale/rotation/opacity keyframes + fades)
     for t_idx, ov in enumerate(text_overlays):
         ts = ov.get("textStyle") if isinstance(ov.get("textStyle"), dict) else {}
         escaped = _escape_ass_text(str(ts.get("text", "")))
         if not escaped:
             continue
-        clip_op = max(0.05, min(1.0, float(ov.get("opacity", 1.0))))
-        ov_font_ui = max(12.0, min(120.0, float(ts.get("fontSize", 32))))
-        ov_ass_size = max(18, int(round(ov_font_ui * (height / 540.0))))
-        ov_color = _hex_to_ass_color(str(ts.get("color", "#FFFFFF")), clip_op)
-        ov_bg_op = max(0.0, min(1.0, float(ts.get("backgroundOpacity", 0.6)))) * clip_op
-        ov_bg_hex = str(ts.get("backgroundColor", "#09090B"))
-        if ov_bg_op > 0.05:
-            ov_bs = 3
-            ov_out_col = _hex_to_ass_color(ov_bg_hex, ov_bg_op)
-            ov_back_col = "&HFF000000"
-            ov_out_w = 10
-            ov_shadow = 0
-        else:
-            ov_bs = 1
-            ov_out_col = "&H00000000"
-            ov_back_col = "&H80000000"
-            ov_out_w = 2
-            ov_shadow = 1
-
-        ov_style_name = f"T1_{t_idx}"
-        style_lines.append(
-            f"Style: {ov_style_name},{ass_font_name},{ov_ass_size},{ov_color},&H000000FF,{ov_out_col},{ov_back_col},1,0,0,0,100,100,0,0,{ov_bs},{ov_out_w},{ov_shadow},5,16,16,16,1"
-        )
 
         ov_start = float(ov["start"])
         ov_end = float(ov["end"])
         ov_dur = max(0.1, ov_end - ov_start)
         _, in_d = _normalize_transition(ov.get("transition_in"), ov_dur * 0.45)
         _, out_d = _normalize_transition(ov.get("transition_out"), ov_dur * 0.45)
-        fade_tag = f"\\fad({int(round(in_d * 1000))},{int(round(out_d * 1000))})" if (in_d > 0.05 or out_d > 0.05) else ""
 
-        pos_x = int(round((max(0.0, min(100.0, float(ts.get("x", 50.0)))) / 100.0) * width))
-        pos_y = int(round((max(0.0, min(100.0, float(ts.get("y", 82.0)))) / 100.0) * height))
-        event_lines.append(
-            f"Dialogue: 1,{_format_ass_timestamp(ov_start)},{_format_ass_timestamp(ov_end)},{ov_style_name},,0,0,0,,{{\\an5\\pos({pos_x},{pos_y}){fade_tag}}}{escaped}"
+        kf_map = ov.get("keyframes") if isinstance(ov.get("keyframes"), dict) else {}
+        x_kfs = kf_map.get("x", [])
+        y_kfs = kf_map.get("y", [])
+        sc_kfs = kf_map.get("scale", [])
+        rot_kfs = kf_map.get("rotation", [])
+        op_kfs = kf_map.get("opacity", [])
+
+        base_x = float(ts.get("x", 50.0))
+        base_y = float(ts.get("y", 82.0))
+        base_scale = 1.0
+        base_rot = float(ov.get("rotation", 0.0) or 0.0)
+        base_op = float(ov.get("opacity", 1.0))
+
+        is_t1_animated = any(
+            _is_prop_animated(kfs) for kfs in (x_kfs, y_kfs, sc_kfs, rot_kfs, op_kfs)
         )
+
+        ov_font_ui = max(12.0, min(120.0, float(ts.get("fontSize", 32))))
+        ov_ass_size = max(18, int(round(ov_font_ui * (height / 540.0))))
+        ov_bg_base_op = max(0.0, min(1.0, float(ts.get("backgroundOpacity", 0.6))))
+        ov_bg_hex = str(ts.get("backgroundColor", "#09090B"))
+        ov_style_name = f"T1_{t_idx}"
+
+        if not is_t1_animated:
+            clip_op = _clamp_kf_value("opacity", _resolve_kf_scalar(op_kfs, base_op, "opacity"))
+            if clip_op <= 0.005:
+                continue
+            clip_op_safe = max(0.05, clip_op)
+            ov_color = _hex_to_ass_color(str(ts.get("color", "#FFFFFF")), clip_op_safe)
+            ov_bg_op = ov_bg_base_op * clip_op_safe
+            if ov_bg_op > 0.05:
+                ov_bs = 3
+                ov_out_col = _hex_to_ass_color(ov_bg_hex, ov_bg_op)
+                ov_back_col = "&HFF000000"
+                ov_out_w = 10
+                ov_shadow = 0
+            else:
+                ov_bs = 1
+                ov_out_col = "&H00000000"
+                ov_back_col = "&H80000000"
+                ov_out_w = 2
+                ov_shadow = 1
+
+            style_lines.append(
+                f"Style: {ov_style_name},{ass_font_name},{ov_ass_size},{ov_color},&H000000FF,{ov_out_col},{ov_back_col},1,0,0,0,100,100,0,0,{ov_bs},{ov_out_w},{ov_shadow},5,16,16,16,1"
+            )
+            fade_tag = f"\\fad({int(round(in_d * 1000))},{int(round(out_d * 1000))})" if (in_d > 0.05 or out_d > 0.05) else ""
+            sx = _resolve_kf_scalar(x_kfs, base_x, "x")
+            sy = _resolve_kf_scalar(y_kfs, base_y, "y")
+            ssc = _resolve_kf_scalar(sc_kfs, base_scale, "scale")
+            srot = _resolve_kf_scalar(rot_kfs, base_rot, "rotation")
+            pos_x = int(round((max(0.0, min(100.0, sx)) / 100.0) * width))
+            pos_y = int(round((max(0.0, min(100.0, sy)) / 100.0) * height))
+            scale_pct = max(10, int(round(ssc * 100)))
+            scale_tag = f"\\fscx{scale_pct}\\fscy{scale_pct}" if scale_pct != 100 else ""
+            rot_tag = f"\\frz{-srot:.2f}" if abs(srot) > 0.05 else ""
+            event_lines.append(
+                f"Dialogue: 1,{_format_ass_timestamp(ov_start)},{_format_ass_timestamp(ov_end)},{ov_style_name},,0,0,0,,{{\\an5\\pos({pos_x},{pos_y}){scale_tag}{rot_tag}{fade_tag}}}{escaped}"
+            )
+        else:
+            # Piecewise sampled ASS events (~16fps) for easing & Bengali shaping parity
+            ov_color = _hex_to_ass_color(str(ts.get("color", "#FFFFFF")), 1.0)
+            if ov_bg_base_op > 0.05:
+                ov_bs = 3
+                ov_out_col = _hex_to_ass_color(ov_bg_hex, ov_bg_base_op)
+                ov_back_col = "&HFF000000"
+                ov_out_w = 10
+                ov_shadow = 0
+            else:
+                ov_bs = 1
+                ov_out_col = "&H00000000"
+                ov_back_col = "&H80000000"
+                ov_out_w = 2
+                ov_shadow = 1
+
+            style_lines.append(
+                f"Style: {ov_style_name},{ass_font_name},{ov_ass_size},{ov_color},&H000000FF,{ov_out_col},{ov_back_col},1,0,0,0,100,100,0,0,{ov_bs},{ov_out_w},{ov_shadow},5,16,16,16,1"
+            )
+
+            step = max(0.06, ov_dur / 450.0)
+            cur_t = ov_start
+            while cur_t < ov_end - 0.008:
+                nxt_t = min(ov_end, cur_t + step)
+                mid_local = max(0.0, ((cur_t + nxt_t) * 0.5) - ov_start)
+                sx = _evaluate_kf_value(x_kfs, mid_local, base_x, "x")
+                sy = _evaluate_kf_value(y_kfs, mid_local, base_y, "y")
+                ssc = _evaluate_kf_value(sc_kfs, mid_local, base_scale, "scale")
+                srot = _evaluate_kf_value(rot_kfs, mid_local, base_rot, "rotation")
+                sop = _evaluate_kf_value(op_kfs, mid_local, base_op, "opacity")
+                if in_d > 0.05 and mid_local < in_d:
+                    sop *= max(0.0, min(1.0, mid_local / in_d))
+                if out_d > 0.05 and (ov_dur - mid_local) < out_d:
+                    sop *= max(0.0, min(1.0, (ov_dur - mid_local) / out_d))
+                sop = max(0.0, min(1.0, sop))
+                if sop > 0.01:
+                    pos_x = int(round((max(0.0, min(100.0, sx)) / 100.0) * width))
+                    pos_y = int(round((max(0.0, min(100.0, sy)) / 100.0) * height))
+                    scale_pct = max(10, int(round(ssc * 100)))
+                    a1 = f"{int(round((1.0 - sop) * 255)):02X}"
+                    eff_out_op = ov_bg_base_op * sop if ov_bg_base_op > 0.05 else sop * 0.85
+                    a3 = f"{int(round((1.0 - max(0.0, min(1.0, eff_out_op))) * 255)):02X}"
+                    rot_tag = f"\\frz{-srot:.2f}" if abs(srot) > 0.05 else ""
+                    event_lines.append(
+                        f"Dialogue: 1,{_format_ass_timestamp(cur_t)},{_format_ass_timestamp(nxt_t)},{ov_style_name},,0,0,0,,"
+                        f"{{\\an5\\pos({pos_x},{pos_y})\\fscx{scale_pct}\\fscy{scale_pct}{rot_tag}\\1a&H{a1}&\\3a&H{a3}&}}{escaped}"
+                    )
+                cur_t = nxt_t
 
     valid_cues = 0
     for idx, cue in enumerate(subtitles):
