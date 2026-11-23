@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -54,6 +55,27 @@ app = FastAPI(
     description="Free local Python FastAPI microservice powered by FFmpeg, FFprobe, and faster-whisper.",
     version="0.2.0",
 )
+
+_CLIENT_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+@app.middleware("http")
+async def pre_register_export_job_middleware(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/v1/export-mp4":
+        settings = get_settings()
+        provided_key = request.headers.get("x-processor-key")
+        if not settings.api_key or provided_key == settings.api_key:
+            raw_header_id = (request.headers.get("x-export-job-id") or "").strip()
+            if _CLIENT_JOB_ID_RE.match(raw_header_id):
+                job_store.create(
+                    raw_header_id,
+                    operation="export_mp4",
+                    stage="uploading",
+                    stage_label="Receiving uploaded media",
+                    measurable=False,
+                    if_missing=True,
+                )
+    return await call_next(request)
 
 
 def verify_processor_key(
@@ -135,8 +157,12 @@ def get_job_status(job_id: str) -> JobStatusResponse:
     response_model=JobStatusResponse,
     dependencies=[Depends(verify_processor_key)],
 )
-def cancel_job(job_id: str) -> JobStatusResponse:
-    job = job_store.request_cancel(job_id)
+def cancel_job(
+    job_id: str,
+    allow_precreate: bool = Query(default=False),
+) -> JobStatusResponse:
+    safe_allow_precreate = bool(allow_precreate and _CLIENT_JOB_ID_RE.match(job_id))
+    job = job_store.request_cancel(job_id, allow_precreate=safe_allow_precreate)
     if not job:
         raise HTTPException(status_code=404, detail="Processing job not found.")
     return JobStatusResponse(**job)
@@ -405,14 +431,12 @@ async def merge_endpoint(
             await upload.close()
 
 
-_CLIENT_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-
-
 @app.post(
     "/api/v1/export-mp4",
     dependencies=[Depends(verify_processor_key)],
 )
 async def export_mp4_endpoint(
+    request: Request,
     file: Optional[UploadFile] = File(default=None),
     files: Optional[list[UploadFile]] = File(default=None),
     resolution: Literal["720p", "1080p"] = Form(default="720p"),
@@ -487,21 +511,43 @@ async def export_mp4_endpoint(
             await upload.close()
         raise
 
-    job_id = raw_cid if _CLIENT_JOB_ID_RE.match(raw_cid) else uuid.uuid4().hex
+    raw_header_cid = (request.headers.get("x-export-job-id") or "").strip()
+    eff_raw_cid = raw_cid or raw_header_cid
+    job_id = eff_raw_cid if _CLIENT_JOB_ID_RE.match(eff_raw_cid) else uuid.uuid4().hex
     job_store.create(
         job_id,
         operation="export_mp4",
         stage="uploading",
         stage_label="Receiving uploaded media",
         measurable=False,
+        if_missing=True,
     )
     job_dir = _prepare_job_dir(settings, job_id)
     job_store.register_job_dir(job_id, job_dir)
     cancel_event = job_store.get_cancel_event(job_id)
+    disconnect_task: Optional[asyncio.Task[None]] = None
+
+    async def _watch_client_disconnect() -> None:
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if await request.is_disconnected():
+                    job_store.request_cancel(job_id)
+                    return
+                await asyncio.sleep(0.15)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
 
     try:
-        if cancel_event is not None and cancel_event.is_set():
+        if (cancel_event is not None and cancel_event.is_set()) or job_store.is_cancelled(job_id):
             raise VideoProcessingCancelledError()
+
+        client_host = getattr(request.client, "host", None)
+        if client_host and client_host != "testclient":
+            disconnect_task = asyncio.create_task(_watch_client_disconnect())
 
         job_store.update(
             job_id,
@@ -514,7 +560,7 @@ async def export_mp4_endpoint(
         saved_paths: list[Path] = []
         first_stem = "sequence"
         for idx, upload in enumerate(uploads):
-            if cancel_event is not None and cancel_event.is_set():
+            if (cancel_event is not None and cancel_event.is_set()) or job_store.is_cancelled(job_id):
                 raise VideoProcessingCancelledError()
             safe_name, saved_path = await _save_single_upload(
                 upload,
@@ -552,24 +598,39 @@ async def export_mp4_endpoint(
         def _on_process_attach(proc) -> None:
             job_store.attach_process(job_id, proc)
 
-        out_meta = await run_in_threadpool(
-            export_timeline_mp4,
-            saved_paths,
-            output_path,
-            timeline_spec=parsed_spec,
-            resolution=eff_resolution,
-            fps=fps,
-            aspect_ratio=eff_aspect_ratio,
-            export_profile=eff_profile_id,
-            encoding_mode=eff_encoding_mode,
-            ffmpeg_bin=settings.ffmpeg_bin,
-            ffprobe_bin=settings.ffprobe_bin,
-            timeout_sec=settings.ffmpeg_timeout_sec,
-            max_duration_sec=settings.max_short_video_sec,
-            progress_cb=_on_stage_progress,
-            cancel_event=cancel_event,
-            process_cb=_on_process_attach,
-        )
+        def _run_export_worker() -> dict:
+            job_store.mark_worker_started(job_id)
+            try:
+                return export_timeline_mp4(
+                    saved_paths,
+                    output_path,
+                    timeline_spec=parsed_spec,
+                    resolution=eff_resolution,
+                    fps=fps,
+                    aspect_ratio=eff_aspect_ratio,
+                    export_profile=eff_profile_id,
+                    encoding_mode=eff_encoding_mode,
+                    ffmpeg_bin=settings.ffmpeg_bin,
+                    ffprobe_bin=settings.ffprobe_bin,
+                    timeout_sec=settings.ffmpeg_timeout_sec,
+                    max_duration_sec=settings.max_short_video_sec,
+                    progress_cb=_on_stage_progress,
+                    cancel_event=cancel_event,
+                    process_cb=_on_process_attach,
+                )
+            finally:
+                job_store.mark_worker_finished(job_id)
+
+        out_meta = await run_in_threadpool(_run_export_worker)
+
+        if (cancel_event is not None and cancel_event.is_set()) or job_store.is_cancelled(job_id):
+            raise VideoProcessingCancelledError()
+
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+            disconnect_task = None
+
         job_store.update(
             job_id,
             status="completed",
@@ -592,6 +653,7 @@ async def export_mp4_endpoint(
             background=BackgroundTask(cleanup_path, job_dir),
         )
     except VideoProcessingCancelledError as exc:
+        job_store.mark_worker_finished(job_id)
         cleanup_path(job_dir)
         job_store.update(
             job_id,
@@ -604,8 +666,9 @@ async def export_mp4_endpoint(
         )
         raise
     except Exception as exc:
+        job_store.mark_worker_finished(job_id)
         cleanup_path(job_dir)
-        if cancel_event is not None and cancel_event.is_set():
+        if (cancel_event is not None and cancel_event.is_set()) or job_store.is_cancelled(job_id):
             cancel_exc = VideoProcessingCancelledError()
             job_store.update(
                 job_id,
@@ -628,6 +691,9 @@ async def export_mp4_endpoint(
         )
         raise
     finally:
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
         for upload in uploads:
             await upload.close()
 

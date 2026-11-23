@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -18,8 +19,15 @@ import {
   trimVideoController,
   videoProcessorStatusController,
 } from "../controllers/videoProcessing.controller.ts";
-import { requireAuth } from "../middleware/auth.middleware.ts";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/auth.middleware.ts";
 import { validateObjectId } from "../middleware/validate.middleware.ts";
+import {
+  attachExportTempFiles,
+  attachExportUploadAbort,
+  cancelActiveExport,
+  isExportCancelled,
+  registerActiveExport,
+} from "../services/videoProcessor.service.ts";
 
 const uploadTempDir = path.join(os.tmpdir(), "ai-studio-express-uploads");
 fs.mkdirSync(uploadTempDir, { recursive: true });
@@ -127,7 +135,80 @@ function handleUploadMiddleware(fieldName: string, maxFiles = 1) {
   };
 }
 
-function handleExportUploadMiddleware() {
+const CLIENT_JOB_ID_REGEX = /^[A-Za-z0-9_-]{8,64}$/;
+
+function extractMulterUploadFiles(req: Request): Express.Multer.File[] {
+  const uploadedFields = (req.files as Record<string, Express.Multer.File[]> | undefined) ?? {};
+  return [
+    ...(req.file ? [req.file] : []),
+    ...(uploadedFields.video ?? []),
+    ...(uploadedFields.videos ?? []),
+  ];
+}
+
+export function preRegisterExportUploadMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const authReq = req as AuthenticatedRequest & { exportJobId?: string };
+  const userId = authReq.userId;
+  if (!userId) {
+    next();
+    return;
+  }
+
+  const rawHeaderId =
+    typeof req.headers["x-export-job-id"] === "string"
+      ? req.headers["x-export-job-id"].trim()
+      : "";
+  const exportJobId = CLIENT_JOB_ID_REGEX.test(rawHeaderId)
+    ? rawHeaderId
+    : crypto.randomUUID();
+  authReq.exportJobId = exportJobId;
+
+  // Prevent unhandled stream 'error' events when tearing down an aborted upload
+  req.on("error", () => undefined);
+
+  registerActiveExport({
+    jobId: exportJobId,
+    userId,
+    tempFilePaths: [],
+  });
+
+  attachExportUploadAbort(userId, exportJobId, () => {
+    if (!req.destroyed && !req.complete) {
+      req.destroy(new Error("Export cancelled by user."));
+    }
+  });
+
+  const onEarlyDisconnect = () => {
+    if (!res.writableFinished && !res.writableEnded) {
+      void cancelActiveExport(userId, exportJobId);
+    }
+  };
+  req.on("aborted", onEarlyDisconnect);
+  res.on("close", onEarlyDisconnect);
+  res.once("finish", () => {
+    req.off("aborted", onEarlyDisconnect);
+    res.off("close", onEarlyDisconnect);
+  });
+
+  if (isExportCancelled(exportJobId)) {
+    if (!res.writableEnded && !res.headersSent) {
+      res.status(499).json({
+        status: "cancelled",
+        cancelled: true,
+        error: "Export cancelled by user.",
+      });
+    }
+    return;
+  }
+
+  next();
+}
+
+export function handleExportUploadMiddleware() {
   const upload = createMulterInstance(24, true);
   const runner = upload.fields([
     { name: "video", maxCount: 1 },
@@ -136,18 +217,51 @@ function handleExportUploadMiddleware() {
 
   return (req: Request, res: Response, next: NextFunction): void => {
     runner(req, res, (err: unknown) => {
+      const authReq = req as AuthenticatedRequest & { exportJobId?: string };
+      const exportJobId = authReq.exportJobId;
+      const files = extractMulterUploadFiles(req);
+      const filePaths = files.map((f) => f.path).filter(Boolean);
+
+      if (exportJobId && authReq.userId && filePaths.length > 0) {
+        attachExportTempFiles(authReq.userId, exportJobId, filePaths);
+      }
+
+      const cancelled = Boolean(exportJobId && isExportCancelled(exportJobId));
+      if (cancelled) {
+        void Promise.all(
+          filePaths.map((filePath) => fs.promises.unlink(filePath).catch(() => undefined))
+        );
+        if (!res.writableEnded && !res.headersSent) {
+          res.status(499).json({
+            status: "cancelled",
+            cancelled: true,
+            error: "Export cancelled by user.",
+          });
+        }
+        return;
+      }
+
       if (!err) {
         next();
         return;
       }
+
+      void Promise.all(
+        filePaths.map((filePath) => fs.promises.unlink(filePath).catch(() => undefined))
+      );
+
       if (err instanceof multer.MulterError) {
         const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-        res.status(status).json({ error: err.message });
+        if (!res.writableEnded && !res.headersSent) {
+          res.status(status).json({ error: err.message });
+        }
         return;
       }
-      res.status(400).json({
-        error: err instanceof Error ? err.message : "Invalid media upload.",
-      });
+      if (!res.writableEnded && !res.headersSent) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : "Invalid media upload.",
+        });
+      }
     });
   };
 }
@@ -184,6 +298,7 @@ videoProcessingRouter.post(
 );
 videoProcessingRouter.post(
   "/export-mp4",
+  preRegisterExportUploadMiddleware,
   handleExportUploadMiddleware(),
   exportMp4VideoController
 );

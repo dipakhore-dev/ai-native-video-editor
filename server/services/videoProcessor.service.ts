@@ -99,15 +99,45 @@ interface ActiveExportEntry extends ExportProgressSnapshot {
   finishedAtMs?: number;
   tempFilePaths: string[];
   activeUploadPromise: Promise<void> | null;
+  cancelPromise: Promise<ExportProgressSnapshot | null> | null;
+  abortUploadFn: (() => void) | null;
+  deliveryCompleted: boolean;
+  videoJobId: string | null;
 }
 
 const activeExportRegistry = new Map<string, ActiveExportEntry>();
+const preCancelledExports = new Map<string, { userId: string; expiresAtMs: number }>();
 
 function pruneActiveExports(): void {
-  const cutoff = Date.now() - 5 * 60 * 1000;
+  const now = Date.now();
+  const cutoff = now - 5 * 60 * 1000;
   for (const [id, entry] of activeExportRegistry.entries()) {
     if (entry.finishedAtMs && entry.finishedAtMs < cutoff) {
       activeExportRegistry.delete(id);
+    }
+  }
+  for (const [id, item] of preCancelledExports.entries()) {
+    if (item.expiresAtMs < now) {
+      preCancelledExports.delete(id);
+    }
+  }
+}
+
+async function unlinkFileWithRetry(filePath: string, retries = 4): Promise<void> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      await fs.unlink(filePath);
+      return;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT") {
+        return;
+      }
+      if ((code === "EBUSY" || code === "EPERM" || code === "EACCES") && attempt < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 60 * (attempt + 1)));
+        continue;
+      }
+      return;
     }
   }
 }
@@ -118,25 +148,113 @@ export function registerActiveExport(params: {
   tempFilePaths: string[];
 }): AbortController {
   pruneActiveExports();
+
+  const existing = activeExportRegistry.get(params.jobId);
+  if (existing && existing.userId === params.userId) {
+    for (const filePath of params.tempFilePaths) {
+      if (filePath && !existing.tempFilePaths.includes(filePath)) {
+        existing.tempFilePaths.push(filePath);
+      }
+    }
+    return existing.abortController;
+  }
+
+  const preCancelled = preCancelledExports.get(params.jobId);
+  const wasPreCancelled = Boolean(preCancelled && preCancelled.userId === params.userId);
+  if (wasPreCancelled) {
+    preCancelledExports.delete(params.jobId);
+  }
+
   const abortController = new AbortController();
   const now = Date.now();
+  if (wasPreCancelled) {
+    abortController.abort(
+      Object.assign(new Error("Export cancelled by user."), {
+        name: "AbortError",
+        statusCode: 499,
+        cancelled: true,
+      })
+    );
+  }
+
   activeExportRegistry.set(params.jobId, {
     jobId: params.jobId,
     userId: params.userId,
     abortController,
-    status: "processing",
-    stage: "uploading",
-    stageLabel: "Preparing export media",
+    status: wasPreCancelled ? "cancelled" : "processing",
+    stage: wasPreCancelled ? "cancelled" : "uploading",
+    stageLabel: wasPreCancelled ? "Export cancelled" : "Preparing export media",
     progress: 0,
     measurable: false,
     elapsedMs: 0,
-    cancelled: false,
-    error: null,
+    cancelled: wasPreCancelled,
+    error: wasPreCancelled ? "Export cancelled by user." : null,
     startedAtMs: now,
+    finishedAtMs: wasPreCancelled ? now : undefined,
     tempFilePaths: [...params.tempFilePaths],
     activeUploadPromise: null,
+    cancelPromise: null,
+    abortUploadFn: null,
+    deliveryCompleted: false,
+    videoJobId: null,
   });
   return abortController;
+}
+
+export function attachExportUploadAbort(
+  userId: string,
+  jobId: string,
+  abortFn: () => void
+): void {
+  const entry = activeExportRegistry.get(jobId);
+  if (!entry || entry.userId !== userId) {
+    return;
+  }
+  if (entry.cancelled || entry.status === "cancelled") {
+    try {
+      abortFn();
+    } catch {
+      // Ignore abort errors
+    }
+    return;
+  }
+  entry.abortUploadFn = abortFn;
+}
+
+export function attachExportTempFiles(
+  userId: string,
+  jobId: string,
+  filePaths: string[]
+): void {
+  const entry = activeExportRegistry.get(jobId);
+  if (!entry || entry.userId !== userId) {
+    return;
+  }
+  for (const filePath of filePaths) {
+    if (filePath && !entry.tempFilePaths.includes(filePath)) {
+      entry.tempFilePaths.push(filePath);
+    }
+  }
+}
+
+export function isExportCancelled(jobId: string): boolean {
+  const entry = activeExportRegistry.get(jobId);
+  if (entry) {
+    return (
+      entry.cancelled ||
+      entry.status === "cancelled" ||
+      entry.abortController.signal.aborted
+    );
+  }
+  return preCancelledExports.has(jobId);
+}
+
+export function markExportDeliveryCompleted(jobId: string): void {
+  const entry = activeExportRegistry.get(jobId);
+  if (entry) {
+    entry.deliveryCompleted = true;
+    entry.abortUploadFn = null;
+  }
 }
 
 function toSnapshot(entry: ActiveExportEntry): ExportProgressSnapshot {
@@ -193,7 +311,8 @@ export async function getExportProgressSnapshot(
           cancelled?: boolean;
           error?: string | null;
         };
-        if (!entry.cancelled) {
+        const currentStatus = entry.status as ExportProgressSnapshot["status"];
+        if (!entry.cancelled && currentStatus !== "cancelled" && currentStatus !== "completed") {
           if (body.status) entry.status = body.status;
           if (body.stage) entry.stage = body.stage;
           if (body.stage_label) entry.stageLabel = body.stage_label;
@@ -227,15 +346,61 @@ export async function getExportProgressSnapshot(
 
 export async function cancelActiveExport(
   userId: string,
-  jobId: string
+  jobId: string,
+  options?: { allowPrecreate?: boolean }
 ): Promise<ExportProgressSnapshot | null> {
+  pruneActiveExports();
   const entry = activeExportRegistry.get(jobId);
-  if (!entry || entry.userId !== userId) {
+  if (!entry) {
+    if (!options?.allowPrecreate) {
+      return null;
+    }
+    const existingPre = preCancelledExports.get(jobId);
+    if (existingPre && existingPre.userId !== userId) {
+      return null;
+    }
+    preCancelledExports.set(jobId, {
+      userId,
+      expiresAtMs: Date.now() + 5 * 60 * 1000,
+    });
+    const { videoProcessorUrl } = getEnvConfig();
+    if (videoProcessorUrl) {
+      try {
+        await fetch(
+          `${videoProcessorUrl}/api/v1/jobs/${encodeURIComponent(jobId)}/cancel?allow_precreate=true`,
+          {
+            method: "POST",
+            headers: getProcessorHeaders(),
+            signal: AbortSignal.timeout(2500),
+          }
+        );
+      } catch {
+        // Best-effort cancellation forward to Python FastAPI
+      }
+    }
+    return {
+      jobId,
+      status: "cancelled",
+      stage: "cancelled",
+      stageLabel: "Export cancelled",
+      progress: 0,
+      measurable: false,
+      elapsedMs: 0,
+      cancelled: true,
+      error: "Export cancelled by user.",
+    };
+  }
+
+  if (entry.userId !== userId) {
     return null;
   }
 
   if (entry.status === "completed" || entry.status === "failed") {
     return toSnapshot(entry);
+  }
+
+  if (entry.cancelPromise) {
+    return entry.cancelPromise;
   }
 
   entry.cancelled = true;
@@ -245,6 +410,15 @@ export async function cancelActiveExport(
   entry.measurable = false;
   entry.error = "Export cancelled by user.";
   entry.finishedAtMs = entry.finishedAtMs ?? Date.now();
+
+  if (entry.abortUploadFn) {
+    try {
+      entry.abortUploadFn();
+    } catch {
+      // Ignore request destroy errors
+    }
+    entry.abortUploadFn = null;
+  }
 
   if (!entry.abortController.signal.aborted) {
     entry.abortController.abort(
@@ -256,32 +430,57 @@ export async function cancelActiveExport(
     );
   }
 
-  // Wait for any in-flight multipart FileHandle streams to finish closing before unlinking temp files
-  if (entry.activeUploadPromise) {
-    await Promise.race([
-      entry.activeUploadPromise.catch(() => undefined),
-      new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-    ]);
-  }
-
-  await Promise.all(
-    entry.tempFilePaths.map((filePath) => fs.unlink(filePath).catch(() => undefined))
-  );
-
-  const { videoProcessorUrl } = getEnvConfig();
-  if (videoProcessorUrl) {
-    try {
-      await fetch(`${videoProcessorUrl}/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
-        method: "POST",
-        headers: getProcessorHeaders(),
-        signal: AbortSignal.timeout(2000),
-      });
-    } catch {
-      // Best-effort cancellation forward to Python FastAPI
+  const runCancel = async (): Promise<ExportProgressSnapshot> => {
+    // Wait for any in-flight multipart FileHandle streams to finish closing before unlinking temp files
+    if (entry.activeUploadPromise) {
+      await Promise.race([
+        entry.activeUploadPromise.catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+      ]);
     }
-  }
 
-  return toSnapshot(entry);
+    await Promise.all(
+      entry.tempFilePaths.map((filePath) => unlinkFileWithRetry(filePath))
+    );
+
+    if (entry.videoJobId) {
+      await VideoJobModel.findOneAndUpdate(
+        {
+          _id: entry.videoJobId,
+          userId,
+          status: { $nin: ["completed", "failed"] },
+        },
+        {
+          $set: {
+            status: "cancelled",
+            errorMessage: "Export cancelled by user.",
+            completedAt: new Date(),
+          },
+        }
+      ).catch(() => undefined);
+    }
+
+    const { videoProcessorUrl } = getEnvConfig();
+    if (videoProcessorUrl) {
+      try {
+        await fetch(
+          `${videoProcessorUrl}/api/v1/jobs/${encodeURIComponent(jobId)}/cancel?allow_precreate=true`,
+          {
+            method: "POST",
+            headers: getProcessorHeaders(),
+            signal: AbortSignal.timeout(2500),
+          }
+        );
+      } catch {
+        // Best-effort cancellation forward to Python FastAPI
+      }
+    }
+
+    return toSnapshot(entry);
+  };
+
+  entry.cancelPromise = runCancel();
+  return entry.cancelPromise;
 }
 
 function createCombinedSignal(externalSignal?: AbortSignal): {
@@ -903,10 +1102,19 @@ export async function runSyncBinaryVideoOperation(params: {
   });
 
   const activeEntry = params.clientJobId ? activeExportRegistry.get(params.clientJobId) : undefined;
+  if (activeEntry) {
+    activeEntry.videoJobId = jobDoc._id.toString();
+  }
   const { signal, cleanup } = createCombinedSignal(params.signal);
+  const hasCancelled = (): boolean => {
+    if (params.signal?.aborted) return true;
+    if (!activeEntry) return false;
+    const st = activeEntry.status as ExportProgressSnapshot["status"];
+    return Boolean(activeEntry.cancelled || st === "cancelled");
+  };
 
   try {
-    if (params.signal?.aborted) {
+    if (hasCancelled()) {
       throw Object.assign(new Error("Export cancelled by user."), {
         statusCode: 499,
         cancelled: true,
@@ -933,6 +1141,7 @@ export async function runSyncBinaryVideoOperation(params: {
         method: "POST",
         headers: {
           ...getProcessorHeaders(),
+          ...(params.clientJobId ? { "X-Export-Job-Id": params.clientJobId } : {}),
           "Content-Type": upload.contentType,
           "Content-Length": String(upload.contentLength),
         },
@@ -941,7 +1150,7 @@ export async function runSyncBinaryVideoOperation(params: {
         signal,
       } as RequestInit & { duplex: "half" });
     } catch (err) {
-      if (params.signal?.aborted || activeEntry?.cancelled) {
+      if (hasCancelled()) {
         throw Object.assign(new Error("Export cancelled by user."), {
           statusCode: 499,
           cancelled: true,
@@ -970,7 +1179,7 @@ export async function runSyncBinaryVideoOperation(params: {
         detail?: string;
         cancelled?: boolean;
       };
-      if (res.status === 499 || errBody.cancelled || params.signal?.aborted) {
+      if (res.status === 499 || errBody.cancelled || hasCancelled()) {
         throw Object.assign(new Error(errBody.error || "Export cancelled by user."), {
           statusCode: 499,
           cancelled: true,
@@ -983,7 +1192,7 @@ export async function runSyncBinaryVideoOperation(params: {
     }
 
     const arrayBuf = await res.arrayBuffer();
-    if (params.signal?.aborted || activeEntry?.cancelled) {
+    if (hasCancelled()) {
       throw Object.assign(new Error("Export cancelled by user."), {
         statusCode: 499,
         cancelled: true,
@@ -1000,6 +1209,13 @@ export async function runSyncBinaryVideoOperation(params: {
     const nameMatch = /filename="?([^";]+)"?/i.exec(disposition);
     const filename = nameMatch?.[1] || params.defaultOutputFilename;
 
+    if (hasCancelled()) {
+      throw Object.assign(new Error("Export cancelled by user."), {
+        statusCode: 499,
+        cancelled: true,
+      });
+    }
+
     jobDoc.status = "completed";
     jobDoc.progress = 100;
     jobDoc.processorJobId = processorJobId;
@@ -1012,6 +1228,13 @@ export async function runSyncBinaryVideoOperation(params: {
     };
     jobDoc.completedAt = new Date();
     await jobDoc.save();
+
+    if (hasCancelled()) {
+      throw Object.assign(new Error("Export cancelled by user."), {
+        statusCode: 499,
+        cancelled: true,
+      });
+    }
 
     if (activeEntry) {
       activeEntry.status = "completed";
@@ -1037,7 +1260,7 @@ export async function runSyncBinaryVideoOperation(params: {
     const isCancelled =
       statusCode === 499 ||
       Boolean((err as { cancelled?: boolean }).cancelled) ||
-      Boolean(params.signal?.aborted);
+      hasCancelled();
     jobDoc.status = isCancelled
       ? "cancelled"
       : statusCode === 503
@@ -1046,9 +1269,9 @@ export async function runSyncBinaryVideoOperation(params: {
     jobDoc.progress = isCancelled ? activeEntry?.progress ?? jobDoc.progress : 100;
     jobDoc.errorMessage = err instanceof Error ? err.message : "Video processing failed.";
     jobDoc.completedAt = new Date();
-    await jobDoc.save();
+    await jobDoc.save().catch(() => undefined);
 
-    if (activeEntry) {
+    if (activeEntry && (activeEntry.status as ExportProgressSnapshot["status"]) !== "completed") {
       activeEntry.status = isCancelled ? "cancelled" : "failed";
       activeEntry.cancelled = isCancelled;
       activeEntry.stage = isCancelled ? "cancelled" : "failed";

@@ -239,6 +239,7 @@ export interface ExportProgressSnapshot {
 export function exportTimelineMp4(
   formData: FormData,
   options?: {
+    clientJobId?: string;
     onUploadProgress?: (pct: number | null) => void;
     onUploadComplete?: () => void;
     signal?: AbortSignal;
@@ -259,6 +260,9 @@ export function exportTimelineMp4(
     xhr.open("POST", "/api/video/export-mp4");
     xhr.withCredentials = true;
     xhr.responseType = "blob";
+    if (options?.clientJobId) {
+      xhr.setRequestHeader("X-Export-Job-Id", options.clientJobId);
+    }
 
     let settled = false;
     const finish = (result: ApiResult<ExportMp4BinaryResult>) => {
@@ -285,7 +289,7 @@ export function exportTimelineMp4(
     options?.signal?.addEventListener("abort", onAbortSignal, { once: true });
 
     xhr.upload.onprogress = (event) => {
-      if (!options?.onUploadProgress) return;
+      if (options?.signal?.aborted || !options?.onUploadProgress) return;
       if (event.lengthComputable && event.total > 0) {
         const pct = Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100)));
         options.onUploadProgress(pct);
@@ -295,6 +299,7 @@ export function exportTimelineMp4(
     };
 
     xhr.upload.onload = () => {
+      if (options?.signal?.aborted) return;
       options?.onUploadComplete?.();
     };
 
@@ -308,6 +313,15 @@ export function exportTimelineMp4(
     };
 
     xhr.onerror = () => {
+      if (options?.signal?.aborted) {
+        finish({
+          ok: false,
+          status: 499,
+          cancelled: true,
+          error: "Export cancelled by user.",
+        });
+        return;
+      }
       finish({
         ok: false,
         status: 0,
@@ -316,6 +330,16 @@ export function exportTimelineMp4(
     };
 
     xhr.onload = async () => {
+      if (options?.signal?.aborted) {
+        finish({
+          ok: false,
+          status: 499,
+          cancelled: true,
+          error: "Export cancelled by user.",
+        });
+        return;
+      }
+
       const responseBlob = xhr.response instanceof Blob ? xhr.response : null;
 
       if (xhr.status < 200 || xhr.status >= 300) {
@@ -333,16 +357,29 @@ export function exportTimelineMp4(
             // Non-JSON error body
           }
         }
-        const isCancelled = xhr.status === 499 || Boolean(errBody.cancelled);
+        const isCancelled =
+          xhr.status === 499 ||
+          Boolean(errBody.cancelled) ||
+          Boolean(options?.signal?.aborted);
         finish({
           ok: false,
-          status: xhr.status,
+          status: isCancelled ? 499 : xhr.status,
           cancelled: isCancelled,
           error:
             errBody.error ||
             errBody.message ||
             (isCancelled ? "Export cancelled by user." : `MP4 export failed (${xhr.status}).`),
           integrationPoint: errBody.integrationPoint,
+        });
+        return;
+      }
+
+      if (options?.signal?.aborted) {
+        finish({
+          ok: false,
+          status: 499,
+          cancelled: true,
+          error: "Export cancelled by user.",
         });
         return;
       }
@@ -390,10 +427,13 @@ export async function fetchExportProgress(
 }
 
 export async function cancelExportMp4(
-  jobId: string
+  jobId: string,
+  options?: { keepalive?: boolean; allowPrecreate?: boolean }
 ): Promise<ApiResult<{ status: string; progress: ExportProgressSnapshot }>> {
-  return requestJson(`/api/video/export-cancel/${encodeURIComponent(jobId)}`, {
+  const query = options?.allowPrecreate ? "?allowPrecreate=1" : "";
+  return requestJson(`/api/video/export-cancel/${encodeURIComponent(jobId)}${query}`, {
     method: "POST",
+    ...(options?.keepalive ? { keepalive: true } : {}),
   });
 }
 

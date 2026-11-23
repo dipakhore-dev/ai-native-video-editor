@@ -8,7 +8,9 @@ import {
   checkVideoProcessorHealth,
   getExportProgressSnapshot,
   getUserVideoJobWithQueueState,
+  isExportCancelled,
   listUserVideoJobs,
+  markExportDeliveryCompleted,
   processVideoMetadataRequest,
   registerActiveExport,
   runSyncBinaryVideoOperation,
@@ -795,17 +797,39 @@ export async function exportMp4VideoController(
     return;
   }
 
+  const preRegisteredId = (req as AuthenticatedRequest & { exportJobId?: string }).exportJobId;
+  const rawHeaderJobId =
+    typeof req.headers["x-export-job-id"] === "string"
+      ? req.headers["x-export-job-id"].trim()
+      : "";
   const rawClientJobId =
     typeof req.body?.clientJobId === "string"
       ? req.body.clientJobId.trim()
       : typeof req.body?.client_job_id === "string"
         ? req.body.client_job_id.trim()
         : "";
-  const clientJobId = CLIENT_JOB_ID_REGEX.test(rawClientJobId)
-    ? rawClientJobId
-    : crypto.randomUUID();
+  const clientJobId =
+    preRegisteredId && CLIENT_JOB_ID_REGEX.test(preRegisteredId)
+      ? preRegisteredId
+      : CLIENT_JOB_ID_REGEX.test(rawClientJobId)
+        ? rawClientJobId
+        : CLIENT_JOB_ID_REGEX.test(rawHeaderJobId)
+          ? rawHeaderJobId
+          : crypto.randomUUID();
 
   let detachListeners = () => undefined;
+
+  if (isExportCancelled(clientJobId) || (req.destroyed && !req.complete)) {
+    await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => undefined)));
+    if (!res.writableEnded && !res.headersSent) {
+      res.status(499).json({
+        status: "cancelled",
+        cancelled: true,
+        error: "Export cancelled by user.",
+      });
+    }
+    return;
+  }
 
   try {
     const rawFormat = typeof req.body?.format === "string" ? req.body.format.trim().toLowerCase() : "mp4";
@@ -919,16 +943,33 @@ export async function exportMp4VideoController(
     });
 
     const onDisconnect = () => {
-      if (!res.writableEnded) {
+      if (!res.writableFinished) {
         void cancelActiveExport(req.userId!, clientJobId);
       }
     };
+    const onFinish = () => {
+      markExportDeliveryCompleted(clientJobId);
+    };
     req.on("aborted", onDisconnect);
     res.on("close", onDisconnect);
+    res.on("finish", onFinish);
     detachListeners = () => {
       req.off("aborted", onDisconnect);
       res.off("close", onDisconnect);
+      res.off("finish", onFinish);
     };
+
+    if (abortController.signal.aborted || isExportCancelled(clientJobId)) {
+      sendProcessorError(
+        res,
+        Object.assign(new Error("Export cancelled by user."), {
+          statusCode: 499,
+          cancelled: true,
+        }),
+        "Export cancelled by user."
+      );
+      return;
+    }
 
     const result = await runSyncBinaryVideoOperation({
       userId: req.userId!,
@@ -956,7 +997,19 @@ export async function exportMp4VideoController(
       signal: abortController.signal,
     });
 
-    if (res.writableEnded || abortController.signal.aborted) {
+    if (
+      res.writableEnded ||
+      res.destroyed ||
+      abortController.signal.aborted ||
+      isExportCancelled(clientJobId)
+    ) {
+      if (!res.writableEnded && !res.headersSent) {
+        res.status(499).json({
+          status: "cancelled",
+          cancelled: true,
+          error: "Export cancelled by user.",
+        });
+      }
       return;
     }
 
@@ -1010,7 +1063,13 @@ export async function cancelExportController(
     return;
   }
 
-  const snapshot = await cancelActiveExport(req.userId!, jobId);
+  const allowPrecreate =
+    req.query.allowPrecreate === "1" ||
+    req.query.allowPrecreate === "true" ||
+    req.query.allow_precreate === "1" ||
+    req.query.allow_precreate === "true";
+
+  const snapshot = await cancelActiveExport(req.userId!, jobId, { allowPrecreate });
   if (!snapshot) {
     res.status(404).json({ error: "Active export job not found." });
     return;

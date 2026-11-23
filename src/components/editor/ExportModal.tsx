@@ -247,6 +247,9 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
 
   const activeJobIdRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const cancellingRef = useRef(false);
+  const uploadCompletedRef = useRef(false);
+  const cancelPromiseRef = useRef<Promise<unknown> | null>(null);
   const pollTimerRef = useRef<number | null>(null);
   const elapsedTimerRef = useRef<number | null>(null);
   const startedAtRef = useRef<number>(0);
@@ -303,8 +306,12 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       stopProgressTimers();
       if (abortControllerRef.current && !abortControllerRef.current.signal.aborted) {
         abortControllerRef.current.abort();
-        if (activeJobIdRef.current) {
-          void cancelExportMp4(activeJobIdRef.current);
+        if (activeJobIdRef.current && !cancellingRef.current) {
+          cancellingRef.current = true;
+          void cancelExportMp4(activeJobIdRef.current, {
+            keepalive: true,
+            allowPrecreate: true,
+          });
         }
       }
     };
@@ -337,23 +344,41 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
   const snapshotJson = useMemo(() => JSON.stringify(structuredSpec, null, 2), [structuredSpec]);
 
   const handleCancelExport = async () => {
-    if (!submitting || cancelling) return;
+    if (!submitting || cancellingRef.current) return;
+    cancellingRef.current = true;
     setCancelling(true);
+    stopProgressTimers();
     setLiveProgress((prev) =>
       prev
-        ? { ...prev, stage: "cancelled", stageLabel: "Cancelling export...", measurable: false }
+        ? {
+            ...prev,
+            stage: "cancelled",
+            stageLabel: "Cancelling export & stopping FFmpeg...",
+            measurable: false,
+          }
         : {
             stage: "cancelled",
-            stageLabel: "Cancelling export...",
+            stageLabel: "Cancelling export & stopping FFmpeg...",
             progress: 0,
             measurable: false,
             elapsedMs: Date.now() - startedAtRef.current,
           }
     );
     const jobId = activeJobIdRef.current;
-    abortControllerRef.current?.abort();
-    if (jobId) {
-      await cancelExportMp4(jobId).catch(() => undefined);
+    const cancelReq = jobId
+      ? cancelExportMp4(jobId, { allowPrecreate: true }).catch(() => undefined)
+      : Promise.resolve();
+    cancelPromiseRef.current = cancelReq;
+
+    if (!uploadCompletedRef.current) {
+      abortControllerRef.current?.abort();
+      await cancelReq;
+    } else {
+      await Promise.race([
+        cancelReq,
+        new Promise<void>((resolve) => window.setTimeout(resolve, 5000)),
+      ]);
+      abortControllerRef.current?.abort();
     }
   };
 
@@ -394,6 +419,9 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
     const abortController = new AbortController();
     activeJobIdRef.current = clientJobId;
     abortControllerRef.current = abortController;
+    cancellingRef.current = false;
+    uploadCompletedRef.current = false;
+    cancelPromiseRef.current = null;
     startedAtRef.current = Date.now();
 
     setCancelling(false);
@@ -407,6 +435,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
     });
 
     elapsedTimerRef.current = window.setInterval(() => {
+      if (cancellingRef.current) return;
       setLiveProgress((prev) =>
         prev ? { ...prev, elapsedMs: Date.now() - startedAtRef.current } : prev
       );
@@ -437,14 +466,40 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         clipFileIndexById[clip.id] = idx;
       }
 
-      if (abortController.signal.aborted) {
+      if (cancellingRef.current || abortController.signal.aborted) {
         stopProgressTimers();
+        const pendingCancel = cancelPromiseRef.current as Promise<unknown> | null;
+        if (pendingCancel) {
+          await pendingCancel.catch(() => undefined);
+        }
+        cancellingRef.current = false;
+        uploadCompletedRef.current = false;
+        cancelPromiseRef.current = null;
+        activeJobIdRef.current = null;
+        abortControllerRef.current = null;
         setSubmitting(false);
         setCancelling(false);
         setLiveProgress(null);
+        const cancelMsg = "Export cancelled by user before upload started.";
         setFeedback({
           kind: "cancelled",
-          message: "Export cancelled by user before upload started.",
+          message: cancelMsg,
+        });
+        recordExportAttempt({
+          id: `exp_${Date.now()}`,
+          projectId: project.id,
+          projectName: project.name,
+          resolution,
+          exportProfile,
+          encodingMode,
+          format,
+          fps,
+          clipCount: project.clips.length,
+          totalDuration,
+          status: "cancelled",
+          message: cancelMsg,
+          requestedAt: new Date().toISOString(),
+          timelineSnapshotJson: snapshotJson,
         });
         return;
       }
@@ -496,7 +551,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         formData.append("projectId", project.id);
       }
 
-      let uploadCompleted = false;
+      uploadCompletedRef.current = false;
       setLiveProgress({
         stage: "uploading",
         stageLabel: "Uploading media to local processor",
@@ -506,12 +561,30 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       });
 
       const pollServerProgress = async () => {
-        if (abortController.signal.aborted || !uploadCompleted) return;
+        if (
+          cancellingRef.current ||
+          abortController.signal.aborted ||
+          !uploadCompletedRef.current
+        ) {
+          return;
+        }
         const snapRes = await fetchExportProgress(clientJobId);
-        if (!snapRes.ok || !snapRes.data?.progress || abortController.signal.aborted) {
+        if (
+          !snapRes.ok ||
+          !snapRes.data?.progress ||
+          cancellingRef.current ||
+          abortController.signal.aborted
+        ) {
           return;
         }
         const snap = snapRes.data.progress;
+        if (snap.cancelled || snap.status === "cancelled") {
+          cancellingRef.current = true;
+          setCancelling(true);
+          stopProgressTimers();
+          abortController.abort();
+          return;
+        }
         setLiveProgress({
           stage: snap.stage,
           stageLabel: snap.stageLabel,
@@ -526,9 +599,16 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       }, 450);
 
       const res = await exportTimelineMp4(formData, {
+        clientJobId,
         signal: abortController.signal,
         onUploadProgress: (pct) => {
-          if (abortController.signal.aborted || uploadCompleted) return;
+          if (
+            cancellingRef.current ||
+            abortController.signal.aborted ||
+            uploadCompletedRef.current
+          ) {
+            return;
+          }
           setLiveProgress({
             stage: "uploading",
             stageLabel:
@@ -541,8 +621,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           });
         },
         onUploadComplete: () => {
-          uploadCompleted = true;
-          if (abortController.signal.aborted) return;
+          uploadCompletedRef.current = true;
+          if (cancellingRef.current || abortController.signal.aborted) return;
           setLiveProgress((prev) => ({
             stage: "processing",
             stageLabel: "Starting FFmpeg render pipeline",
@@ -555,11 +635,47 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       });
 
       stopProgressTimers();
+      const pendingCancel = cancelPromiseRef.current as Promise<unknown> | null;
+      if (pendingCancel) {
+        await pendingCancel.catch(() => undefined);
+      }
+
+      const wasCancelled = Boolean(
+        res.cancelled ||
+          res.status === 499 ||
+          cancellingRef.current ||
+          abortController.signal.aborted
+      );
+      cancellingRef.current = false;
+      uploadCompletedRef.current = false;
+      cancelPromiseRef.current = null;
       setSubmitting(false);
       setCancelling(false);
       setLiveProgress(null);
       activeJobIdRef.current = null;
       abortControllerRef.current = null;
+
+      if (wasCancelled) {
+        const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
+        setFeedback({ kind: "cancelled", message: cancelMsg });
+        recordExportAttempt({
+          id: `exp_${Date.now()}`,
+          projectId: project.id,
+          projectName: project.name,
+          resolution,
+          exportProfile,
+          encodingMode,
+          format,
+          fps,
+          clipCount: project.clips.length,
+          totalDuration,
+          status: "cancelled",
+          message: cancelMsg,
+          requestedAt: new Date().toISOString(),
+          timelineSnapshotJson: snapshotJson,
+        });
+        return;
+      }
 
       if (res.ok && res.data) {
         const downloadUrl = URL.createObjectURL(res.data.blob);
@@ -600,26 +716,6 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         return;
       }
 
-      if (res.cancelled || res.status === 499) {
-        const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
-        setFeedback({ kind: "cancelled", message: cancelMsg });
-        recordExportAttempt({
-          id: `exp_${Date.now()}`,
-          projectId: project.id,
-          projectName: project.name,
-          resolution,
-          format,
-          fps,
-          clipCount: project.clips.length,
-          totalDuration,
-          status: "cancelled",
-          message: cancelMsg,
-          requestedAt: new Date().toISOString(),
-          timelineSnapshotJson: snapshotJson,
-        });
-        return;
-      }
-
       if (res.status === 401) {
         const authMsg =
           "Sign in to your account before exporting MP4 video through the backend FFmpeg worker.";
@@ -629,6 +725,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           projectId: project.id,
           projectName: project.name,
           resolution,
+          exportProfile,
+          encodingMode,
           format,
           fps,
           clipCount: project.clips.length,
@@ -653,6 +751,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         projectId: project.id,
         projectName: project.name,
         resolution,
+        exportProfile,
+        encodingMode,
         format,
         fps,
         clipCount: project.clips.length,
@@ -664,11 +764,42 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       });
     } catch (err) {
       stopProgressTimers();
+      const pendingCancel = cancelPromiseRef.current as Promise<unknown> | null;
+      if (pendingCancel) {
+        await pendingCancel.catch(() => undefined);
+      }
+      const wasCancelled = Boolean(cancellingRef.current || abortController.signal.aborted);
+      cancellingRef.current = false;
+      uploadCompletedRef.current = false;
+      cancelPromiseRef.current = null;
       setSubmitting(false);
       setCancelling(false);
       setLiveProgress(null);
       activeJobIdRef.current = null;
       abortControllerRef.current = null;
+
+      if (wasCancelled) {
+        const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
+        setFeedback({ kind: "cancelled", message: cancelMsg });
+        recordExportAttempt({
+          id: `exp_${Date.now()}`,
+          projectId: project.id,
+          projectName: project.name,
+          resolution,
+          exportProfile,
+          encodingMode,
+          format,
+          fps,
+          clipCount: project.clips.length,
+          totalDuration,
+          status: "cancelled",
+          message: cancelMsg,
+          requestedAt: new Date().toISOString(),
+          timelineSnapshotJson: snapshotJson,
+        });
+        return;
+      }
+
       const errMsg = err instanceof Error ? err.message : "Could not read local video file bytes.";
       setFeedback({ kind: "error", message: errMsg });
       recordExportAttempt({
@@ -676,6 +807,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         projectId: project.id,
         projectName: project.name,
         resolution,
+        exportProfile,
+        encodingMode,
         format,
         fps,
         clipCount: project.clips.length,

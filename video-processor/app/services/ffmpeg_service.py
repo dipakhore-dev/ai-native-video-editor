@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Literal, Optional, Sequence
 
 from .ffprobe_service import check_binary, extract_audio_metadata, extract_video_metadata
+from .job_store import terminate_subprocess_tree
 
 logger = logging.getLogger("video_processor.ffmpeg")
 
@@ -437,6 +438,12 @@ def _run_ffmpeg_with_progress(
     logger.debug("Executing FFmpeg command (cwd=%s): %s", cwd, formatted_cmd)
 
     try:
+        popen_kwargs: dict[str, object] = {}
+        if sys.platform == "win32" or os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+
         proc = subprocess.Popen(
             progress_cmd,
             cwd=str(cwd) if cwd is not None else None,
@@ -447,6 +454,7 @@ def _run_ffmpeg_with_progress(
             errors="replace",
             bufsize=1,
             shell=False,
+            **popen_kwargs,  # type: ignore[arg-type]
         )
     except OSError as exc:
         logger.error("Failed to spawn FFmpeg (%s): %s", formatted_cmd, exc)
@@ -512,30 +520,22 @@ def _run_ffmpeg_with_progress(
     cancelled = False
 
     def _terminate_process_cleanly() -> None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=1.5)
-        except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=1.0)
-            except Exception:
-                pass
+        terminate_subprocess_tree(proc, wait_sec=1.5)
 
     try:
         while True:
-            rc = proc.poll()
-            if rc is not None:
-                break
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _terminate_process_cleanly()
+                break
+            rc = proc.poll()
+            if rc is not None:
                 break
             if time.monotonic() - start_mono > timeout_sec:
                 timed_out = True
                 _terminate_process_cleanly()
                 break
-            time.sleep(0.08)
+            time.sleep(0.05)
 
         if cancelled or timed_out:
             # Close pipes first so Windows pipe reader threads unblock immediately
@@ -557,6 +557,8 @@ def _run_ffmpeg_with_progress(
                     pipe.close()
                 except Exception:
                     pass
+        if proc.poll() is None:
+            _terminate_process_cleanly()
         if process_cb is not None:
             process_cb(None)
 
@@ -1917,6 +1919,8 @@ def _render_unified_visual_mp4(
     except VideoProcessingCancelledError:
         raise
     except VideoProcessingError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError() from exc
         if active_encoder != "libx264" and exc.status_code != 504:
             logger.warning(
                 "Hardware encoder '%s' failed during export (%s); falling back to libx264.",
@@ -2518,6 +2522,8 @@ def export_timeline_mp4(
     probe_start = time.perf_counter()
     v1_source_metas: dict[int, dict] = {}
     for clip, f_idx in zip(sorted_v1, v1_file_indices):
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
         if f_idx in v1_source_metas:
             continue
         if _is_image_clip(clip, uploaded_files[f_idx]):
@@ -2530,6 +2536,8 @@ def export_timeline_mp4(
 
     v2_source_metas: dict[int, dict] = {}
     for clip, f_idx in zip(sorted_v2, v2_file_indices):
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
         if f_idx in v2_source_metas:
             continue
         if f_idx in v1_source_metas:
@@ -2545,6 +2553,8 @@ def export_timeline_mp4(
 
     a1_source_metas: dict[int, dict] = {}
     for f_idx in set(a1_file_indices):
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
         if f_idx in v1_source_metas and bool(v1_source_metas[f_idx].get("has_audio")):
             a1_source_metas[f_idx] = v1_source_metas[f_idx]
         else:
@@ -3304,6 +3314,9 @@ def export_timeline_mp4(
             {k: v.get("total_sec") for k, v in perf_summary["stages"].items()},
         )
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise VideoProcessingCancelledError()
+
         if progress_cb is not None:
             progress_cb("finalizing", "Finalizing MP4 metadata", 98, False)
 
@@ -3313,7 +3326,15 @@ def export_timeline_mp4(
         rendered_meta["performance"] = perf_summary
         return rendered_meta
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        for attempt in range(3):
+            if not work_dir.exists():
+                break
+            try:
+                shutil.rmtree(work_dir, ignore_errors=(attempt < 2))
+                if not work_dir.exists():
+                    break
+            except OSError:
+                time.sleep(0.05 * (attempt + 1))
 
 
 def _hex_to_ass_color(hex_color: str, opacity: float = 1.0) -> str:

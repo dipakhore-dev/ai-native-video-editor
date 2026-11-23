@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Sequence
 from unittest import mock
 
 from app.config import get_settings
@@ -2813,6 +2814,267 @@ class TestFfmpegAndWhisperServices(unittest.TestCase):
         late_rms = self._measure_pcm_rms(out_mp4, 1.45, 0.50)
         self.assertGreater(late_rms, 0.06)
         self.assertGreater(late_rms, early_rms * 4.0)
+
+    def test_phase4_cancellation_tombstones_immutability_and_probing_abort(self) -> None:
+        # 1) Missing job without allow_precreate still returns None (-> HTTP 404)
+        self.assertIsNone(job_store.request_cancel("missing-job-default-404"))
+
+        # 2) Pre-cancel tombstone with allow_precreate=True aborts job created afterward
+        tomb_id = "pre-cancelled-upload-job-1"
+        pre_snap = job_store.request_cancel(tomb_id, allow_precreate=True)
+        self.assertIsNotNone(pre_snap)
+        assert pre_snap is not None
+        self.assertEqual(pre_snap["status"], "cancelled")
+        self.assertTrue(pre_snap["cancelled"])
+        self.assertTrue(job_store.is_cancelled(tomb_id))
+
+        created = job_store.create(tomb_id, "export_mp4", if_missing=True)
+        self.assertEqual(created["status"], "cancelled")
+        self.assertTrue(created["cancelled"])
+        ev = job_store.get_cancel_event(tomb_id)
+        self.assertIsNotNone(ev)
+        assert ev is not None
+        self.assertTrue(ev.is_set())
+
+        # 3) Strict terminal state immutability: cancelled cannot revert to completed/processing
+        after_complete_attempt = job_store.update(
+            tomb_id,
+            status="completed",
+            progress=100,
+            stage="completed",
+            stage_label="Export complete",
+        )
+        self.assertIsNotNone(after_complete_attempt)
+        assert after_complete_attempt is not None
+        self.assertEqual(after_complete_attempt["status"], "cancelled")
+        self.assertTrue(after_complete_attempt["cancelled"])
+
+        # Completed cannot revert to cancelled
+        done_id = "completed-immutable-job-1"
+        job_store.create(done_id, "export_mp4")
+        job_store.update(done_id, status="completed", progress=100, stage="completed")
+        after_cancel_attempt = job_store.request_cancel(done_id)
+        self.assertIsNotNone(after_cancel_attempt)
+        assert after_cancel_attempt is not None
+        self.assertEqual(after_cancel_attempt["status"], "completed")
+
+        # 4) Cancelling before FFmpeg starts (during probing) aborts immediately
+        clip = self._make_clip("probe_cancel.mp4", duration=1.5, size="640x360", with_audio=False)
+        out_probe_cancel = self.test_root / "probe_cancel_out.mp4"
+        cancel_ev = threading.Event()
+        cancel_ev.set()
+        with self.assertRaises(VideoProcessingCancelledError):
+            export_timeline_mp4(
+                [clip],
+                out_probe_cancel,
+                export_profile="fast_preview",
+                encoding_mode="cpu",
+                cancel_event=cancel_ev,
+            )
+        self.assertFalse(out_probe_cancel.exists())
+
+    def test_phase4_cancellation_across_profiles_and_gpu_fallback_guard(self) -> None:
+        clip = self._make_clip("prof_cancel_src.mp4", duration=3.0, size="640x360", with_audio=True)
+        spec = {
+            "format": "mp4",
+            "project": {"aspectRatio": "16:9", "resolution": "1080p", "fps": 24},
+            "tracks": [
+                {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+            ],
+            "clips": [
+                {
+                    "id": "v1_prof",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "prof_cancel_src.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 6.0,
+                    "durationSec": 6.0,
+                    "sourceInSec": 0.0,
+                    "sourceOutSec": 3.0,
+                    "speed": 0.5,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+
+        # Cancel across all 3 export profiles (CPU)
+        for profile in ("fast_preview", "balanced", "high_quality"):
+            job_dir = self.test_root / f"job_prof_{profile}"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            out_path = job_dir / f"{profile}_cancel.mp4"
+            job_id = f"cancel-profile-{profile}"
+            job_store.create(job_id, "export_mp4")
+            job_store.register_job_dir(job_id, job_dir)
+            cancel_ev = job_store.get_cancel_event(job_id)
+            assert cancel_ev is not None
+            proc_attached = threading.Event()
+            spawned_procs: list[subprocess.Popen[str]] = []
+            errors: list[Exception] = []
+
+            def on_proc(proc: subprocess.Popen[str] | None, *, _ev=proc_attached, _list=spawned_procs, _jid=job_id) -> None:
+                job_store.attach_process(_jid, proc)
+                if proc is not None:
+                    _list.append(proc)
+                    _ev.set()
+
+            def run_job(*, _out=out_path, _jid=job_id, _prof=profile, _cev=cancel_ev, _on_proc=on_proc, _errs=errors) -> None:
+                job_store.mark_worker_started(_jid)
+                try:
+                    export_timeline_mp4(
+                        [clip],
+                        _out,
+                        timeline_spec=spec,
+                        export_profile=_prof,
+                        encoding_mode="cpu",
+                        cancel_event=_cev,
+                        process_cb=_on_proc,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _errs.append(exc)
+                finally:
+                    job_store.mark_worker_finished(_jid)
+
+            t = threading.Thread(target=run_job, daemon=True)
+            t.start()
+            self.assertTrue(proc_attached.wait(timeout=8.0), f"FFmpeg did not start for {profile}")
+            # Fire repeated concurrent cancel calls to verify idempotency and coordinated cleanup
+            for _ in range(3):
+                snap = job_store.request_cancel(job_id)
+                self.assertIsNotNone(snap)
+                self.assertEqual(snap["status"], "cancelled")
+            t.join(timeout=10.0)
+            self.assertFalse(t.is_alive())
+            self.assertTrue(any(isinstance(e, VideoProcessingCancelledError) for e in errors), errors)
+            self.assertFalse(job_dir.exists(), f"{profile} job_dir must be deleted after worker finishes")
+            for p in spawned_procs:
+                self.assertIsNotNone(p.poll(), f"FFmpeg PID {p.pid} leaked after cancel for {profile}")
+
+        # Mocked GPU encoding cancelled: must NOT fall back to CPU libx264
+        gpu_cancel_out = self.test_root / "gpu_cancel_no_fallback.mp4"
+        gpu_cancel_ev = threading.Event()
+        call_encoders: list[str] = []
+
+        def fake_select_encoder(_mode: str, _bin: str) -> tuple[str, bool]:
+            return ("h264_nvenc", False)
+
+        def fake_run_with_progress(cmd: Sequence[str], *_args: object, **_kwargs: object) -> None:
+            cmd_str = " ".join(str(x) for x in cmd)
+            if "h264_nvenc" in cmd_str:
+                call_encoders.append("h264_nvenc")
+                gpu_cancel_ev.set()
+                raise VideoProcessingError("Simulated NVENC interrupted on cancel", status_code=500)
+            call_encoders.append("libx264")
+            raise AssertionError("CPU fallback must NOT execute when cancel_event is already set")
+
+        with (
+            mock.patch("app.services.ffmpeg_service._select_video_encoder", side_effect=fake_select_encoder),
+            mock.patch("app.services.ffmpeg_service._run_ffmpeg_with_progress", side_effect=fake_run_with_progress),
+        ):
+            with self.assertRaises(VideoProcessingCancelledError):
+                export_timeline_mp4(
+                    [clip],
+                    gpu_cancel_out,
+                    timeline_spec=spec,
+                    export_profile="fast_preview",
+                    encoding_mode="gpu",
+                    cancel_event=gpu_cancel_ev,
+                )
+        self.assertEqual(call_encoders, ["h264_nvenc"])
+
+    def test_phase4_immediate_reexport_succeeds_after_cancellation(self) -> None:
+        clip = self._make_clip("reexport_src.mp4", duration=2.5, size="640x360", with_audio=True)
+        job_dir_1 = self.test_root / "job_cancel_first"
+        job_dir_1.mkdir(parents=True, exist_ok=True)
+        out_1 = job_dir_1 / "cancelled.mp4"
+        job_id_1 = "cancel-then-reexport-1"
+        job_store.create(job_id_1, "export_mp4")
+        job_store.register_job_dir(job_id_1, job_dir_1)
+        cancel_ev_1 = job_store.get_cancel_event(job_id_1)
+        assert cancel_ev_1 is not None
+
+        proc_started = threading.Event()
+        errors: list[Exception] = []
+
+        def on_proc_1(proc: subprocess.Popen[str] | None) -> None:
+            job_store.attach_process(job_id_1, proc)
+            if proc is not None:
+                proc_started.set()
+
+        spec_1 = {
+            "format": "mp4",
+            "project": {"aspectRatio": "16:9", "resolution": "1080p", "fps": 24},
+            "tracks": [
+                {"id": "track_v1", "name": "V1 Primary", "type": "video", "muted": False, "locked": False},
+            ],
+            "clips": [
+                {
+                    "id": "v1_c1",
+                    "trackId": "track_v1",
+                    "kind": "video",
+                    "sourceName": "reexport_src.mp4",
+                    "timelineStartSec": 0.0,
+                    "timelineEndSec": 5.0,
+                    "durationSec": 5.0,
+                    "sourceInSec": 0.0,
+                    "sourceOutSec": 2.5,
+                    "speed": 0.5,
+                    "volume": 1.0,
+                    "opacity": 1.0,
+                    "fileIndex": 0,
+                }
+            ],
+        }
+
+        def worker_1() -> None:
+            job_store.mark_worker_started(job_id_1)
+            try:
+                export_timeline_mp4(
+                    [clip],
+                    out_1,
+                    timeline_spec=spec_1,
+                    export_profile="balanced",
+                    encoding_mode="cpu",
+                    cancel_event=cancel_ev_1,
+                    process_cb=on_proc_1,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                job_store.mark_worker_finished(job_id_1)
+
+        t1 = threading.Thread(target=worker_1, daemon=True)
+        t1.start()
+        self.assertTrue(proc_started.wait(timeout=8.0))
+        job_store.request_cancel(job_id_1)
+        t1.join(timeout=10.0)
+        self.assertTrue(any(isinstance(e, VideoProcessingCancelledError) for e in errors))
+        self.assertFalse(job_dir_1.exists())
+
+        # Immediately launch a brand new export and verify clean completion
+        job_dir_2 = self.test_root / "job_reexport_second"
+        job_dir_2.mkdir(parents=True, exist_ok=True)
+        out_2 = job_dir_2 / "reexport_ok.mp4"
+        job_id_2 = "cancel-then-reexport-2"
+        job_store.create(job_id_2, "export_mp4")
+        job_store.register_job_dir(job_id_2, job_dir_2)
+        meta_2 = export_timeline_mp4(
+            [clip],
+            out_2,
+            timeline_spec={
+                **spec_1,
+                "clips": [{**spec_1["clips"][0], "speed": 1.0, "durationSec": 2.5, "timelineEndSec": 2.5}],
+            },
+            export_profile="fast_preview",
+            encoding_mode="cpu",
+            cancel_event=job_store.get_cancel_event(job_id_2),
+            process_cb=lambda p: job_store.attach_process(job_id_2, p),
+        )
+        self.assertTrue(out_2.exists())
+        self.assertGreater(out_2.stat().st_size, 1000)
+        self.assertAlmostEqual(meta_2["duration_seconds"], 2.5, delta=0.35)
 
 
 if __name__ == "__main__":
