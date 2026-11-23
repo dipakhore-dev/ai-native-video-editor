@@ -709,6 +709,16 @@ export async function deleteServerProject(
   });
 }
 
+export async function duplicateServerProject(
+  projectId: string,
+  name?: string
+): Promise<ApiResult<{ status: string; project: ServerProjectDto }>> {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/duplicate`, {
+    method: "POST",
+    body: JSON.stringify(name ? { name } : {}),
+  });
+}
+
 export async function saveServerProjectTimeline(
   projectId: string,
   project: Project
@@ -797,6 +807,40 @@ export async function deleteServerMediaMetadata(
   mediaId: string
 ): Promise<ApiResult<{ status: string; deleted: boolean }>> {
   return requestJson(`/api/media/${encodeURIComponent(mediaId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function fetchServerVideoJobs(
+  operation?: string
+): Promise<
+  ApiResult<{
+    status: string;
+    jobs: Array<{
+      _id?: string;
+      id?: string;
+      projectId?: string | null;
+      operation: string;
+      status: "queued" | "processing" | "completed" | "failed" | "cancelled" | "integration_required";
+      sourceFilename: string;
+      sourceSizeBytes?: number;
+      inputParams?: Record<string, unknown>;
+      result?: Record<string, unknown>;
+      errorMessage?: string;
+      startedAt?: string;
+      completedAt?: string;
+      createdAt?: string;
+    }>;
+  }>
+> {
+  const qs = operation ? `?operation=${encodeURIComponent(operation)}` : "";
+  return requestJson(`/api/video/jobs${qs}`);
+}
+
+export async function deleteServerVideoJob(
+  jobId: string
+): Promise<ApiResult<{ status: string; deleted: boolean }>> {
+  return requestJson(`/api/video/jobs/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
   });
 }

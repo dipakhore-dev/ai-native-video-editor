@@ -1,4 +1,4 @@
-import React, { useRef } from "react";
+import React, { useRef, useState } from "react";
 import {
   Plus,
   Film,
@@ -9,19 +9,31 @@ import {
   ArrowRight,
   Trash2,
   RefreshCw,
+  Copy,
+  AlertTriangle,
+  LayoutTemplate,
 } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
+import { ConfirmDialog } from "../components/common/ConfirmDialog";
 import { IntegrationNotice } from "../components/common/IntegrationNotice";
+import { ProjectThumbnail } from "../components/common/ProjectThumbnail";
 import { useStudio } from "../context/StudioContext";
+import type { Project } from "../types/studio";
 import { formatBytes, formatTimecode } from "../utils/media";
+import { getProjectMediaHealth } from "../utils/projectThumbnails";
+import { PROJECT_TEMPLATES } from "../utils/templates";
 
 export function DashboardPage() {
   const {
     navigate,
     projects,
     setActiveProjectId,
+    createProjectFromTemplateId,
+    duplicateProject,
     deleteProject,
     mediaAssets,
+    idbHydrating,
+    isAuthenticated,
     totalMediaBytes,
     uploadLocalFiles,
     uploadingMedia,
@@ -34,6 +46,8 @@ export function DashboardPage() {
   } = useStudio();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
 
   const videoCount = mediaAssets.filter((a) => a.kind === "video").length;
   const imageCount = mediaAssets.filter((a) => a.kind === "image").length;
@@ -49,6 +63,16 @@ export function DashboardPage() {
   const openProject = (projectId: string) => {
     setActiveProjectId(projectId);
     navigate("editor");
+  };
+
+  const handleDuplicate = async (projectId: string) => {
+    if (duplicatingId) return;
+    setDuplicatingId(projectId);
+    try {
+      await duplicateProject(projectId);
+    } finally {
+      setDuplicatingId(null);
+    }
   };
 
   return (
@@ -131,20 +155,20 @@ export function DashboardPage() {
               {formatBytes(totalMediaBytes)}
             </p>
             <p className="mt-1.5 text-xs text-zinc-500 tabular-nums">
-              {uploadingMedia ? "Inspecting local files..." : `${mediaAssets.length} active session files`}
+              {uploadingMedia ? "Inspecting local files..." : `${mediaAssets.length} active IndexedDB files`}
             </p>
           </div>
 
           <div className="rounded-xl border border-zinc-800/80 bg-[#111114] p-5">
             <div className="flex items-center justify-between text-xs text-zinc-400">
-              <span>Session Projects</span>
+              <span>Workspace Projects</span>
               <FolderOpen className="h-4 w-4 text-violet-400" />
             </div>
             <p className="mt-3 font-mono text-2xl font-semibold text-white tabular-nums">
               {projects.length}
             </p>
             <p className="mt-1.5 text-xs text-zinc-500">
-              Stored in browser memory
+              {isAuthenticated ? "Synced with MongoDB" : "Saved in local browser storage"}
             </p>
           </div>
 
@@ -163,15 +187,66 @@ export function DashboardPage() {
 
           <div className="rounded-xl border border-zinc-800/80 bg-[#111114] p-5">
             <div className="flex items-center justify-between text-xs text-zinc-400">
-              <span>Cloud Storage Quota</span>
+              <span>Export History</span>
               <Upload className="h-4 w-4 text-zinc-400" />
             </div>
-            <p className="mt-3 text-sm font-semibold text-zinc-200">
-              Not Connected
-            </p>
+            <button
+              type="button"
+              onClick={() => navigate("exports")}
+              className="mt-3 text-sm font-semibold text-violet-400 hover:text-violet-300 inline-flex items-center gap-1.5"
+            >
+              <span>View Export Jobs</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
             <p className="mt-1.5 text-xs text-zinc-500">
-              Attach S3 / GCS in Integrations
+              Local MP4 &amp; JSON export records
             </p>
+          </div>
+        </section>
+
+        {/* Quick Starter Templates */}
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-display text-lg font-semibold text-white inline-flex items-center gap-2">
+              <LayoutTemplate className="h-4 w-4 text-violet-400" />
+              <span>Starter Templates</span>
+            </h2>
+            <button
+              type="button"
+              onClick={() => navigate("projects")}
+              className="inline-flex items-center gap-1 text-xs font-medium text-zinc-400 hover:text-white transition-colors"
+            >
+              <span>Manage All Projects</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {PROJECT_TEMPLATES.map((tpl) => (
+              <div
+                key={tpl.id}
+                className="rounded-xl border border-zinc-800/80 bg-[#111114] p-4 flex items-center justify-between gap-3 hover:border-zinc-700 transition-colors"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-medium text-white truncate">{tpl.title}</h3>
+                    <span className="font-mono text-[11px] text-violet-300 tabular-nums shrink-0">
+                      {tpl.aspectRatio}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-zinc-500 tabular-nums truncate">
+                    {tpl.resolution} · {tpl.fps}fps · {tpl.estimatedDurationSec}s
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => createProjectFromTemplateId(tpl.id)}
+                  className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-100 hover:bg-violet-600 hover:border-violet-500 hover:text-white transition-colors whitespace-nowrap shrink-0"
+                >
+                  Use
+                </button>
+              </div>
+            ))}
           </div>
         </section>
 
@@ -196,9 +271,9 @@ export function DashboardPage() {
               <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-zinc-900 border border-zinc-800 text-violet-400 mb-4">
                 <Film className="h-5 w-5" />
               </div>
-              <h3 className="text-base font-medium text-white">No projects in this session yet</h3>
+              <h3 className="text-base font-medium text-white">No projects in this workspace yet</h3>
               <p className="mt-1.5 text-xs text-zinc-400 max-w-md mx-auto leading-relaxed">
-                Create a new sequence to launch the multitrack timeline editor, or upload local video files to inspect thumbnails and duration.
+                Create a new sequence, choose a starter template above, or upload local video files to inspect thumbnails and duration.
               </p>
               <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
                 <button
@@ -226,7 +301,7 @@ export function DashboardPage() {
                   (max, clip) => Math.max(max, clip.startTime + clip.duration),
                   0
                 );
-                const previewThumb = project.clips.find((c) => c.thumbnailUrl)?.thumbnailUrl;
+                const health = getProjectMediaHealth(project, mediaAssets, !idbHydrating);
 
                 return (
                   <div
@@ -238,19 +313,13 @@ export function DashboardPage() {
                       onClick={() => openProject(project.id)}
                       className="relative h-36 bg-zinc-950 w-full text-left group overflow-hidden"
                     >
-                      {previewThumb ? (
-                        <img
-                          src={previewThumb}
-                          alt={project.name}
-                          className="h-full w-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
-                        />
-                      ) : (
-                        <div className="h-full w-full flex items-center justify-center text-zinc-600">
-                          <Film className="h-7 w-7" />
-                        </div>
-                      )}
+                      <ProjectThumbnail
+                        project={project}
+                        mediaAssets={mediaAssets}
+                        className="h-full w-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
+                      />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent" />
-                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between text-[11px] font-mono text-zinc-300 tabular-nums">
+                      <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between text-[11px] font-mono text-zinc-200 tabular-nums">
                         <span>{project.aspectRatio} · {project.resolution}</span>
                         <span>{formatTimecode(totalDuration)}</span>
                       </div>
@@ -268,15 +337,38 @@ export function DashboardPage() {
                         <p className="mt-1 text-xs text-zinc-500 tabular-nums">
                           {project.clips.length} clips · {project.fps} fps
                         </p>
+                        {health.hasMissingMedia && (
+                          <button
+                            type="button"
+                            onClick={() => openProject(project.id)}
+                            className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-amber-400 hover:text-amber-300"
+                          >
+                            <AlertTriangle className="h-3 w-3 shrink-0" />
+                            <span>{health.missingCount} missing file(s) · Relink</span>
+                          </button>
+                        )}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => deleteProject(project.id)}
-                        className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-rose-400 transition-colors shrink-0"
-                        aria-label={`Delete ${project.name}`}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                      <div className="inline-flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          disabled={duplicatingId === project.id}
+                          onClick={() => void handleDuplicate(project.id)}
+                          className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-white disabled:opacity-40 transition-colors"
+                          aria-label={`Duplicate ${project.name}`}
+                          title="Duplicate project"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingDelete(project)}
+                          className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-rose-400 transition-colors"
+                          aria-label={`Delete ${project.name}`}
+                          title="Delete project"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -346,12 +438,35 @@ export function DashboardPage() {
           ) : null}
 
           <IntegrationNotice
-            title="Session-Only Persistence"
+            title={isAuthenticated ? "MongoDB + IndexedDB Hybrid Storage" : "Local IndexedDB + MongoDB Auth"}
             endpoint="POST /api/projects"
-            description="Projects and uploaded local media live in browser memory during this preview. Connect PostgreSQL or Firestore to persist edits across reloads."
+            description={
+              isAuthenticated
+                ? "Timelines, clips, subtitles, keyframes, and export jobs persist in MongoDB, while large local media blobs stay fast in browser IndexedDB."
+                : "Local media blobs persist in browser IndexedDB across reloads, and project timelines save in localStorage. Sign in to sync projects with MongoDB."
+            }
           />
         </section>
       </div>
+
+      <ConfirmDialog
+        open={Boolean(pendingDelete)}
+        title="Delete Project"
+        description={
+          pendingDelete
+            ? `Delete "${pendingDelete.name}"? This removes the sequence, clips, subtitles, and keyframes from your workspace.`
+            : ""
+        }
+        confirmLabel="Delete Project"
+        cancelLabel="Keep Project"
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) {
+            deleteProject(pendingDelete.id);
+          }
+          setPendingDelete(null);
+        }}
+      />
     </StudioShell>
   );
 }

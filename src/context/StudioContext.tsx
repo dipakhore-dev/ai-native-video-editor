@@ -4,10 +4,13 @@ import {
   createServerProject,
   deleteServerMediaMetadata,
   deleteServerProject,
+  deleteServerVideoJob,
+  duplicateServerProject,
   fetchCurrentAuthUser,
   fetchIntegrationStatus,
   fetchServerMediaAssets,
   fetchServerProjects,
+  fetchServerVideoJobs,
   mapServerProjectToStudioProject,
   saveServerProjectSubtitles,
   saveServerProjectTimeline,
@@ -19,10 +22,12 @@ import type {
   AppRoute,
   AspectRatioOption,
   ExportAttempt,
+  ExportRetryConfig,
   IntegrationStatusMap,
   MediaAsset,
   MediaKind,
   Project,
+  ProjectTemplateId,
   ResolutionOption,
   SessionUser,
   SubtitleMetadata,
@@ -32,8 +37,24 @@ import type {
   TimelineClip,
 } from "../types/studio";
 import { DEFAULT_DUCKING_AMOUNT, DEFAULT_WAVEFORM_BUCKETS, extractAudioWaveformPeaks } from "../utils/audio";
-import { extractMediaAsset } from "../utils/media";
-import { clearAllMediaCaches, clearAssetMediaCaches, thumbnailCache, waveformCache } from "../utils/mediaCache";
+import {
+  canRetryExportAttempt,
+  deleteExportFileBlob,
+  loadPersistedExportAttempts,
+  mapServerVideoJobToExportAttempt,
+  persistExportAttempts,
+  saveExportFileBlob,
+  upsertExportAttemptSafely,
+} from "../utils/exportHistoryStorage";
+import { detectMediaKind, extractMediaAsset } from "../utils/media";
+import {
+  clearAllMediaCaches,
+  clearAssetMediaCaches,
+  projectThumbnailCache,
+  thumbnailCache,
+  waveformCache,
+} from "../utils/mediaCache";
+import { createProjectFromTemplate } from "../utils/templates";
 import {
   checkStorageQuotaForBytes,
   deleteMediaFromIndexedDB,
@@ -98,8 +119,13 @@ interface StudioContextValue {
   activeProjectId: string | null;
   setActiveProjectId: (id: string | null) => void;
   createProject: (input: CreateProjectInput, openInEditor?: boolean) => Project;
+  createProjectFromTemplateId: (
+    templateId: ProjectTemplateId,
+    customName?: string,
+    openInEditor?: boolean
+  ) => Project;
   renameProject: (id: string, name: string) => void;
-  duplicateProject: (id: string) => void;
+  duplicateProject: (id: string) => Promise<Project | null>;
   deleteProject: (id: string) => void;
   mediaAssets: MediaAsset[];
   uploadingMedia: boolean;
@@ -188,7 +214,11 @@ interface StudioContextValue {
     overrideProjectId?: string
   ) => Promise<{ ok: boolean; error?: string; projectId?: string }>;
   exportAttempts: ExportAttempt[];
-  recordExportAttempt: (attempt: ExportAttempt) => void;
+  recordExportAttempt: (attempt: ExportAttempt, outputBlob?: Blob) => void;
+  deleteExportAttempt: (attemptId: string) => void;
+  retryFailedExport: (attempt: ExportAttempt) => boolean;
+  pendingRetryExportConfig: ExportRetryConfig | null;
+  clearPendingRetryExportConfig: () => void;
   integrations: IntegrationStatusMap | null;
   integrationsLoading: boolean;
   integrationsError: string | null;
@@ -267,7 +297,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [idbHydrating, setIdbHydrating] = useState(true);
   const [storageEstimate, setStorageEstimate] = useState<BrowserStorageEstimate | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
-  const [exportAttempts, setExportAttempts] = useState<ExportAttempt[]>([]);
+  const [exportAttempts, setExportAttempts] = useState<ExportAttempt[]>(() =>
+    loadPersistedExportAttempts()
+  );
+  const [pendingRetryExportConfig, setPendingRetryExportConfig] =
+    useState<ExportRetryConfig | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationStatusMap | null>(null);
   const [integrationsLoading, setIntegrationsLoading] = useState(true);
   const [integrationsError, setIntegrationsError] = useState<string | null>(null);
@@ -286,6 +320,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const projectsRef = useRef<Project[]>(initialSaved.projects);
   const idbHydratedRef = useRef(false);
   const serverMediaIdByClientIdRef = useRef<Map<string, string>>(new Map());
+  const deletedProjectIdsRef = useRef<Set<string>>(new Set());
+  const deletedExportJobIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     mediaAssetsRef.current = mediaAssets;
@@ -374,9 +410,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         defaultResolution: user.defaultResolution,
       });
 
-      const [projRes, serverMediaRes] = await Promise.all([
+      const [projRes, serverMediaRes, serverJobsRes] = await Promise.all([
         fetchServerProjects(),
         fetchServerMediaAssets(),
+        fetchServerVideoJobs("export_mp4"),
       ]);
 
       if (serverMediaRes.ok && serverMediaRes.data?.assets) {
@@ -391,7 +428,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (projRes.ok && projRes.data?.projects) {
-        const serverProjects = projRes.data.projects.map(mapServerProjectToStudioProject);
+        const serverProjects = projRes.data.projects
+          .map(mapServerProjectToStudioProject)
+          .filter((sp) => !deletedProjectIdsRef.current.has(sp.id));
         setProjects((prev) => {
           const prevById = new Map(prev.map((p) => [p.id, p]));
           const mergedServer = serverProjects.map((sp) => {
@@ -415,7 +454,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             };
           });
           const serverIds = new Set(mergedServer.map((p) => p.id));
-          const localOnly = prev.filter((p) => !serverIds.has(p.id) && !MONGO_OBJECT_ID_RE.test(p.id));
+          const localOnly = prev.filter(
+            (p) =>
+              !serverIds.has(p.id) &&
+              !MONGO_OBJECT_ID_RE.test(p.id) &&
+              !deletedProjectIdsRef.current.has(p.id)
+          );
           const combined = [...localOnly, ...mergedServer];
           return reconcileProjectsWithMediaAssets(
             combined,
@@ -428,6 +472,42 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           if (curr) return curr;
           return serverProjects[0]?.id ?? null;
         });
+      }
+
+      if (serverJobsRes.ok && Array.isArray(serverJobsRes.data?.jobs)) {
+        const mappedServerAttempts = serverJobsRes.data.jobs
+          .map(mapServerVideoJobToExportAttempt)
+          .filter((a): a is ExportAttempt => Boolean(a))
+          .filter((a) => !deletedExportJobIdsRef.current.has(a.serverJobId || a.id));
+
+        if (mappedServerAttempts.length > 0) {
+          setExportAttempts((prev) => {
+            const existingServerIds = new Set(
+              prev.map((p) => p.serverJobId).filter((sid): sid is string => Boolean(sid))
+            );
+            let next = [...prev];
+            for (const srv of mappedServerAttempts) {
+              if (srv.serverJobId && existingServerIds.has(srv.serverJobId)) {
+                const match = next.find((p) => p.serverJobId === srv.serverJobId);
+                if (match && match.status !== "cancelled") {
+                  next = upsertExportAttemptSafely(next, {
+                    ...match,
+                    status: srv.status,
+                    message: srv.message,
+                    encoderUsed: srv.encoderUsed ?? match.encoderUsed,
+                    exportDurationMs: srv.exportDurationMs ?? match.exportDurationMs,
+                    outputSizeBytes: srv.outputSizeBytes ?? match.outputSizeBytes,
+                  });
+                }
+                continue;
+              }
+              next = upsertExportAttemptSafely(next, srv);
+            }
+            next.sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
+            persistExportAttempts(next);
+            return next;
+          });
+        }
       }
     },
     []
@@ -610,38 +690,67 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         subtitles: [],
         subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
       };
-      setProjects((prev) => [project, ...prev]);
+      setProjects((prev) => {
+        const next = [project, ...prev];
+        persistProjectsToLocalStorage(next);
+        return next;
+      });
       setActiveProjectId(project.id);
       if (openInEditor) {
         setRoute("editor");
       }
       return project;
     },
-    [setActiveProjectId]
+    [persistProjectsToLocalStorage, setActiveProjectId]
+  );
+
+  const createProjectFromTemplateId = useCallback(
+    (templateId: ProjectTemplateId, customName?: string, openInEditor = true): Project => {
+      const project = createProjectFromTemplate(templateId, customName ? { name: customName } : undefined);
+      setProjects((prev) => {
+        const next = [project, ...prev];
+        persistProjectsToLocalStorage(next);
+        return next;
+      });
+      setActiveProjectId(project.id);
+      if (openInEditor) {
+        setRoute("editor");
+      }
+      return project;
+    },
+    [persistProjectsToLocalStorage, setActiveProjectId]
   );
 
   const renameProject = useCallback(
     (id: string, name: string) => {
       const trimmed = name.trim();
-      if (!trimmed) return;
-      setProjects((prev) =>
-        prev.map((p) => (p.id === id ? { ...p, name: trimmed, updatedAt: new Date().toISOString() } : p))
-      );
+      if (!trimmed || deletedProjectIdsRef.current.has(id)) return;
+      setProjects((prev) => {
+        const next = prev.map((p) =>
+          p.id === id ? { ...p, name: trimmed, updatedAt: new Date().toISOString() } : p
+        );
+        persistProjectsToLocalStorage(next);
+        return next;
+      });
+      projectThumbnailCache.invalidateProject(id);
       if (isAuthenticated && MONGO_OBJECT_ID_RE.test(id)) {
         void updateServerProject(id, { name: trimmed });
       }
     },
-    [isAuthenticated]
+    [isAuthenticated, persistProjectsToLocalStorage]
   );
 
-  const duplicateProject = useCallback((id: string) => {
-    setProjects((prev) => {
-      const source = prev.find((p) => p.id === id);
-      if (!source) return prev;
+  const duplicateProject = useCallback(
+    async (id: string): Promise<Project | null> => {
+      const source = projectsRef.current.find((p) => p.id === id);
+      if (!source || deletedProjectIdsRef.current.has(id)) return null;
+
       const now = new Date().toISOString();
+      const stamp = Date.now();
+      const tempCopyId = `proj_${stamp}_${Math.random().toString(36).slice(2, 6)}`;
       const clipIdMap = new Map<string, string>();
-      const clonedClips = source.clips.map((c) => {
-        const nextClipId = `clip_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const clonedClips = source.clips.map((c, idx) => {
+        const nextClipId = `clip_${stamp}_${idx}_${Math.random().toString(36).slice(2, 7)}`;
         clipIdMap.set(c.id, nextClipId);
         return {
           ...c,
@@ -654,22 +763,47 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           textStyle: c.textStyle ? { ...c.textStyle } : undefined,
         };
       });
+
       const copy: Project = {
         ...cloneProject(source),
-        id: `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        name: `${source.name} (Copy)`,
+        id: tempCopyId,
+        name: `${source.name} (Copy)`.slice(0, 140),
         createdAt: now,
         updatedAt: now,
         clips: clonedClips,
         subtitles: (source.subtitles ?? []).map((s, idx) => ({
           ...s,
-          id: `sub_${Date.now()}_${idx}`,
+          id: `sub_${stamp}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
           clipId: s.clipId ? clipIdMap.get(s.clipId) ?? s.clipId : undefined,
         })),
       };
-      return [copy, ...prev];
-    });
-  }, []);
+
+      setProjects((prev) => {
+        const next = [copy, ...prev];
+        persistProjectsToLocalStorage(next);
+        return next;
+      });
+
+      if (isAuthenticated && MONGO_OBJECT_ID_RE.test(id)) {
+        const res = await duplicateServerProject(id, copy.name);
+        if (res.ok && res.data?.project) {
+          const mongoId = String(res.data.project._id || res.data.project.id || "");
+          if (mongoId && !deletedProjectIdsRef.current.has(tempCopyId)) {
+            setProjects((prev) => {
+              const next = prev.map((p) => (p.id === tempCopyId ? { ...p, id: mongoId } : p));
+              persistProjectsToLocalStorage(next);
+              return next;
+            });
+            setActiveProjectIdState((curr) => (curr === tempCopyId ? mongoId : curr));
+            return { ...copy, id: mongoId };
+          }
+        }
+      }
+
+      return copy;
+    },
+    [isAuthenticated, persistProjectsToLocalStorage]
+  );
 
   const cleanupOrphanedAssets = useCallback(
     async (candidateAssetIds: string[], remainingProjects: Project[]): Promise<number> => {
@@ -701,6 +835,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const deleteProject = useCallback(
     (id: string) => {
+      deletedProjectIdsRef.current.add(id);
+      projectThumbnailCache.invalidateProject(id);
+
       const currentProjects = projectsRef.current;
       const targetProject = currentProjects.find((p) => p.id === id);
       const remainingProjects = currentProjects.filter((p) => p.id !== id);
@@ -893,6 +1030,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const relinkMissingClipAsset = useCallback(
     async (assetId: string, file: File): Promise<{ ok: boolean; error?: string }> => {
+      const detectedKind = detectMediaKind(file);
+      if (!detectedKind || detectedKind === "text") {
+        const msg = `Unsupported file type '${file.name}'. Choose a valid video, image, or audio file.`;
+        setMediaError(msg);
+        return { ok: false, error: msg };
+      }
+
+      const referencingClips = projectsRef.current.flatMap((p) =>
+        p.clips.filter((c) => c.assetId === assetId)
+      );
+      const expectedKinds = new Set(referencingClips.map((c) => c.kind));
+      if (expectedKinds.size > 0 && !expectedKinds.has(detectedKind)) {
+        const expectedList = Array.from(expectedKinds).join("/");
+        const msg = `Selected file '${file.name}' is ${detectedKind}, but timeline clip expects ${expectedList}.`;
+        setMediaError(msg);
+        return { ok: false, error: msg };
+      }
+
       setUploadingMedia(true);
       setMediaError(null);
       let extracted: MediaAsset | null = null;
@@ -909,7 +1064,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         clearAssetMediaCaches(assetId);
         extracted = await extractMediaAsset(file, assetId);
         const now = new Date().toISOString();
-        await saveMediaToIndexedDB({
+        const storedRecord: StoredMediaRecord = {
           id: assetId,
           name: extracted.name,
           kind: extracted.kind as Exclude<MediaKind, "text">,
@@ -925,17 +1080,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           blob: file,
           addedAt: extracted.addedAt,
           updatedAt: now,
-        });
+        };
+        await saveMediaToIndexedDB(storedRecord);
 
         registerTrackedObjectUrl(assetId, extracted.objectUrl);
+        if (extracted.thumbnailUrl) {
+          thumbnailCache.setCached(assetId, extracted.thumbnailUrl);
+        }
+        if (extracted.waveformPeaks?.length) {
+          waveformCache.setAssetPeaks(assetId, extracted.waveformPeaks);
+        }
 
         setMediaAssets((prev) => {
           const without = prev.filter((a) => a.id !== assetId);
           return [extracted!, ...without];
         });
 
-        setProjects((prev) =>
-          prev.map((proj) => {
+        setProjects((prev) => {
+          const next = prev.map((proj) => {
             let changed = false;
             const nextClips = proj.clips.map((clip) => {
               if (clip.assetId !== assetId) return clip;
@@ -943,19 +1105,51 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
               return {
                 ...clip,
                 objectUrl: extracted!.objectUrl,
-                thumbnailUrl: extracted!.thumbnailUrl ?? clip.thumbnailUrl,
-                waveformPeaks: extracted!.waveformPeaks ?? clip.waveformPeaks,
+                thumbnailUrl: extracted!.thumbnailUrl,
+                waveformPeaks: extracted!.waveformPeaks,
                 sourceName: extracted!.name,
                 sourceSizeBytes: extracted!.sizeBytes,
                 sourceMimeType: extracted!.mimeType,
+                ...(extracted!.width ? { sourceWidth: extracted!.width } : {}),
+                ...(extracted!.height ? { sourceHeight: extracted!.height } : {}),
                 needsRelink: false,
               };
             });
-            return changed
-              ? { ...proj, updatedAt: new Date().toISOString(), clips: nextClips }
-              : proj;
-          })
-        );
+            if (changed) {
+              projectThumbnailCache.invalidateProject(proj.id);
+              return { ...proj, updatedAt: new Date().toISOString(), clips: nextClips };
+            }
+            return proj;
+          });
+          persistProjectsToLocalStorage(next);
+          return next;
+        });
+
+        if (extracted.kind === "video" && !extracted.waveformPeaks) {
+          const targetExtracted = extracted;
+          void (async () => {
+            const peaks = await extractAudioWaveformPeaks(file, DEFAULT_WAVEFORM_BUCKETS, assetId);
+            if (!peaks || peaks.length === 0) return;
+            waveformCache.setAssetPeaks(assetId, peaks);
+            try {
+              await saveMediaToIndexedDB({
+                ...storedRecord,
+                waveformPeaks: peaks,
+                updatedAt: new Date().toISOString(),
+              });
+            } catch {
+              // Best-effort waveform persistence
+            }
+            setMediaAssets((prev) => {
+              const nextAssets = prev.map((a) =>
+                a.id === targetExtracted.id ? { ...a, waveformPeaks: peaks } : a
+              );
+              mediaAssetsRef.current = nextAssets;
+              setProjects((p) => reconcileProjectsWithMediaAssets(p, nextAssets, true));
+              return nextAssets;
+            });
+          })();
+        }
 
         void syncAssetMetadataToMongo(extracted);
         await refreshStorageEstimate();
@@ -971,7 +1165,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: msg };
       }
     },
-    [refreshStorageEstimate, registerTrackedObjectUrl, syncAssetMetadataToMongo]
+    [
+      persistProjectsToLocalStorage,
+      refreshStorageEstimate,
+      registerTrackedObjectUrl,
+      syncAssetMetadataToMongo,
+    ]
   );
 
   const getProjectsUsingAsset = useCallback(
@@ -1735,9 +1934,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       subtitleMeta?: SubtitleMetadata;
     }): Promise<{ ok: boolean; error?: string; projectId?: string }> => {
       const targetId = override?.projectId ?? activeProjectId;
-      const targetProject = projects.find((p) => p.id === targetId) ?? activeProject;
-      if (!targetProject) {
-        return { ok: false, error: "No active project selected." };
+      const targetProject = projectsRef.current.find((p) => p.id === targetId) ?? activeProject;
+      if (!targetProject || deletedProjectIdsRef.current.has(targetProject.id)) {
+        return { ok: false, error: "Project is no longer available." };
       }
 
       if (!isAuthenticated) {
@@ -1773,9 +1972,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         if (res.status !== 404) {
           return { ok: false, error: res.error || "Failed to save subtitles to MongoDB." };
         }
+        // Do not recreate if project was deleted locally or removed on server after Mongo creation
+        if (
+          deletedProjectIdsRef.current.has(targetProject.id) ||
+          !projectsRef.current.some((p) => p.id === targetProject.id)
+        ) {
+          return { ok: false, error: "Project was deleted." };
+        }
+        return { ok: false, error: "Project was not found on server." };
       }
 
-      // Project is local-only or missing on server: create it in MongoDB and upgrade its ID
+      if (
+        deletedProjectIdsRef.current.has(targetProject.id) ||
+        !projectsRef.current.some((p) => p.id === targetProject.id)
+      ) {
+        return { ok: false, error: "Project was deleted." };
+      }
+
+      // Project is local-only: create it in MongoDB and upgrade its ID
       const createdRes = await createServerProject(projectWithLatest);
       if (!createdRes.ok || !createdRes.data?.project) {
         return {
@@ -1789,6 +2003,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: "Server returned a project without an ID." };
       }
 
+      if (deletedProjectIdsRef.current.has(targetProject.id)) {
+        void deleteServerProject(mongoId);
+        return { ok: false, error: "Project was deleted." };
+      }
+
       setProjects((prev) => {
         const nextList = prev.map((p) =>
           p.id === targetProject.id ? { ...p, id: mongoId, updatedAt: new Date().toISOString() } : p
@@ -1800,7 +2019,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
       return { ok: true, projectId: mongoId };
     },
-    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage, projects]
+    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage]
   );
 
   const saveTimelineToMongo = useCallback(
@@ -1808,9 +2027,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       overrideProjectId?: string
     ): Promise<{ ok: boolean; error?: string; projectId?: string }> => {
       const targetId = overrideProjectId ?? activeProjectId;
-      const targetProject = projects.find((p) => p.id === targetId) ?? activeProject;
-      if (!targetProject) {
-        return { ok: false, error: "No active project selected." };
+      const targetProject = projectsRef.current.find((p) => p.id === targetId) ?? activeProject;
+      if (!targetProject || deletedProjectIdsRef.current.has(targetProject.id)) {
+        return { ok: false, error: "Project is no longer available." };
       }
 
       if (!isAuthenticated) {
@@ -1837,6 +2056,18 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           setMongoSaveError(errMsg);
           return { ok: false, error: errMsg };
         }
+        // Prevent autosave from resurrecting a deleted Mongo-backed project on 404
+        const errMsg = "Project no longer exists on server.";
+        setMongoSaveStatus("idle");
+        return { ok: false, error: errMsg };
+      }
+
+      if (
+        deletedProjectIdsRef.current.has(targetProject.id) ||
+        !projectsRef.current.some((p) => p.id === targetProject.id)
+      ) {
+        setMongoSaveStatus("idle");
+        return { ok: false, error: "Project was deleted." };
       }
 
       const createdRes = await createServerProject(targetProject);
@@ -1855,6 +2086,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: errMsg };
       }
 
+      if (deletedProjectIdsRef.current.has(targetProject.id)) {
+        void deleteServerProject(mongoId);
+        setMongoSaveStatus("idle");
+        return { ok: false, error: "Project was deleted." };
+      }
+
       setProjects((prev) => {
         const nextList = prev.map((p) =>
           p.id === targetProject.id ? { ...p, id: mongoId } : p
@@ -1869,18 +2106,21 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       setLastMongoSaveAt(savedAt);
       return { ok: true, projectId: mongoId };
     },
-    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage, projects]
+    [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage]
   );
 
   // Automatic debounced MongoDB persistence when authenticated user edits a Mongo-backed project
   useEffect(() => {
     if (!isAuthenticated || !activeProject) return;
+    if (deletedProjectIdsRef.current.has(activeProject.id)) return;
     if (!MONGO_OBJECT_ID_RE.test(activeProject.id) && activeProject.clips.length === 0) {
       return;
     }
 
+    const scheduledProjectId = activeProject.id;
     const timer = window.setTimeout(() => {
-      void saveTimelineToMongo(activeProject.id);
+      if (deletedProjectIdsRef.current.has(scheduledProjectId)) return;
+      void saveTimelineToMongo(scheduledProjectId);
     }, 1500);
 
     return () => window.clearTimeout(timer);
@@ -1888,8 +2128,67 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated, activeProject?.id, activeProject?.updatedAt]);
 
-  const recordExportAttempt = useCallback((attempt: ExportAttempt) => {
-    setExportAttempts((prev) => [attempt, ...prev]);
+  const recordExportAttempt = useCallback((attempt: ExportAttempt, outputBlob?: Blob) => {
+    if (outputBlob && outputBlob.size > 0 && attempt.status === "completed") {
+      void saveExportFileBlob(attempt.id, outputBlob, attempt.outputFilename || "export.mp4");
+    }
+    setExportAttempts((prev) => {
+      const next = upsertExportAttemptSafely(prev, attempt);
+      persistExportAttempts(next);
+      return next;
+    });
+  }, []);
+
+  const deleteExportAttempt = useCallback(
+    (attemptId: string) => {
+      const target = exportAttempts.find((a) => a.id === attemptId);
+      if (target?.serverJobId) {
+        deletedExportJobIdsRef.current.add(target.serverJobId);
+        if (isAuthenticated && MONGO_OBJECT_ID_RE.test(target.serverJobId)) {
+          void deleteServerVideoJob(target.serverJobId);
+        }
+      }
+      deletedExportJobIdsRef.current.add(attemptId);
+      void deleteExportFileBlob(attemptId);
+      setExportAttempts((prev) => {
+        const next = prev.filter((a) => a.id !== attemptId);
+        persistExportAttempts(next);
+        return next;
+      });
+    },
+    [exportAttempts, isAuthenticated]
+  );
+
+  const retryFailedExport = useCallback(
+    (attempt: ExportAttempt): boolean => {
+      if (!canRetryExportAttempt(attempt)) {
+        return false;
+      }
+      const targetProject =
+        projectsRef.current.find((p) => p.id === attempt.projectId) ??
+        projectsRef.current.find((p) => p.name === attempt.projectName);
+      if (!targetProject) {
+        return false;
+      }
+
+      const fps = attempt.fps === 24 || attempt.fps === 30 || attempt.fps === 60 ? attempt.fps : targetProject.fps;
+      setPendingRetryExportConfig({
+        projectId: targetProject.id,
+        format: attempt.format,
+        exportProfile: attempt.exportProfile,
+        encodingMode: attempt.encodingMode,
+        fps,
+        burnSubtitles: attempt.burnSubtitles,
+      });
+      setActiveProjectId(targetProject.id);
+      setRoute("editor");
+      return true;
+    },
+    [setActiveProjectId]
+  );
+
+  const clearPendingRetryExportConfig = useCallback(() => {
+    setPendingRetryExportConfig(null);
   }, []);
 
   const updateSessionUser = useCallback((patch: Partial<SessionUser>) => {
@@ -1911,6 +2210,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       activeProjectId,
       setActiveProjectId,
       createProject,
+      createProjectFromTemplateId,
       renameProject,
       duplicateProject,
       deleteProject,
@@ -1961,6 +2261,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       saveTimelineToMongo,
       exportAttempts,
       recordExportAttempt,
+      deleteExportAttempt,
+      retryFailedExport,
+      pendingRetryExportConfig,
+      clearPendingRetryExportConfig,
       integrations,
       integrationsLoading,
       integrationsError,
@@ -1982,6 +2286,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       activeProjectId,
       setActiveProjectId,
       createProject,
+      createProjectFromTemplateId,
       renameProject,
       duplicateProject,
       deleteProject,
@@ -2032,6 +2337,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       saveTimelineToMongo,
       exportAttempts,
       recordExportAttempt,
+      deleteExportAttempt,
+      retryFailedExport,
+      pendingRetryExportConfig,
+      clearPendingRetryExportConfig,
       integrations,
       integrationsLoading,
       integrationsError,

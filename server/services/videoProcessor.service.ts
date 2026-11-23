@@ -1216,6 +1216,11 @@ export async function runSyncBinaryVideoOperation(params: {
       });
     }
 
+    const exportDurationMs = Math.max(
+      0,
+      Date.now() - (jobDoc.startedAt ? new Date(jobDoc.startedAt).getTime() : Date.now())
+    );
+
     jobDoc.status = "completed";
     jobDoc.progress = 100;
     jobDoc.processorJobId = processorJobId;
@@ -1223,6 +1228,7 @@ export async function runSyncBinaryVideoOperation(params: {
       outputFilename: filename,
       outputSizeBytes: buffer.length,
       contentType,
+      exportDurationMs,
       ...(exportProfile ? { exportProfile } : {}),
       ...(encoderUsed ? { encoderUsed, hardwareFallbackUsed } : {}),
     };
@@ -1230,6 +1236,16 @@ export async function runSyncBinaryVideoOperation(params: {
     await jobDoc.save();
 
     if (hasCancelled()) {
+      await VideoJobModel.findOneAndUpdate(
+        { _id: jobDoc._id, userId: params.userId, status: { $ne: "cancelled" } },
+        {
+          $set: {
+            status: "cancelled",
+            errorMessage: "Export cancelled by user.",
+            completedAt: new Date(),
+          },
+        }
+      ).catch(() => undefined);
       throw Object.assign(new Error("Export cancelled by user."), {
         statusCode: 499,
         cancelled: true,
@@ -1403,11 +1419,15 @@ export async function runSyncSubtitlesGeneration(params: {
 
 export async function listUserVideoJobs(
   userId: string,
-  projectId?: string
+  projectId?: string,
+  operation?: VideoOperationType
 ): Promise<IVideoJob[]> {
   const filter: Record<string, unknown> = { userId };
   if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
     filter.projectId = projectId;
+  }
+  if (operation) {
+    filter.operation = operation;
   }
   return VideoJobModel.find(filter).sort({ createdAt: -1 }).limit(50);
 }
@@ -1423,4 +1443,23 @@ export async function getUserVideoJobWithQueueState(
       ? await getBullMqJobSnapshot(job.queueJobId)
       : null;
   return { job, bullmq };
+}
+
+export async function deleteUserVideoJob(
+  userId: string,
+  jobId: string
+): Promise<{ deleted: boolean; conflict?: boolean }> {
+  const existing = await VideoJobModel.findOne({ _id: jobId, userId });
+  if (!existing) {
+    return { deleted: false };
+  }
+  if (existing.status === "queued" || existing.status === "processing") {
+    return { deleted: false, conflict: true };
+  }
+  const removed = await VideoJobModel.findOneAndDelete({
+    _id: jobId,
+    userId,
+    status: { $nin: ["queued", "processing"] },
+  });
+  return { deleted: Boolean(removed) };
 }

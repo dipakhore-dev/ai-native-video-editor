@@ -65,7 +65,7 @@ export async function updateUserExportJobStatus(
   }
 ): Promise<IExportJob | null> {
   return ExportJobModel.findOneAndUpdate(
-    { _id: jobId, userId },
+    { _id: jobId, userId, status: { $nin: ["completed", "cancelled"] } },
     { $set: updates },
     { new: true, runValidators: true }
   );

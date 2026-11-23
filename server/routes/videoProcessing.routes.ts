@@ -8,6 +8,7 @@ import { getEnvConfig } from "../config/env.ts";
 import {
   aspectRatioVideoController,
   cancelExportController,
+  deleteVideoJobController,
   exportMp4VideoController,
   extractVideoMetadataController,
   getExportProgressController,
@@ -311,3 +312,4 @@ videoProcessingRouter.post(
 );
 videoProcessingRouter.get("/jobs", listVideoJobsController);
 videoProcessingRouter.get("/jobs/:id", validateObjectId("id"), getVideoJobController);
+videoProcessingRouter.delete("/jobs/:id", validateObjectId("id"), deleteVideoJobController);

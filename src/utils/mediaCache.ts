@@ -460,8 +460,45 @@ class WaveformCacheManager {
   }
 }
 
+class ProjectThumbnailCacheManager {
+  private readonly cache = new BoundedLRUCache<string, { fingerprint: string; url: string }>(
+    80,
+    8 * 1024 * 1024
+  );
+
+  get(projectId: string, fingerprint: string): string | undefined {
+    const entry = this.cache.get(projectId);
+    if (!entry || entry.fingerprint !== fingerprint) {
+      return undefined;
+    }
+    return entry.url;
+  }
+
+  set(projectId: string, fingerprint: string, url: string): void {
+    if (!projectId || !fingerprint || !url) return;
+    const approxBytes = url.startsWith("data:") ? url.length : 16_384;
+    this.cache.set(projectId, { fingerprint, url }, approxBytes, (evicted) => {
+      revokeIfBlobUrl(evicted.url);
+    });
+  }
+
+  invalidateProject(projectId: string): boolean {
+    if (!projectId) return false;
+    return this.cache.delete(projectId);
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  getStats(): LRUCacheStats {
+    return this.cache.getStats();
+  }
+}
+
 export const thumbnailCache = new ThumbnailCacheManager();
 export const waveformCache = new WaveformCacheManager();
+export const projectThumbnailCache = new ProjectThumbnailCacheManager();
 
 export function clearAssetMediaCaches(assetId: string): void {
   thumbnailCache.invalidateAsset(assetId);
@@ -471,11 +508,13 @@ export function clearAssetMediaCaches(assetId: string): void {
 export function clearAllMediaCaches(): void {
   thumbnailCache.clear();
   waveformCache.clear();
+  projectThumbnailCache.clear();
 }
 
 export function getMediaCacheStats() {
   return {
     thumbnails: thumbnailCache.getStats(),
     waveforms: waveformCache.getStats(),
+    projectThumbnails: projectThumbnailCache.getStats(),
   };
 }

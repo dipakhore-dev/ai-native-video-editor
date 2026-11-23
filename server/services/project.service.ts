@@ -85,6 +85,99 @@ export async function saveUserProjectSubtitles(
   );
 }
 
+export async function duplicateUserProject(
+  userId: string,
+  projectId: string,
+  customName?: string
+): Promise<IProject | null> {
+  const source = await ProjectModel.findOne({ _id: projectId, userId }).lean();
+  if (!source) return null;
+
+  const baseName = (customName?.trim() || `${source.name} (Copy)`).slice(0, 140);
+  const stamp = Date.now();
+  const clipIdMap = new Map<string, string>();
+
+  const clonedTracks = (source.tracks ?? []).map((t) => ({
+    id: t.id,
+    name: t.name,
+    type: t.type,
+    muted: Boolean(t.muted),
+    locked: Boolean(t.locked),
+  }));
+
+  const clonedClips = (source.clips ?? []).map((clip, idx) => {
+    const nextClipId = `clip_${stamp}_${idx}_${Math.random().toString(36).slice(2, 7)}`;
+    clipIdMap.set(clip.id, nextClipId);
+    return {
+      id: nextClipId,
+      assetId: clip.assetId,
+      trackId: clip.trackId,
+      name: clip.name,
+      kind: clip.kind,
+      startTime: clip.startTime,
+      duration: clip.duration,
+      inPoint: clip.inPoint,
+      sourceDuration: clip.sourceDuration,
+      volume: clip.volume,
+      muted: Boolean(clip.muted),
+      fadeInSec: clip.fadeInSec ?? 0,
+      fadeOutSec: clip.fadeOutSec ?? 0,
+      ...(clip.kind === "audio"
+        ? {
+            duckingEnabled: Boolean(clip.duckingEnabled),
+            duckingAmount: clip.duckingAmount ?? 0.6,
+          }
+        : {}),
+      speed: clip.speed,
+      opacity: clip.opacity,
+      ...(clip.rotation !== undefined ? { rotation: clip.rotation } : {}),
+      ...(Array.isArray(clip.keyframes) && clip.keyframes.length > 0
+        ? {
+            keyframes: clip.keyframes.map((kf, kfIdx) => ({
+              id: `kf_${stamp}_${idx}_${kfIdx}_${Math.random().toString(36).slice(2, 6)}`,
+              timeSec: kf.timeSec,
+              property: kf.property,
+              value: kf.value,
+              easing: kf.easing,
+            })),
+          }
+        : {}),
+      ...(clip.transitionIn ? { transitionIn: { ...clip.transitionIn } } : {}),
+      ...(clip.transitionOut ? { transitionOut: { ...clip.transitionOut } } : {}),
+      ...(clip.effects ? { effects: { ...clip.effects } } : {}),
+      ...(clip.overlayTransform ? { overlayTransform: { ...clip.overlayTransform } } : {}),
+      ...(clip.sourceWidth !== undefined ? { sourceWidth: clip.sourceWidth } : {}),
+      ...(clip.sourceHeight !== undefined ? { sourceHeight: clip.sourceHeight } : {}),
+      ...(clip.sourceName !== undefined ? { sourceName: clip.sourceName } : {}),
+      ...(clip.sourceSizeBytes !== undefined ? { sourceSizeBytes: clip.sourceSizeBytes } : {}),
+      ...(clip.sourceMimeType !== undefined ? { sourceMimeType: clip.sourceMimeType } : {}),
+      ...(clip.textStyle ? { textStyle: { ...clip.textStyle } } : {}),
+    };
+  });
+
+  const clonedSubtitles = (source.subtitles ?? []).map((sub, idx) => ({
+    id: `sub_${stamp}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+    start: sub.start,
+    end: sub.end,
+    text: sub.text,
+    ...(sub.clipId ? { clipId: clipIdMap.get(sub.clipId) ?? sub.clipId } : {}),
+  }));
+
+  return ProjectModel.create({
+    userId,
+    name: baseName,
+    description: source.description ?? "",
+    aspectRatio: source.aspectRatio ?? "16:9",
+    resolution: source.resolution ?? "1080p",
+    fps: source.fps ?? 24,
+    tracks: clonedTracks,
+    clips: clonedClips,
+    subtitles: clonedSubtitles,
+    ...(source.subtitleStyle ? { subtitleStyle: { ...source.subtitleStyle } } : {}),
+    ...(source.subtitleMeta ? { subtitleMeta: { ...source.subtitleMeta } } : {}),
+  });
+}
+
 export async function deleteUserProject(
   userId: string,
   projectId: string

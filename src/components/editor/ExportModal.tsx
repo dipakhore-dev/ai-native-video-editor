@@ -23,6 +23,7 @@ import {
 } from "../../services/api";
 import type {
   ExportProfileId,
+  ExportRetryConfig,
   HardwareEncodingMode,
   Project,
   RenderTimelinePayload,
@@ -34,6 +35,7 @@ import { buildStructuredTimelineSpec, resolveDimensions } from "../../utils/time
 interface ExportModalProps {
   project: Project;
   totalDuration: number;
+  initialRetryConfig?: ExportRetryConfig | null;
   onClose: () => void;
 }
 
@@ -203,13 +205,23 @@ function triggerBrowserDownload(url: string, filename: string): void {
   document.body.removeChild(a);
 }
 
-export function ExportModal({ project, totalDuration, onClose }: ExportModalProps) {
+export function ExportModal({
+  project,
+  totalDuration,
+  initialRetryConfig,
+  onClose,
+}: ExportModalProps) {
   const { mediaAssets, recordExportAttempt, navigate } = useStudio();
-  const [format, setFormat] = useState<"mp4" | "webm" | "mov">("mp4");
-  const [exportProfile, setExportProfile] = useState<ExportProfileId>(
-    project.resolution === "720p" ? "fast_preview" : "balanced"
+  const [format, setFormat] = useState<"mp4" | "webm" | "mov">(
+    initialRetryConfig?.format ?? "mp4"
   );
-  const [encodingMode, setEncodingMode] = useState<HardwareEncodingMode>("auto");
+  const [exportProfile, setExportProfile] = useState<ExportProfileId>(
+    initialRetryConfig?.exportProfile ??
+      (project.resolution === "720p" ? "fast_preview" : "balanced")
+  );
+  const [encodingMode, setEncodingMode] = useState<HardwareEncodingMode>(
+    initialRetryConfig?.encodingMode ?? "auto"
+  );
   const [processorCaps, setProcessorCaps] = useState<{
     loading: boolean;
     reachable: boolean;
@@ -238,8 +250,12 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
   );
   const subtitleStyle = useMemo(() => getSubtitleStyle(project), [project]);
 
-  const [fps, setFps] = useState<number>(project.fps);
-  const [burnSubtitles, setBurnSubtitles] = useState<boolean>(validSubtitles.length > 0);
+  const [fps, setFps] = useState<number>(initialRetryConfig?.fps ?? project.fps);
+  const [burnSubtitles, setBurnSubtitles] = useState<boolean>(
+    initialRetryConfig?.burnSubtitles !== undefined
+      ? initialRetryConfig.burnSubtitles && validSubtitles.length > 0
+      : validSubtitles.length > 0
+  );
   const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [liveProgress, setLiveProgress] = useState<LiveExportProgress | null>(null);
@@ -390,6 +406,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
     }
     setFeedback(null);
 
+    const shouldBurnSubtitles = burnSubtitles && validSubtitles.length > 0;
     const validationError = validateTimelineForLocalMp4(project, format, resolution, fps);
     if (validationError) {
       setFeedback({ kind: "error", message: validationError });
@@ -397,6 +414,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         id: `exp_${Date.now()}`,
         projectId: project.id,
         projectName: project.name,
+        aspectRatio: project.aspectRatio,
         resolution,
         exportProfile,
         encodingMode,
@@ -404,6 +422,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         fps,
         clipCount: project.clips.length,
         totalDuration,
+        exportDurationMs: 0,
+        burnSubtitles: shouldBurnSubtitles,
         status: "failed",
         message: validationError,
         requestedAt: new Date().toISOString(),
@@ -486,9 +506,10 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           message: cancelMsg,
         });
         recordExportAttempt({
-          id: `exp_${Date.now()}`,
+          id: clientJobId,
           projectId: project.id,
           projectName: project.name,
+          aspectRatio: project.aspectRatio,
           resolution,
           exportProfile,
           encodingMode,
@@ -496,6 +517,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           fps,
           clipCount: project.clips.length,
           totalDuration,
+          exportDurationMs: Math.max(0, Date.now() - startedAtRef.current),
+          burnSubtitles: shouldBurnSubtitles,
           status: "cancelled",
           message: cancelMsg,
           requestedAt: new Date().toISOString(),
@@ -505,7 +528,6 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       }
 
       const resolutionPreset = activeProfileMeta.resolutionPreset;
-      const shouldBurnSubtitles = burnSubtitles && validSubtitles.length > 0;
       const exportSpec: RenderTimelinePayload & { format: "mp4" } = {
         ...structuredSpec,
         format: "mp4",
@@ -655,13 +677,16 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       activeJobIdRef.current = null;
       abortControllerRef.current = null;
 
+      const elapsedMs = Math.max(0, Date.now() - startedAtRef.current);
+
       if (wasCancelled) {
         const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
         setFeedback({ kind: "cancelled", message: cancelMsg });
         recordExportAttempt({
-          id: `exp_${Date.now()}`,
+          id: clientJobId,
           projectId: project.id,
           projectName: project.name,
+          aspectRatio: project.aspectRatio,
           resolution,
           exportProfile,
           encodingMode,
@@ -669,6 +694,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           fps,
           clipCount: project.clips.length,
           totalDuration,
+          exportDurationMs: elapsedMs,
+          burnSubtitles: shouldBurnSubtitles,
           status: "cancelled",
           message: cancelMsg,
           requestedAt: new Date().toISOString(),
@@ -681,7 +708,7 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         const downloadUrl = URL.createObjectURL(res.data.blob);
         triggerBrowserDownload(downloadUrl, res.data.filename);
 
-        const elapsedSec = Math.max(1, Math.round((Date.now() - startedAtRef.current) / 1000));
+        const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
         const encoderNote = res.data.encoderUsed
           ? `${activeProfileMeta.label} · ${res.data.encoderUsed}${res.data.hardwareFallbackUsed ? " (CPU fallback)" : ""}`
           : activeProfileMeta.label;
@@ -694,25 +721,32 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           sizeBytes: res.data.sizeBytes,
         });
 
-        recordExportAttempt({
-          id: `exp_${Date.now()}`,
-          projectId: project.id,
-          projectName: project.name,
-          resolution,
-          exportProfile,
-          encodingMode,
-          encoderUsed: res.data.encoderUsed,
-          format,
-          fps,
-          clipCount: project.clips.length,
-          totalDuration,
-          status: "completed",
-          message: successMsg,
-          requestedAt: new Date().toISOString(),
-          timelineSnapshotJson: snapshotJson,
-          outputFilename: res.data.filename,
-          outputSizeBytes: res.data.sizeBytes,
-        });
+        recordExportAttempt(
+          {
+            id: clientJobId,
+            serverJobId: res.data.jobId || undefined,
+            projectId: project.id,
+            projectName: project.name,
+            aspectRatio: project.aspectRatio,
+            resolution,
+            exportProfile,
+            encodingMode,
+            encoderUsed: res.data.encoderUsed,
+            format,
+            fps,
+            clipCount: project.clips.length,
+            totalDuration,
+            exportDurationMs: elapsedMs,
+            burnSubtitles: shouldBurnSubtitles,
+            status: "completed",
+            message: successMsg,
+            requestedAt: new Date().toISOString(),
+            timelineSnapshotJson: snapshotJson,
+            outputFilename: res.data.filename,
+            outputSizeBytes: res.data.sizeBytes,
+          },
+          res.data.blob
+        );
         return;
       }
 
@@ -721,9 +755,10 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           "Sign in to your account before exporting MP4 video through the backend FFmpeg worker.";
         setFeedback({ kind: "auth", message: authMsg });
         recordExportAttempt({
-          id: `exp_${Date.now()}`,
+          id: clientJobId,
           projectId: project.id,
           projectName: project.name,
+          aspectRatio: project.aspectRatio,
           resolution,
           exportProfile,
           encodingMode,
@@ -731,6 +766,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           fps,
           clipCount: project.clips.length,
           totalDuration,
+          exportDurationMs: elapsedMs,
+          burnSubtitles: shouldBurnSubtitles,
           status: "failed",
           message: authMsg,
           requestedAt: new Date().toISOString(),
@@ -747,9 +784,10 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       });
 
       recordExportAttempt({
-        id: `exp_${Date.now()}`,
+        id: clientJobId,
         projectId: project.id,
         projectName: project.name,
+        aspectRatio: project.aspectRatio,
         resolution,
         exportProfile,
         encodingMode,
@@ -757,6 +795,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         fps,
         clipCount: project.clips.length,
         totalDuration,
+        exportDurationMs: elapsedMs,
+        burnSubtitles: shouldBurnSubtitles,
         status: isWorkerUnavailable ? "integration_required" : "failed",
         message: errorMsg,
         requestedAt: new Date().toISOString(),
@@ -777,14 +817,16 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       setLiveProgress(null);
       activeJobIdRef.current = null;
       abortControllerRef.current = null;
+      const elapsedMs = Math.max(0, Date.now() - startedAtRef.current);
 
       if (wasCancelled) {
         const cancelMsg = "Export cancelled and temporary processing files were cleaned up.";
         setFeedback({ kind: "cancelled", message: cancelMsg });
         recordExportAttempt({
-          id: `exp_${Date.now()}`,
+          id: clientJobId,
           projectId: project.id,
           projectName: project.name,
+          aspectRatio: project.aspectRatio,
           resolution,
           exportProfile,
           encodingMode,
@@ -792,6 +834,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
           fps,
           clipCount: project.clips.length,
           totalDuration,
+          exportDurationMs: elapsedMs,
+          burnSubtitles: shouldBurnSubtitles,
           status: "cancelled",
           message: cancelMsg,
           requestedAt: new Date().toISOString(),
@@ -803,9 +847,10 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
       const errMsg = err instanceof Error ? err.message : "Could not read local video file bytes.";
       setFeedback({ kind: "error", message: errMsg });
       recordExportAttempt({
-        id: `exp_${Date.now()}`,
+        id: clientJobId,
         projectId: project.id,
         projectName: project.name,
+        aspectRatio: project.aspectRatio,
         resolution,
         exportProfile,
         encodingMode,
@@ -813,6 +858,8 @@ export function ExportModal({ project, totalDuration, onClose }: ExportModalProp
         fps,
         clipCount: project.clips.length,
         totalDuration,
+        exportDurationMs: elapsedMs,
+        burnSubtitles: shouldBurnSubtitles,
         status: "failed",
         message: errMsg,
         requestedAt: new Date().toISOString(),

@@ -266,8 +266,10 @@ export interface RenderTimelinePayload {
 
 export interface ExportAttempt {
   id: string;
+  serverJobId?: string;
   projectId: string;
   projectName: string;
+  aspectRatio?: AspectRatioOption;
   resolution: string;
   exportProfile?: ExportProfileId;
   encodingMode?: HardwareEncodingMode;
@@ -276,6 +278,8 @@ export interface ExportAttempt {
   fps: number;
   clipCount: number;
   totalDuration: number;
+  exportDurationMs?: number;
+  burnSubtitles?: boolean;
   status: "completed" | "failed" | "cancelled" | "integration_required";
   message: string;
   requestedAt: string;
@@ -283,6 +287,17 @@ export interface ExportAttempt {
   outputFilename?: string;
   outputSizeBytes?: number;
 }
+
+export interface ExportRetryConfig {
+  projectId: string;
+  format: "mp4" | "webm" | "mov";
+  exportProfile?: ExportProfileId;
+  encodingMode?: HardwareEncodingMode;
+  fps: 24 | 30 | 60;
+  burnSubtitles?: boolean;
+}
+
+export type ProjectTemplateId = "youtube-landscape" | "instagram-reels" | "square-social";
 
 export interface IntegrationStatusItem {
   id: string;

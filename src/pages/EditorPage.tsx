@@ -22,7 +22,7 @@ import { AiAssistantPanel, type EditorPanelTab } from "../components/editor/AiAs
 import { EditorPreviewStage } from "../components/editor/EditorPreviewStage";
 import { ExportModal } from "../components/editor/ExportModal";
 import { useStudio } from "../context/StudioContext";
-import type { MediaAsset, MediaKind } from "../types/studio";
+import type { ExportRetryConfig, MediaAsset, MediaKind } from "../types/studio";
 import { formatBytes, formatTimecode } from "../utils/media";
 import { TimelinePlaybackClock } from "../utils/timelineClock";
 
@@ -57,6 +57,8 @@ export function EditorPage() {
     mongoSaveError,
     saveTimelineToMongo,
     sessionUser,
+    pendingRetryExportConfig,
+    clearPendingRetryExportConfig,
   } = useStudio();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -73,9 +75,22 @@ export function EditorPage() {
   const [binSearch, setBinSearch] = useState("");
   const [binDragOver, setBinDragOver] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [activeRetryConfig, setActiveRetryConfig] = useState<ExportRetryConfig | null>(null);
   const [saveFlash, setSaveFlash] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<EditorPanelTab>("assistant");
   const [previewMediaError, setPreviewMediaError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (
+      pendingRetryExportConfig &&
+      activeProject &&
+      pendingRetryExportConfig.projectId === activeProject.id
+    ) {
+      setActiveRetryConfig(pendingRetryExportConfig);
+      setExportOpen(true);
+      clearPendingRetryExportConfig();
+    }
+  }, [pendingRetryExportConfig, activeProject, clearPendingRetryExportConfig]);
 
   const totalDuration = useMemo(() => {
     if (!activeProject || activeProject.clips.length === 0) return 0;
@@ -743,7 +758,11 @@ export function EditorPage() {
         <ExportModal
           project={activeProject}
           totalDuration={totalDuration}
-          onClose={() => setExportOpen(false)}
+          initialRetryConfig={activeRetryConfig}
+          onClose={() => {
+            setExportOpen(false);
+            setActiveRetryConfig(null);
+          }}
         />
       )}
     </StudioShell>

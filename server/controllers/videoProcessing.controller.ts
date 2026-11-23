@@ -6,6 +6,7 @@ import { getVideoQueueStatus } from "../queues/videoQueue.ts";
 import {
   cancelActiveExport,
   checkVideoProcessorHealth,
+  deleteUserVideoJob,
   getExportProgressSnapshot,
   getUserVideoJobWithQueueState,
   isExportCancelled,
@@ -16,6 +17,7 @@ import {
   runSyncBinaryVideoOperation,
   runSyncSubtitlesGeneration,
 } from "../services/videoProcessor.service.ts";
+import type { VideoOperationType } from "../models/VideoJob.ts";
 
 function getParamId(req: AuthenticatedRequest): string {
   const raw = req.params.id;
@@ -1117,6 +1119,17 @@ export async function subtitlesVideoController(
   }
 }
 
+const VALID_VIDEO_OPERATIONS = new Set<VideoOperationType>([
+  "metadata",
+  "thumbnail",
+  "trim",
+  "merge",
+  "resize_crop",
+  "aspect_ratio",
+  "export_mp4",
+  "subtitles",
+]);
+
 export async function listVideoJobsController(
   req: AuthenticatedRequest,
   res: Response
@@ -1124,7 +1137,11 @@ export async function listVideoJobsController(
   try {
     const projectId =
       typeof req.query.projectId === "string" ? req.query.projectId : undefined;
-    const jobs = await listUserVideoJobs(req.userId!, projectId);
+    const rawOp = typeof req.query.operation === "string" ? req.query.operation.trim() : "";
+    const operation = VALID_VIDEO_OPERATIONS.has(rawOp as VideoOperationType)
+      ? (rawOp as VideoOperationType)
+      : undefined;
+    const jobs = await listUserVideoJobs(req.userId!, projectId, operation);
     res.json({ status: "ok", jobs });
   } catch (err) {
     res.status(500).json({
@@ -1147,6 +1164,30 @@ export async function getVideoJobController(
   } catch (err) {
     res.status(500).json({
       error: err instanceof Error ? err.message : "Failed to fetch video processing job.",
+    });
+  }
+}
+
+export async function deleteVideoJobController(
+  req: AuthenticatedRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const result = await deleteUserVideoJob(req.userId!, getParamId(req));
+    if (result.conflict) {
+      res.status(409).json({
+        error: "Cannot delete an actively processing export job. Cancel the export first.",
+      });
+      return;
+    }
+    if (!result.deleted) {
+      res.status(404).json({ error: "Video processing job not found." });
+      return;
+    }
+    res.json({ status: "ok", deleted: true });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Failed to delete video processing job.",
     });
   }
 }

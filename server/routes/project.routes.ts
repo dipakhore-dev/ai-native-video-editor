@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
   createProjectController,
   deleteProjectController,
+  duplicateProjectController,
   getProjectController,
   listProjectsController,
   saveSubtitlesController,
@@ -42,4 +43,5 @@ projectRouter.put(
   validateBody(UpdateSubtitlesSchema),
   saveSubtitlesController
 );
+projectRouter.post("/:id/duplicate", validateObjectId("id"), duplicateProjectController);
 projectRouter.delete("/:id", validateObjectId("id"), deleteProjectController);
