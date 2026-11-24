@@ -5,7 +5,7 @@ coverage/
 .DS_Store
 *.log
 .env*
-!.env.example
+.env.example
 .venv/
 venv/
 video-processor/.venv/
@@ -14,7 +14,7 @@ __pycache__/
 .pytest_cache/
 video-processor/.env
 video-processor/.env.*
-!video-processor/.env.example
+video-processor/.env.example
 tmp/
 uploads/
 exports/
