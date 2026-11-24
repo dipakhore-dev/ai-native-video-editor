@@ -478,29 +478,17 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         const mappedServerAttempts = serverJobsRes.data.jobs
           .map(mapServerVideoJobToExportAttempt)
           .filter((a): a is ExportAttempt => Boolean(a))
-          .filter((a) => !deletedExportJobIdsRef.current.has(a.serverJobId || a.id));
+          .filter(
+            (a) =>
+              !deletedExportJobIdsRef.current.has(a.id) &&
+              (!a.serverJobId || !deletedExportJobIdsRef.current.has(a.serverJobId)) &&
+              (!a.clientJobId || !deletedExportJobIdsRef.current.has(a.clientJobId))
+          );
 
         if (mappedServerAttempts.length > 0) {
           setExportAttempts((prev) => {
-            const existingServerIds = new Set(
-              prev.map((p) => p.serverJobId).filter((sid): sid is string => Boolean(sid))
-            );
             let next = [...prev];
             for (const srv of mappedServerAttempts) {
-              if (srv.serverJobId && existingServerIds.has(srv.serverJobId)) {
-                const match = next.find((p) => p.serverJobId === srv.serverJobId);
-                if (match && match.status !== "cancelled") {
-                  next = upsertExportAttemptSafely(next, {
-                    ...match,
-                    status: srv.status,
-                    message: srv.message,
-                    encoderUsed: srv.encoderUsed ?? match.encoderUsed,
-                    exportDurationMs: srv.exportDurationMs ?? match.exportDurationMs,
-                    outputSizeBytes: srv.outputSizeBytes ?? match.outputSizeBytes,
-                  });
-                }
-                continue;
-              }
               next = upsertExportAttemptSafely(next, srv);
             }
             next.sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
@@ -2147,6 +2135,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         if (isAuthenticated && MONGO_OBJECT_ID_RE.test(target.serverJobId)) {
           void deleteServerVideoJob(target.serverJobId);
         }
+      }
+      if (target?.clientJobId) {
+        deletedExportJobIdsRef.current.add(target.clientJobId);
       }
       deletedExportJobIdsRef.current.add(attemptId);
       void deleteExportFileBlob(attemptId);

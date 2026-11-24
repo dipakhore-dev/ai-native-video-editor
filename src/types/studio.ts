@@ -266,6 +266,7 @@ export interface RenderTimelinePayload {
 
 export interface ExportAttempt {
   id: string;
+  clientJobId?: string;
   serverJobId?: string;
   projectId: string;
   projectName: string;

@@ -1097,7 +1097,10 @@ export async function runSyncBinaryVideoOperation(params: {
         ? `${primary.originalName} (+${params.files.length - 1} more)`
         : primary.originalName,
     sourceSizeBytes: params.files.reduce((sum, f) => sum + f.sizeBytes, 0),
-    inputParams: params.fields ?? {},
+    inputParams: {
+      ...(params.fields ?? {}),
+      ...(params.clientJobId ? { client_job_id: params.clientJobId } : {}),
+    },
     startedAt: new Date(),
   });
 
@@ -1295,6 +1298,9 @@ export async function runSyncBinaryVideoOperation(params: {
       activeEntry.measurable = false;
       activeEntry.error = jobDoc.errorMessage;
       activeEntry.finishedAtMs = activeEntry.finishedAtMs ?? Date.now();
+    }
+    if (err && typeof err === "object") {
+      (err as { videoJobId?: string }).videoJobId = jobDoc._id.toString();
     }
     throw err;
   } finally {

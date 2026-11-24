@@ -477,9 +477,7 @@ class ProjectThumbnailCacheManager {
   set(projectId: string, fingerprint: string, url: string): void {
     if (!projectId || !fingerprint || !url) return;
     const approxBytes = url.startsWith("data:") ? url.length : 16_384;
-    this.cache.set(projectId, { fingerprint, url }, approxBytes, (evicted) => {
-      revokeIfBlobUrl(evicted.url);
-    });
+    this.cache.set(projectId, { fingerprint, url }, approxBytes);
   }
 
   invalidateProject(projectId: string): boolean {

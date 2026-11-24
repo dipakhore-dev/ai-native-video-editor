@@ -274,7 +274,15 @@ export function ExportsPage() {
                           {canRetry && (
                             <button
                               type="button"
-                              onClick={() => retryFailedExport(item)}
+                              onClick={() => {
+                                setDownloadError(null);
+                                const ok = retryFailedExport(item);
+                                if (!ok) {
+                                  setDownloadError(
+                                    `Cannot retry "${item.projectName}" because its project sequence is no longer in the workspace.`
+                                  );
+                                }
+                              }}
                               className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/20 transition-colors whitespace-nowrap"
                             >
                               <RotateCcw className="h-3.5 w-3.5" />

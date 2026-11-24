@@ -55,6 +55,10 @@ export async function createUserExportJob(
   });
 }
 
+const UPDATABLE_EXPORT_STATUSES: Array<
+  Exclude<IExportJob["status"], "completed">
+> = ["queued", "processing", "failed", "integration_required"];
+
 export async function updateUserExportJobStatus(
   userId: string,
   jobId: string,
@@ -64,8 +68,14 @@ export async function updateUserExportJobStatus(
     errorMessage?: string;
   }
 ): Promise<IExportJob | null> {
+  const filter: mongoose.QueryFilter<IExportJob> = {
+    _id: jobId,
+    userId,
+    status: { $in: UPDATABLE_EXPORT_STATUSES },
+  };
+
   return ExportJobModel.findOneAndUpdate(
-    { _id: jobId, userId, status: { $nin: ["completed", "cancelled"] } },
+    filter,
     { $set: updates },
     { new: true, runValidators: true }
   );

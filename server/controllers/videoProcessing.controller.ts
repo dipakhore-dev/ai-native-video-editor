@@ -70,7 +70,11 @@ function sendProcessorError(res: Response, err: unknown, fallbackMessage: string
   }
   const status = (err as { statusCode?: number }).statusCode || 500;
   const integrationPoint = (err as { integrationPoint?: string }).integrationPoint;
+  const videoJobId = (err as { videoJobId?: string }).videoJobId;
   const isCancelled = status === 499 || Boolean((err as { cancelled?: boolean })?.cancelled);
+  if (videoJobId) {
+    res.setHeader("X-Video-Job-Id", videoJobId);
+  }
   res.status(status).json({
     status: isCancelled
       ? "cancelled"
@@ -78,6 +82,7 @@ function sendProcessorError(res: Response, err: unknown, fallbackMessage: string
         ? "integration_required"
         : "error",
     ...(isCancelled ? { cancelled: true } : {}),
+    ...(videoJobId ? { jobId: videoJobId } : {}),
     ...(integrationPoint ? { integrationPoint } : {}),
     error: err instanceof Error ? err.message : fallbackMessage,
   });

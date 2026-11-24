@@ -18,6 +18,7 @@ export interface ApiResult<T> {
   error?: string;
   integrationPoint?: string;
   cancelled?: boolean;
+  jobId?: string;
 }
 
 async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiResult<T>> {
@@ -348,6 +349,7 @@ export function exportTimelineMp4(
           message?: string;
           integrationPoint?: string;
           cancelled?: boolean;
+          jobId?: string;
         } = {};
         if (responseBlob) {
           try {
@@ -357,6 +359,7 @@ export function exportTimelineMp4(
             // Non-JSON error body
           }
         }
+        const errJobId = xhr.getResponseHeader("x-video-job-id") || errBody.jobId || undefined;
         const isCancelled =
           xhr.status === 499 ||
           Boolean(errBody.cancelled) ||
@@ -365,6 +368,7 @@ export function exportTimelineMp4(
           ok: false,
           status: isCancelled ? 499 : xhr.status,
           cancelled: isCancelled,
+          jobId: errJobId,
           error:
             errBody.error ||
             errBody.message ||

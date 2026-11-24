@@ -507,6 +507,7 @@ export function ExportModal({
         });
         recordExportAttempt({
           id: clientJobId,
+          clientJobId,
           projectId: project.id,
           projectName: project.name,
           aspectRatio: project.aspectRatio,
@@ -684,6 +685,8 @@ export function ExportModal({
         setFeedback({ kind: "cancelled", message: cancelMsg });
         recordExportAttempt({
           id: clientJobId,
+          clientJobId,
+          serverJobId: res.jobId || undefined,
           projectId: project.id,
           projectName: project.name,
           aspectRatio: project.aspectRatio,
@@ -724,6 +727,7 @@ export function ExportModal({
         recordExportAttempt(
           {
             id: clientJobId,
+            clientJobId,
             serverJobId: res.data.jobId || undefined,
             projectId: project.id,
             projectName: project.name,
@@ -756,6 +760,8 @@ export function ExportModal({
         setFeedback({ kind: "auth", message: authMsg });
         recordExportAttempt({
           id: clientJobId,
+          clientJobId,
+          serverJobId: res.jobId || undefined,
           projectId: project.id,
           projectName: project.name,
           aspectRatio: project.aspectRatio,
@@ -785,6 +791,8 @@ export function ExportModal({
 
       recordExportAttempt({
         id: clientJobId,
+        clientJobId,
+        serverJobId: res.jobId || undefined,
         projectId: project.id,
         projectName: project.name,
         aspectRatio: project.aspectRatio,
@@ -824,6 +832,7 @@ export function ExportModal({
         setFeedback({ kind: "cancelled", message: cancelMsg });
         recordExportAttempt({
           id: clientJobId,
+          clientJobId,
           projectId: project.id,
           projectName: project.name,
           aspectRatio: project.aspectRatio,
@@ -848,6 +857,7 @@ export function ExportModal({
       setFeedback({ kind: "error", message: errMsg });
       recordExportAttempt({
         id: clientJobId,
+        clientJobId,
         projectId: project.id,
         projectName: project.name,
         aspectRatio: project.aspectRatio,

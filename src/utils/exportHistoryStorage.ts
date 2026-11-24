@@ -244,26 +244,63 @@ export function persistExportAttempts(attempts: ExportAttempt[]): void {
 }
 
 /**
- * Enforces terminal cancellation immutability when recording or merging export history.
+ * Enforces terminal cancellation immutability and deterministic deduplication
+ * across clientJobId and serverJobId when recording or merging export history.
  * A cancelled export attempt must never transition to completed/processing or auto-restart.
  */
 export function upsertExportAttemptSafely(
   prev: ExportAttempt[],
   incoming: ExportAttempt
 ): ExportAttempt[] {
-  const existingIdx = prev.findIndex((item) => item.id === incoming.id);
+  const incomingClientId =
+    incoming.clientJobId || (!incoming.id.startsWith("srv_") ? incoming.id : undefined);
+
+  const existingIdx = prev.findIndex((item) => {
+    if (item.id === incoming.id) return true;
+    if (incoming.serverJobId && item.serverJobId === incoming.serverJobId) return true;
+    if (incomingClientId && item.id === incomingClientId) return true;
+    if (item.clientJobId && item.clientJobId === incoming.id) return true;
+    if (incomingClientId && item.clientJobId && item.clientJobId === incomingClientId) return true;
+    return false;
+  });
+
   if (existingIdx === -1) {
     return [incoming, ...prev].slice(0, MAX_PERSISTED_EXPORT_ATTEMPTS);
   }
 
   const existing = prev[existingIdx];
+  // Preserve non-"srv_" local ID so cached IndexedDB MP4 blob lookup key stays intact
+  const preservedId = !existing.id.startsWith("srv_")
+    ? existing.id
+    : incoming.clientJobId || existing.id;
+
   if (existing.status === "cancelled" && incoming.status !== "cancelled") {
-    return prev;
+    const patched: ExportAttempt = {
+      ...existing,
+      id: preservedId,
+      serverJobId: incoming.serverJobId ?? existing.serverJobId,
+      clientJobId: incomingClientId ?? existing.clientJobId,
+    };
+    const next = [...prev];
+    next[existingIdx] = patched;
+    return next;
   }
 
   const updated: ExportAttempt = {
     ...existing,
     ...incoming,
+    id: preservedId,
+    serverJobId: incoming.serverJobId ?? existing.serverJobId,
+    clientJobId: incomingClientId ?? existing.clientJobId,
+    timelineSnapshotJson:
+      incoming.timelineSnapshotJson && incoming.timelineSnapshotJson.length > 2
+        ? incoming.timelineSnapshotJson
+        : existing.timelineSnapshotJson,
+    totalDuration: incoming.totalDuration > 0 ? incoming.totalDuration : existing.totalDuration,
+    exportDurationMs: incoming.exportDurationMs ?? existing.exportDurationMs,
+    encoderUsed: incoming.encoderUsed ?? existing.encoderUsed,
+    outputFilename: incoming.outputFilename ?? existing.outputFilename,
+    outputSizeBytes: incoming.outputSizeBytes ?? existing.outputSizeBytes,
     status: existing.status === "cancelled" ? "cancelled" : incoming.status,
   };
   const next = [...prev];
@@ -342,8 +379,16 @@ export function mapServerVideoJobToExportAttempt(job: ServerVideoJobDto): Export
       ? job.status
       : "failed";
 
+  const clientJobId =
+    typeof input.client_job_id === "string" && input.client_job_id.trim()
+      ? input.client_job_id.trim()
+      : typeof input.clientJobId === "string" && input.clientJobId.trim()
+        ? input.clientJobId.trim()
+        : undefined;
+
   return {
     id: `srv_${serverId}`,
+    ...(clientJobId ? { clientJobId } : {}),
     serverJobId: serverId,
     projectId: job.projectId ? String(job.projectId) : "",
     projectName,
