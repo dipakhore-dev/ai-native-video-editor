@@ -21,6 +21,7 @@ import {
   videoProcessorStatusController,
 } from "../controllers/videoProcessing.controller.ts";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth.middleware.ts";
+import { createRateLimiter } from "../middleware/rateLimit.middleware.ts";
 import { validateObjectId } from "../middleware/validate.middleware.ts";
 import {
   attachExportTempFiles,
@@ -29,8 +30,10 @@ import {
   isExportCancelled,
   registerActiveExport,
 } from "../services/videoProcessor.service.ts";
+import { validateUploadedMediaMagicBytesMiddleware } from "../utils/fileMagic.ts";
 
-const uploadTempDir = path.join(os.tmpdir(), "ai-studio-express-uploads");
+export const EXPRESS_UPLOAD_TEMP_DIR = path.join(os.tmpdir(), "ai-studio-express-uploads");
+const uploadTempDir = EXPRESS_UPLOAD_TEMP_DIR;
 fs.mkdirSync(uploadTempDir, { recursive: true });
 
 const ALLOWED_VIDEO_EXTENSIONS = new Set([
@@ -269,45 +272,87 @@ export function handleExportUploadMiddleware() {
 
 export const videoProcessingRouter = Router();
 
+const videoOperationRateLimiter = createRateLimiter({
+  name: "video-processing",
+  windowMs: 60_000,
+  maxRequests: () => getEnvConfig().rateLimitVideoMax,
+});
+
+const exportRateLimiter = createRateLimiter({
+  name: "video-export",
+  windowMs: 60_000,
+  maxRequests: () => getEnvConfig().rateLimitExportMax,
+  message: "Too many MP4 export attempts in a short window. Please wait a moment and try again.",
+});
+
+const validateVideoOnlyUpload = validateUploadedMediaMagicBytesMiddleware({
+  allowAudio: false,
+  allowImages: false,
+});
+
+const validateExportUpload = validateUploadedMediaMagicBytesMiddleware({
+  allowAudio: true,
+  allowImages: true,
+});
+
+const validateSubtitleUpload = validateUploadedMediaMagicBytesMiddleware({
+  allowAudio: true,
+  allowImages: false,
+});
+
 videoProcessingRouter.use(requireAuth);
 
 videoProcessingRouter.get("/status", videoProcessorStatusController);
 videoProcessingRouter.post(
   "/metadata",
+  videoOperationRateLimiter,
   handleUploadMiddleware("video", 1),
+  validateVideoOnlyUpload,
   extractVideoMetadataController
 );
 videoProcessingRouter.post(
   "/thumbnail",
+  videoOperationRateLimiter,
   handleUploadMiddleware("video", 1),
+  validateVideoOnlyUpload,
   thumbnailVideoController
 );
 videoProcessingRouter.post(
   "/trim",
+  videoOperationRateLimiter,
   handleUploadMiddleware("video", 1),
+  validateVideoOnlyUpload,
   trimVideoController
 );
 videoProcessingRouter.post(
   "/aspect-ratio",
+  videoOperationRateLimiter,
   handleUploadMiddleware("video", 1),
+  validateVideoOnlyUpload,
   aspectRatioVideoController
 );
 videoProcessingRouter.post(
   "/merge",
+  videoOperationRateLimiter,
   handleUploadMiddleware("videos", 8),
+  validateVideoOnlyUpload,
   mergeVideosController
 );
 videoProcessingRouter.post(
   "/export-mp4",
+  exportRateLimiter,
   preRegisterExportUploadMiddleware,
   handleExportUploadMiddleware(),
+  validateExportUpload,
   exportMp4VideoController
 );
 videoProcessingRouter.get("/export-progress/:jobId", getExportProgressController);
 videoProcessingRouter.post("/export-cancel/:jobId", cancelExportController);
 videoProcessingRouter.post(
   "/subtitles",
+  videoOperationRateLimiter,
   handleUploadMiddleware("video", 1),
+  validateSubtitleUpload,
   subtitlesVideoController
 );
 videoProcessingRouter.get("/jobs", listVideoJobsController);

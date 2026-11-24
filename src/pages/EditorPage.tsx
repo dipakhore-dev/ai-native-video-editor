@@ -64,6 +64,7 @@ export function EditorPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const relinkInputRef = useRef<HTMLInputElement | null>(null);
   const relinkTargetAssetIdRef = useRef<string | null>(null);
+  const saveFlashTimerRef = useRef<number | null>(null);
 
   const playbackClock = useMemo(() => new TimelinePlaybackClock(0), []);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -203,13 +204,27 @@ export function EditorPage() {
     setMasterMuted((m) => !m);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (saveFlashTimerRef.current !== null) {
+        window.clearTimeout(saveFlashTimerRef.current);
+      }
+    };
+  }, []);
+
   const triggerLocalSave = useCallback(() => {
     saveTimelineLocally();
     if (isAuthenticated) {
       void saveTimelineToMongo();
     }
     setSaveFlash(true);
-    setTimeout(() => setSaveFlash(false), 1800);
+    if (saveFlashTimerRef.current !== null) {
+      window.clearTimeout(saveFlashTimerRef.current);
+    }
+    saveFlashTimerRef.current = window.setTimeout(() => {
+      saveFlashTimerRef.current = null;
+      setSaveFlash(false);
+    }, 1800);
   }, [isAuthenticated, saveTimelineLocally, saveTimelineToMongo]);
 
   // Keyboard Shortcuts including Undo / Redo / Local Save

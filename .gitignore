@@ -6,3 +6,16 @@ coverage/
 *.log
 .env*
 !.env.example
+.venv/
+venv/
+video-processor/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+video-processor/.env
+video-processor/.env.*
+!video-processor/.env.example
+tmp/
+uploads/
+exports/
+server-uploads/

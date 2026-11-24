@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .ffprobe_service import check_binary, extract_video_metadata
+from .job_store import sanitize_error_text
 
 
 SUPPORTED_SUBTITLE_LANGUAGES: frozenset[str] = frozenset({
@@ -146,6 +147,8 @@ def extract_mono_wav_for_whisper(
         [
             ffmpeg_path,
             "-y",
+            "-protocol_whitelist",
+            "file,pipe",
             "-i",
             str(input_path),
             "-vn",
@@ -251,7 +254,7 @@ def transcribe_video_subtitles(
         raise
     except Exception as exc:
         raise SubtitleGenerationError(
-            f"Subtitle transcription failed: {exc}",
+            f"Subtitle transcription failed: {sanitize_error_text(str(exc), 'transcription error')}",
             status_code=422,
         ) from exc
 

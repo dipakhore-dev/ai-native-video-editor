@@ -7,34 +7,122 @@ export interface AppEnvConfig {
   jwtExpiresIn: string;
   authCookieName: string;
   clientOrigin: string;
+  corsAllowedOrigins: string[];
   geminiApiKey: string;
   videoProcessorUrl: string;
   videoProcessorApiKey: string;
   redisUrl: string;
   videoUploadMaxMb: number;
   videoGenProviderUrl: string;
+  maxConcurrentExports: number;
+  maxUserActiveExports: number;
+  maxExportQueueWaitMs: number;
+  exportTimeoutMs: number;
+  aiRequestTimeoutMs: number;
+  uploadTempMaxAgeMs: number;
+  rateLimitAuthMax: number;
+  rateLimitAiMax: number;
+  rateLimitVideoMax: number;
+  rateLimitExportMax: number;
 }
 
-export function getEnvConfig(): AppEnvConfig {
-  const nodeEnv = process.env.NODE_ENV || "development";
+function parseBoundedInt(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (raw === undefined || raw.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+export function normalizeOrigin(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "MY_APP_URL") {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function parseAllowedOriginsList(env: NodeJS.ProcessEnv): string[] {
+  const candidates: string[] = [];
+  if (env.CORS_ALLOWED_ORIGINS) {
+    candidates.push(...env.CORS_ALLOWED_ORIGINS.split(","));
+  }
+  if (env.APP_URL) {
+    candidates.push(env.APP_URL);
+  }
+  if (env.CLIENT_ORIGIN) {
+    candidates.push(env.CLIENT_ORIGIN);
+  }
+
+  const normalized = new Set<string>();
+  for (const item of candidates) {
+    const origin = normalizeOrigin(item);
+    if (origin) {
+      normalized.add(origin);
+    }
+  }
+  return Array.from(normalized);
+}
+
+export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig {
+  const nodeEnv = (env.NODE_ENV || "development").trim() || "development";
   return {
-    port: Number(process.env.PORT || 3000),
+    port: parseBoundedInt(env.PORT, 3000, 1, 65535),
     nodeEnv,
     isProd: nodeEnv === "production",
-    mongodbUri: (process.env.MONGODB_URI || "").trim(),
-    jwtSecret: (process.env.JWT_SECRET || "").trim(),
-    jwtExpiresIn: process.env.JWT_EXPIRES_IN || "7d",
-    authCookieName: process.env.AUTH_COOKIE_NAME || "ai_studio_token",
-    clientOrigin: process.env.CLIENT_ORIGIN || process.env.APP_URL || "http://localhost:3000",
-    geminiApiKey: (process.env.GEMINI_API_KEY || "").trim(),
-    videoProcessorUrl: (process.env.VIDEO_PROCESSOR_URL || "")
+    mongodbUri: (env.MONGODB_URI || "").trim(),
+    jwtSecret: (env.JWT_SECRET || "").trim(),
+    jwtExpiresIn: (env.JWT_EXPIRES_IN || "7d").trim() || "7d",
+    authCookieName: (env.AUTH_COOKIE_NAME || "ai_studio_token").trim() || "ai_studio_token",
+    clientOrigin: env.CLIENT_ORIGIN || env.APP_URL || "http://localhost:3000",
+    corsAllowedOrigins: parseAllowedOriginsList(env),
+    geminiApiKey: (env.GEMINI_API_KEY || "").trim(),
+    videoProcessorUrl: (env.VIDEO_PROCESSOR_URL || "")
       .trim()
       .replace(/\/+$/, ""),
-    videoProcessorApiKey: (process.env.VIDEO_PROCESSOR_API_KEY || "").trim(),
-    redisUrl: (process.env.REDIS_URL || "").trim(),
-    videoUploadMaxMb: Math.max(1, Number(process.env.VIDEO_UPLOAD_MAX_MB || 500)),
-    videoGenProviderUrl: (process.env.VIDEO_GEN_PROVIDER_URL || "").trim(),
+    videoProcessorApiKey: (env.VIDEO_PROCESSOR_API_KEY || "").trim(),
+    redisUrl: (env.REDIS_URL || "").trim(),
+    videoUploadMaxMb: parseBoundedInt(env.VIDEO_UPLOAD_MAX_MB, 500, 1, 4096),
+    videoGenProviderUrl: (env.VIDEO_GEN_PROVIDER_URL || "").trim(),
+    maxConcurrentExports: parseBoundedInt(env.MAX_CONCURRENT_EXPORTS, 2, 1, 16),
+    maxUserActiveExports: parseBoundedInt(env.MAX_USER_ACTIVE_EXPORTS, 1, 1, 8),
+    maxExportQueueWaitMs: parseBoundedInt(env.MAX_EXPORT_QUEUE_WAIT_MS, 5000, 0, 60_000),
+    exportTimeoutMs: parseBoundedInt(env.VIDEO_EXPORT_TIMEOUT_MS, 360_000, 30_000, 1_800_000),
+    aiRequestTimeoutMs: parseBoundedInt(env.AI_REQUEST_TIMEOUT_MS, 25_000, 3_000, 120_000),
+    uploadTempMaxAgeMs: parseBoundedInt(env.UPLOAD_TEMP_MAX_AGE_MS, 3_600_000, 60_000, 86_400_000),
+    rateLimitAuthMax: parseBoundedInt(env.RATE_LIMIT_AUTH_MAX, 25, 1, 500),
+    rateLimitAiMax: parseBoundedInt(env.RATE_LIMIT_AI_MAX, 20, 1, 500),
+    rateLimitVideoMax: parseBoundedInt(env.RATE_LIMIT_VIDEO_MAX, 40, 1, 1000),
+    rateLimitExportMax: parseBoundedInt(env.RATE_LIMIT_EXPORT_MAX, 10, 1, 200),
   };
+}
+
+export function getAllowedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const cfg = getEnvConfig(env);
+  const origins = new Set<string>(cfg.corsAllowedOrigins);
+  if (!cfg.isProd) {
+    origins.add(`http://localhost:${cfg.port}`);
+    origins.add(`http://127.0.0.1:${cfg.port}`);
+    origins.add("http://localhost:3000");
+    origins.add("http://127.0.0.1:3000");
+  }
+  return origins;
 }
 
 export function normalizeJwtExpiresIn(raw?: string): string | number {
@@ -66,24 +154,111 @@ export function getAuthCookieMaxAgeMs(): number {
   return amount * (multipliers[unit] ?? 24 * 60 * 60 * 1000);
 }
 
-export function isGeminiConfigured(): boolean {
-  const { geminiApiKey } = getEnvConfig();
+export function isGeminiConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  const { geminiApiKey } = getEnvConfig(env);
   return Boolean(geminiApiKey && geminiApiKey !== "MY_GEMINI_API_KEY");
 }
 
-export function isJwtConfigured(): boolean {
-  const { jwtSecret } = getEnvConfig();
-  return Boolean(jwtSecret && jwtSecret.length >= 16 && jwtSecret !== "REPLACE_WITH_SECURE_RANDOM_SECRET");
+export function isJwtConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  const { jwtSecret } = getEnvConfig(env);
+  return Boolean(
+    jwtSecret &&
+      jwtSecret.length >= 16 &&
+      jwtSecret !== "REPLACE_WITH_SECURE_RANDOM_SECRET"
+  );
 }
 
-export function isRedisConfigured(): boolean {
-  return Boolean(getEnvConfig().redisUrl);
+export function isRedisConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(getEnvConfig(env).redisUrl);
 }
 
-export function isVideoProcessorUrlConfigured(): boolean {
-  return Boolean(getEnvConfig().videoProcessorUrl);
+export function isVideoProcessorUrlConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(getEnvConfig(env).videoProcessorUrl);
 }
 
-export function isVideoGenProviderConfigured(): boolean {
-  return Boolean(getEnvConfig().videoGenProviderUrl);
+export function isVideoGenProviderConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(getEnvConfig(env).videoGenProviderUrl);
+}
+
+export interface StartupValidationResult {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export function validateStartupEnv(env: NodeJS.ProcessEnv = process.env): StartupValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const cfg = getEnvConfig(env);
+
+  if (env.PORT !== undefined && env.PORT.trim() !== "") {
+    const portNum = Number(env.PORT);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      errors.push("PORT must be an integer between 1 and 65535.");
+    }
+  }
+
+  if (env.VIDEO_UPLOAD_MAX_MB !== undefined && env.VIDEO_UPLOAD_MAX_MB.trim() !== "") {
+    const maxMb = Number(env.VIDEO_UPLOAD_MAX_MB);
+    if (!Number.isFinite(maxMb) || maxMb < 1 || maxMb > 4096) {
+      errors.push("VIDEO_UPLOAD_MAX_MB must be between 1 and 4096.");
+    }
+  }
+
+  if (cfg.videoProcessorUrl) {
+    try {
+      const parsed = new URL(cfg.videoProcessorUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        errors.push("VIDEO_PROCESSOR_URL must use http:// or https://.");
+      }
+    } catch {
+      errors.push("VIDEO_PROCESSOR_URL is not a valid URL.");
+    }
+  }
+
+  if (cfg.videoGenProviderUrl) {
+    try {
+      const parsed = new URL(cfg.videoGenProviderUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        errors.push("VIDEO_GEN_PROVIDER_URL must use http:// or https://.");
+      }
+    } catch {
+      errors.push("VIDEO_GEN_PROVIDER_URL is not a valid URL.");
+    }
+  }
+
+  if (cfg.isProd) {
+    if (!isJwtConfigured(env)) {
+      errors.push(
+        "Production startup blocked: JWT_SECRET must be set to a random secret of at least 16 characters."
+      );
+    }
+    if (cfg.videoProcessorUrl && cfg.videoProcessorApiKey.length < 16) {
+      errors.push(
+        "Production startup blocked: VIDEO_PROCESSOR_API_KEY (minimum 16 characters) is required when VIDEO_PROCESSOR_URL is configured."
+      );
+    }
+    if (cfg.corsAllowedOrigins.length === 0) {
+      warnings.push(
+        "No explicit CORS_ALLOWED_ORIGINS/APP_URL origin configured; cross-origin browser API requests will be rejected."
+      );
+    }
+  } else {
+    if (cfg.mongodbUri && !isJwtConfigured(env)) {
+      warnings.push(
+        "MONGODB_URI is set without a strong JWT_SECRET (>= 16 chars); authenticated routes will fail until JWT_SECRET is set."
+      );
+    }
+    if (cfg.videoProcessorUrl && !cfg.videoProcessorApiKey) {
+      warnings.push(
+        "VIDEO_PROCESSOR_API_KEY is empty in local development mode. Set a shared secret before deploying."
+      );
+    }
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+  };
 }

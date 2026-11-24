@@ -1,5 +1,6 @@
 import type { CookieOptions, NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { getAuthCookieMaxAgeMs, getEnvConfig, isJwtConfigured } from "../config/env.ts";
 import { isDatabaseConnected } from "../config/database.ts";
 import { UserModel, type IUser } from "../models/User.ts";
@@ -71,7 +72,13 @@ export async function requireAuth(
   }
 
   try {
-    const decoded = jwt.verify(token, jwtSecret) as JwtPayload;
+    const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] }) as JwtPayload;
+    if (!decoded?.sub || typeof decoded.sub !== "string" || !mongoose.Types.ObjectId.isValid(decoded.sub)) {
+      clearAuthCookie(res, req);
+      res.status(401).json({ error: "Invalid authentication session." });
+      return;
+    }
+
     const user = await UserModel.findById(decoded.sub);
     if (!user) {
       clearAuthCookie(res, req);
@@ -106,11 +113,13 @@ export async function optionalAuth(
   }
 
   try {
-    const decoded = jwt.verify(token, jwtSecret) as JwtPayload;
-    const user = await UserModel.findById(decoded.sub);
-    if (user) {
-      req.user = user;
-      req.userId = user._id.toString();
+    const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] }) as JwtPayload;
+    if (decoded?.sub && typeof decoded.sub === "string" && mongoose.Types.ObjectId.isValid(decoded.sub)) {
+      const user = await UserModel.findById(decoded.sub);
+      if (user) {
+        req.user = user;
+        req.userId = user._id.toString();
+      }
     }
   } catch {
     // Ignore invalid optional cookie

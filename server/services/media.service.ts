@@ -4,13 +4,18 @@ import { ProjectModel } from "../models/Project.ts";
 
 export async function listUserMediaAssets(
   userId: string,
-  projectId?: string
+  projectId?: string,
+  limit = 100
 ): Promise<IMediaAsset[]> {
   const filter: Record<string, unknown> = { userId };
-  if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
-    filter.projectId = projectId;
+  if (projectId !== undefined && projectId.trim() !== "") {
+    if (!mongoose.Types.ObjectId.isValid(projectId.trim())) {
+      throw Object.assign(new Error("Invalid projectId filter."), { statusCode: 400 });
+    }
+    filter.projectId = projectId.trim();
   }
-  return MediaAssetModel.find(filter).sort({ createdAt: -1 });
+  const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
+  return MediaAssetModel.find(filter).sort({ createdAt: -1 }).limit(safeLimit);
 }
 
 export async function getUserMediaAssetById(

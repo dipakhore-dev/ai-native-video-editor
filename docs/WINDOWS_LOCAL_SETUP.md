@@ -166,3 +166,15 @@ python -m unittest discover -s video-processor/tests -t video-processor -v
 - **Multilingual Model**: Bengali (`bn`) requires a multilingual `faster-whisper` model (`small`, `medium`, or `base`—never `*.en`). The default `WHISPER_MODEL_SIZE="small"` runs on CPU (`int8`) at ₹0 cost.
 - **Built-in Windows Font (`Nirmala UI`)**: Windows 10 and Windows 11 include **Nirmala UI** (`C:\Windows\Fonts\Nirmala.ttf`), which supports Bengali Unicode (`বাংলা`) glyphs. When Bengali text is present during MP4 subtitle burn-in, the Python processor automatically selects `Nirmala UI` (or `Noto Sans Bengali` if installed) instead of `Arial`.
 - **Optional `Noto Sans Bengali` Font on Windows**: If you prefer Google's **Noto Sans Bengali** for both MP4 burn-in and local preview fallback, download the free TTF from Google Fonts (`Noto Sans Bengali`), right-click `NotoSansBengali-Regular.ttf` -> **Install for all users** (or copy it to `C:\Windows\Fonts`), or override via `SUBTITLE_BENGALI_FONT` in `video-processor\.env`.
+
+---
+
+## Deploying to Production (Linux / Docker / Reverse Proxy)
+
+When promoting from local Windows development to production (`NODE_ENV=production` / `APP_ENV=production`):
+
+1. **Secrets & Origins**: Set a 32+ character `JWT_SECRET`, a 16+ character `VIDEO_PROCESSOR_API_KEY` shared identically between `.env` and `video-processor/.env`, and explicit `APP_URL` / `CORS_ALLOWED_ORIGINS`.
+2. **HTTPS & Timeouts**: Terminate TLS at Nginx/Caddy/Load Balancer, enable `TRUST_PROXY=true`, set `proxy_read_timeout 360s`, and set `client_max_body_size 512m`.
+3. **Health Checks**: Use `GET /api/health/live` for liveness and `GET /api/health/ready` for readiness (fails `503` during graceful shutdown or MongoDB disconnect).
+4. **Backups**: Enable MongoDB Atlas automated backups (or scheduled `mongodump`) — local browser IndexedDB media remains on each user's device, while MongoDB stores accounts, project timelines, and export job records.
+

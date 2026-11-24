@@ -41,10 +41,16 @@ export async function listAiRequestsController(
   try {
     const projectId =
       typeof req.query.projectId === "string" ? req.query.projectId : undefined;
-    const requests = await listUserAiRequests(req.userId!, projectId);
+    const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+    const requests = await listUserAiRequests(
+      req.userId!,
+      projectId,
+      Number.isFinite(rawLimit) ? rawLimit : 50
+    );
     res.json({ status: "ok", requests });
   } catch (err) {
-    res.status(500).json({
+    const status = (err as { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
       error: err instanceof Error ? err.message : "Failed to load AI request history.",
     });
   }

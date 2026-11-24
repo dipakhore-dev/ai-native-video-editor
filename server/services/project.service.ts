@@ -1,7 +1,8 @@
 import { ProjectModel, type IProject } from "../models/Project.ts";
 
-export async function listUserProjects(userId: string): Promise<IProject[]> {
-  return ProjectModel.find({ userId }).sort({ updatedAt: -1 });
+export async function listUserProjects(userId: string, limit = 100): Promise<IProject[]> {
+  const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
+  return ProjectModel.find({ userId }).sort({ updatedAt: -1 }).limit(safeLimit);
 }
 
 export async function getUserProjectById(

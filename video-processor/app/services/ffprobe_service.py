@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
+from .job_store import sanitize_error_text
+
 
 class VideoMetadataError(Exception):
     """Raised when ffprobe validation or extraction fails."""
@@ -118,6 +120,8 @@ def extract_video_metadata(
         resolved_ffprobe,
         "-v",
         "quiet",
+        "-protocol_whitelist",
+        "file,pipe",
         "-print_format",
         "json",
         "-show_format",
@@ -139,10 +143,13 @@ def extract_video_metadata(
             status_code=504,
         ) from exc
     except OSError as exc:
-        raise VideoMetadataError(f"Failed to execute ffprobe: {exc}", status_code=500) from exc
+        raise VideoMetadataError(
+            f"Failed to execute ffprobe: {sanitize_error_text(str(exc), 'execution failed')}",
+            status_code=500,
+        ) from exc
 
     if proc.returncode != 0:
-        err_detail = (proc.stderr or "").strip()
+        err_detail = sanitize_error_text(proc.stderr or "", "")
         raise VideoMetadataError(
             f"File is not a valid or readable media container{': ' + err_detail if err_detail else '.'}",
             status_code=422,
@@ -252,6 +259,8 @@ def extract_audio_metadata(
         resolved_ffprobe,
         "-v",
         "quiet",
+        "-protocol_whitelist",
+        "file,pipe",
         "-print_format",
         "json",
         "-show_format",
@@ -273,10 +282,13 @@ def extract_audio_metadata(
             status_code=504,
         ) from exc
     except OSError as exc:
-        raise VideoMetadataError(f"Failed to execute ffprobe: {exc}", status_code=500) from exc
+        raise VideoMetadataError(
+            f"Failed to execute ffprobe: {sanitize_error_text(str(exc), 'execution failed')}",
+            status_code=500,
+        ) from exc
 
     if proc.returncode != 0:
-        err_detail = (proc.stderr or "").strip()
+        err_detail = sanitize_error_text(proc.stderr or "", "")
         raise VideoMetadataError(
             f"Audio file is not valid or readable{': ' + err_detail if err_detail else '.'}",
             status_code=422,

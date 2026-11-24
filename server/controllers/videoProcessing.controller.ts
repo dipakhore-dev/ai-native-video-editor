@@ -2,6 +2,7 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import type { Response } from "express";
 import type { AuthenticatedRequest } from "../middleware/auth.middleware.ts";
+import { sanitizeErrorMessage, sanitizeFilenameForDisposition } from "../middleware/security.middleware.ts";
 import { getVideoQueueStatus } from "../queues/videoQueue.ts";
 import {
   cancelActiveExport,
@@ -84,7 +85,7 @@ function sendProcessorError(res: Response, err: unknown, fallbackMessage: string
     ...(isCancelled ? { cancelled: true } : {}),
     ...(videoJobId ? { jobId: videoJobId } : {}),
     ...(integrationPoint ? { integrationPoint } : {}),
-    error: err instanceof Error ? err.message : fallbackMessage,
+    error: err instanceof Error ? sanitizeErrorMessage(err.message, fallbackMessage) : fallbackMessage,
   });
 }
 
@@ -101,7 +102,7 @@ export async function videoProcessorStatusController(
   const statusMessage = !processor.configured
     ? "Python FastAPI service URL (VIDEO_PROCESSOR_URL) is not configured. Start video-processor locally on Windows (see docs/WINDOWS_LOCAL_SETUP.md) and set VIDEO_PROCESSOR_URL in .env."
     : !processor.reachable
-      ? `Python FastAPI service at ${processor.url} is unreachable. Start uvicorn locally or verify the service URL.`
+      ? "Python FastAPI service is currently unreachable. Start uvicorn locally or verify VIDEO_PROCESSOR_URL on the server."
       : !processorReady
         ? "Python FastAPI service is reachable, but FFmpeg/FFprobe binaries were not detected on its PATH."
         : "Python FastAPI service is connected and ready for synchronous video processing.";
@@ -229,7 +230,10 @@ export async function thumbnailVideoController(
     });
 
     res.setHeader("Content-Type", result.contentType);
-    res.setHeader("Content-Disposition", `inline; filename="${result.filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${sanitizeFilenameForDisposition(result.filename, "thumbnail.jpg")}"`
+    );
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.send(result.buffer);
   } catch (err) {
@@ -277,7 +281,10 @@ export async function trimVideoController(
     });
 
     res.setHeader("Content-Type", result.contentType);
-    res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilenameForDisposition(result.filename, "trimmed.mp4")}"`
+    );
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.send(result.buffer);
   } catch (err) {
@@ -336,7 +343,10 @@ export async function aspectRatioVideoController(
     });
 
     res.setHeader("Content-Type", result.contentType);
-    res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilenameForDisposition(result.filename, "formatted.mp4")}"`
+    );
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.send(result.buffer);
   } catch (err) {
@@ -386,7 +396,10 @@ export async function mergeVideosController(
     });
 
     res.setHeader("Content-Type", result.contentType);
-    res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilenameForDisposition(result.filename, "merged_output.mp4")}"`
+    );
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.send(result.buffer);
   } catch (err) {
@@ -1021,7 +1034,10 @@ export async function exportMp4VideoController(
     }
 
     res.setHeader("Content-Type", result.contentType);
-    res.setHeader("Content-Disposition", `attachment; filename="${result.filename}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilenameForDisposition(result.filename, "export.mp4")}"`
+    );
     res.setHeader("X-Video-Job-Id", result.job._id.toString());
     res.setHeader("X-Export-Client-Job-Id", clientJobId);
     if (result.exportProfile) {
@@ -1146,10 +1162,17 @@ export async function listVideoJobsController(
     const operation = VALID_VIDEO_OPERATIONS.has(rawOp as VideoOperationType)
       ? (rawOp as VideoOperationType)
       : undefined;
-    const jobs = await listUserVideoJobs(req.userId!, projectId, operation);
+    const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+    const jobs = await listUserVideoJobs(
+      req.userId!,
+      projectId,
+      operation,
+      Number.isFinite(rawLimit) ? rawLimit : 50
+    );
     res.json({ status: "ok", jobs });
   } catch (err) {
-    res.status(500).json({
+    const status = (err as { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
       error: err instanceof Error ? err.message : "Failed to list video processing jobs.",
     });
   }

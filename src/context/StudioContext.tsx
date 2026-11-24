@@ -12,6 +12,7 @@ import {
   fetchServerProjects,
   fetchServerVideoJobs,
   mapServerProjectToStudioProject,
+  registerSessionExpiredHandler,
   saveServerProjectSubtitles,
   saveServerProjectTimeline,
   submitAuthLogout,
@@ -207,6 +208,12 @@ interface StudioContextValue {
   redo: () => void;
   lastLocalSaveAt: string | null;
   saveTimelineLocally: () => void;
+  hasUnsavedChanges: boolean;
+  lastSaveError: string | null;
+  sessionNotice: string | null;
+  dismissSessionNotice: () => void;
+  exportInProgress: boolean;
+  setExportInProgress: (active: boolean) => void;
   mongoSaveStatus: "idle" | "saving" | "saved" | "error";
   lastMongoSaveAt: string | null;
   mongoSaveError: string | null;
@@ -310,6 +317,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const [undoStack, setUndoStack] = useState<Project[]>([]);
   const [redoStack, setRedoStack] = useState<Project[]>([]);
   const [lastLocalSaveAt, setLastLocalSaveAt] = useState<string | null>(initialSaved.savedAt);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [lastSaveError, setLastSaveError] = useState<string | null>(null);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
+  const [exportInProgress, setExportInProgress] = useState(false);
   const [mongoSaveStatus, setMongoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [lastMongoSaveAt, setLastMongoSaveAt] = useState<string | null>(null);
   const [mongoSaveError, setMongoSaveError] = useState<string | null>(null);
@@ -367,6 +378,34 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   });
 
   const isAuthenticated = sessionUser.mode === "authenticated";
+  const sessionUserModeRef = useRef<SessionUser["mode"]>(sessionUser.mode);
+
+  useEffect(() => {
+    sessionUserModeRef.current = sessionUser.mode;
+  }, [sessionUser.mode]);
+
+  useEffect(() => {
+    registerSessionExpiredHandler(() => {
+      if (sessionUserModeRef.current === "authenticated") {
+        serverMediaIdByClientIdRef.current.clear();
+        setSessionUser((prev) => ({ ...prev, mode: "local_session" }));
+        setSessionNotice(
+          "Your sign-in session expired. Local timeline edits are kept in browser storage; sign in again to resume MongoDB sync."
+        );
+      }
+    });
+    return () => registerSessionExpiredHandler(null);
+  }, []);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges && !exportInProgress) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [exportInProgress, hasUnsavedChanges]);
 
   const setActiveProjectId = useCallback((id: string | null) => {
     setActiveProjectIdState(id);
@@ -400,6 +439,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         user = meRes.data.user;
       }
 
+      setSessionNotice(null);
       setSessionUser({
         id: user.id,
         displayName: user.fullName,
@@ -504,6 +544,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const logoutSession = useCallback(async () => {
     await submitAuthLogout();
     serverMediaIdByClientIdRef.current.clear();
+    setSessionNotice(null);
     setSessionUser({
       displayName: "Elena Vance",
       email: "editor@local.session",
@@ -630,7 +671,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [mediaAssets]
   );
 
-  const persistProjectsToLocalStorage = useCallback((list: Project[]) => {
+  const persistProjectsToLocalStorage = useCallback((list: Project[]): boolean => {
     try {
       const savedAt = new Date().toISOString();
       const serializableProjects = list.map((p) => ({
@@ -652,14 +693,23 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         })
       );
       setLastLocalSaveAt(savedAt);
+      setLastSaveError(null);
+      return true;
     } catch {
-      setMediaError("Could not save timeline to browser localStorage (storage quota may be full).");
+      const quotaErr =
+        "Could not save timeline to browser localStorage (storage quota may be full).";
+      setMediaError(quotaErr);
+      setLastSaveError(quotaErr);
+      return false;
     }
   }, []);
 
   const saveTimelineLocally = useCallback(() => {
-    persistProjectsToLocalStorage(projects);
-  }, [persistProjectsToLocalStorage, projects]);
+    const ok = persistProjectsToLocalStorage(projects);
+    if (ok && !isAuthenticated) {
+      setHasUnsavedChanges(false);
+    }
+  }, [isAuthenticated, persistProjectsToLocalStorage, projects]);
 
   const createProject = useCallback(
     (input: CreateProjectInput, openInEditor = true): Project => {
@@ -1228,6 +1278,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const mutateActiveProject = useCallback(
     (updater: (project: Project) => Project, recordHistory = true) => {
+      setHasUnsavedChanges(true);
       setProjects((prev) => {
         if (!activeProjectId) return prev;
         const current = prev.find((p) => p.id === activeProjectId);
@@ -1251,6 +1302,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   );
 
   const commitProjectSnapshot = useCallback((beforeSnapshot: Project) => {
+    setHasUnsavedChanges(true);
     setUndoStack((stack) => [
       ...stack.slice(-(MAX_HISTORY_ENTRIES - 1)),
       cloneProject(beforeSnapshot),
@@ -1260,6 +1312,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const undo = useCallback(() => {
     if (!activeProjectId || undoStack.length === 0) return;
+    setHasUnsavedChanges(true);
     const previous = undoStack[undoStack.length - 1];
     setUndoStack((stack) => stack.slice(0, -1));
     const assetsById = new Map(mediaAssetsRef.current.map((a) => [a.id, a]));
@@ -1279,6 +1332,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const redo = useCallback(() => {
     if (!activeProjectId || redoStack.length === 0) return;
+    setHasUnsavedChanges(true);
     const next = redoStack[redoStack.length - 1];
     setRedoStack((stack) => stack.slice(0, -1));
     const assetsById = new Map(mediaAssetsRef.current.map((a) => [a.id, a]));
@@ -1299,6 +1353,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   const addClipToTimeline = useCallback(
     (asset: MediaAsset, preferredTrackId?: string, explicitStartTime?: number): TimelineClip | null => {
       let createdClip: TimelineClip | null = null;
+      setHasUnsavedChanges(true);
 
       setProjects((prev) => {
         let targetId = activeProjectId;
@@ -2034,19 +2089,24 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         const res = await saveServerProjectTimeline(targetProject.id, targetProject);
         if (res.ok) {
           const savedAt = new Date().toISOString();
+          persistProjectsToLocalStorage(projectsRef.current);
           setMongoSaveStatus("saved");
           setLastMongoSaveAt(savedAt);
+          setHasUnsavedChanges(false);
+          setLastSaveError(null);
           return { ok: true, projectId: targetProject.id };
         }
         if (res.status !== 404) {
           const errMsg = res.error || "Failed to save timeline to MongoDB.";
           setMongoSaveStatus("error");
           setMongoSaveError(errMsg);
+          setLastSaveError(errMsg);
           return { ok: false, error: errMsg };
         }
         // Prevent autosave from resurrecting a deleted Mongo-backed project on 404
         const errMsg = "Project no longer exists on server.";
         setMongoSaveStatus("idle");
+        setLastSaveError(errMsg);
         return { ok: false, error: errMsg };
       }
 
@@ -2063,6 +2123,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         const errMsg = createdRes.error || "Failed to create project in MongoDB.";
         setMongoSaveStatus("error");
         setMongoSaveError(errMsg);
+        setLastSaveError(errMsg);
         return { ok: false, error: errMsg };
       }
 
@@ -2071,6 +2132,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         const errMsg = "Server returned a project without an ID.";
         setMongoSaveStatus("error");
         setMongoSaveError(errMsg);
+        setLastSaveError(errMsg);
         return { ok: false, error: errMsg };
       }
 
@@ -2092,6 +2154,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       const savedAt = new Date().toISOString();
       setMongoSaveStatus("saved");
       setLastMongoSaveAt(savedAt);
+      setHasUnsavedChanges(false);
+      setLastSaveError(null);
       return { ok: true, projectId: mongoId };
     },
     [activeProject, activeProjectId, isAuthenticated, persistProjectsToLocalStorage]
@@ -2186,6 +2250,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     setSessionUser((prev) => ({ ...prev, ...patch }));
   }, []);
 
+  const dismissSessionNotice = useCallback(() => setSessionNotice(null), []);
   const clearMediaError = useCallback(() => setMediaError(null), []);
   const canUndo = undoStack.length > 0;
   const canRedo = redoStack.length > 0;
@@ -2246,6 +2311,12 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       redo,
       lastLocalSaveAt,
       saveTimelineLocally,
+      hasUnsavedChanges,
+      lastSaveError,
+      sessionNotice,
+      dismissSessionNotice,
+      exportInProgress,
+      setExportInProgress,
       mongoSaveStatus,
       lastMongoSaveAt,
       mongoSaveError,
@@ -2322,6 +2393,11 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       redo,
       lastLocalSaveAt,
       saveTimelineLocally,
+      hasUnsavedChanges,
+      lastSaveError,
+      sessionNotice,
+      dismissSessionNotice,
+      exportInProgress,
       mongoSaveStatus,
       lastMongoSaveAt,
       mongoSaveError,

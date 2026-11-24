@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Literal, Optional, Sequence
 
 from .ffprobe_service import check_binary, extract_audio_metadata, extract_video_metadata
-from .job_store import terminate_subprocess_tree
+from .job_store import sanitize_error_text, terminate_subprocess_tree
 
 logger = logging.getLogger("video_processor.ffmpeg")
 
@@ -416,6 +417,26 @@ def _format_ffmpeg_failure(stderr_lines: Sequence[str]) -> str:
     return tail
 
 
+def inject_protocol_whitelist(cmd: list[str]) -> list[str]:
+    """Ensure every FFmpeg -i input uses -protocol_whitelist file,pipe to prevent remote fetches."""
+    if not cmd:
+        return []
+    result: list[str] = [cmd[0]]
+    idx = 1
+    while idx < len(cmd):
+        token = str(cmd[idx])
+        if token == "-protocol_whitelist" and idx + 1 < len(cmd):
+            idx += 2
+            continue
+        if token == "-i":
+            result.extend(["-protocol_whitelist", "file,pipe", "-i"])
+            idx += 1
+            continue
+        result.append(token)
+        idx += 1
+    return result
+
+
 def _run_ffmpeg_with_progress(
     cmd: list[str],
     timeout_sec: int,
@@ -429,10 +450,11 @@ def _run_ffmpeg_with_progress(
     if cancel_event is not None and cancel_event.is_set():
         raise VideoProcessingCancelledError()
 
-    if len(cmd) >= 2:
-        progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    safe_cmd = inject_protocol_whitelist(cmd)
+    if len(safe_cmd) >= 2:
+        progress_cmd = [safe_cmd[0], "-progress", "pipe:1", "-nostats", *safe_cmd[1:]]
     else:
-        progress_cmd = list(cmd)
+        progress_cmd = list(safe_cmd)
 
     formatted_cmd = " ".join(shlex.quote(str(arg)) for arg in progress_cmd)
     logger.debug("Executing FFmpeg command (cwd=%s): %s", cwd, formatted_cmd)
@@ -458,7 +480,10 @@ def _run_ffmpeg_with_progress(
         )
     except OSError as exc:
         logger.error("Failed to spawn FFmpeg (%s): %s", formatted_cmd, exc)
-        raise VideoProcessingError(f"Failed to execute ffmpeg: {exc}", status_code=500) from exc
+        raise VideoProcessingError(
+            f"Failed to execute ffmpeg: {sanitize_error_text(str(exc), 'execution failed')}",
+            status_code=500,
+        ) from exc
 
     if process_cb is not None:
         process_cb(proc)
@@ -580,7 +605,7 @@ def _run_ffmpeg_with_progress(
             formatted_cmd,
             recent_stderr,
         )
-        summary = _format_ffmpeg_failure(stderr_lines)
+        summary = sanitize_error_text(_format_ffmpeg_failure(stderr_lines), "FFmpeg processing error")
         raise VideoProcessingError(f"FFmpeg processing failed: {summary}", status_code=422)
 
 
@@ -3433,7 +3458,8 @@ def _detect_bengali_font_name() -> str:
 def _resolve_ass_font_name(items: Sequence[dict], style: dict) -> str:
     explicit = str(style.get("fontFamily", "") or "").strip()
     if explicit:
-        cleaned = explicit.replace(",", " ").replace("\n", " ").replace("\r", " ").strip()
+        cleaned = re.sub(r"[^A-Za-z0-9 _-]", " ", explicit)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()[:64]
         if cleaned:
             return cleaned
     if _contains_bengali_unicode(items):

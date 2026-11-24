@@ -21,18 +21,37 @@ export interface ApiResult<T> {
   jobId?: string;
 }
 
+let sessionExpiredHandler: (() => void) | null = null;
+
+export function registerSessionExpiredHandler(handler: (() => void) | null): void {
+  sessionExpiredHandler = handler;
+}
+
+function shouldTriggerSessionExpired(url: string, status: number): boolean {
+  if (status !== 401) return false;
+  return (
+    !url.startsWith("/api/auth/me") &&
+    !url.startsWith("/api/auth/login") &&
+    !url.startsWith("/api/auth/register")
+  );
+}
+
 async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiResult<T>> {
   try {
     const res = await fetch(url, {
       credentials: "include",
+      ...options,
       headers: {
         "Content-Type": "application/json",
+        "X-Requested-With": "AIStudioClient",
         ...(options?.headers ?? {}),
       },
-      ...options,
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (shouldTriggerSessionExpired(url, res.status)) {
+        sessionExpiredHandler?.();
+      }
       return {
         ok: false,
         status: res.status,
@@ -261,6 +280,7 @@ export function exportTimelineMp4(
     xhr.open("POST", "/api/video/export-mp4");
     xhr.withCredentials = true;
     xhr.responseType = "blob";
+    xhr.setRequestHeader("X-Requested-With", "AIStudioClient");
     if (options?.clientJobId) {
       xhr.setRequestHeader("X-Export-Job-Id", options.clientJobId);
     }
@@ -364,6 +384,9 @@ export function exportTimelineMp4(
           xhr.status === 499 ||
           Boolean(errBody.cancelled) ||
           Boolean(options?.signal?.aborted);
+        if (xhr.status === 401) {
+          sessionExpiredHandler?.();
+        }
         finish({
           ok: false,
           status: isCancelled ? 499 : xhr.status,
@@ -466,6 +489,9 @@ export async function generateVideoSubtitles(
     const res = await fetch("/api/video/subtitles", {
       method: "POST",
       credentials: "include",
+      headers: {
+        "X-Requested-With": "AIStudioClient",
+      },
       body: formData,
     });
     const body = (await res.json().catch(() => ({}))) as Partial<GeneratedSubtitlesResponse> & {
@@ -474,6 +500,9 @@ export async function generateVideoSubtitles(
       integrationPoint?: string;
     };
     if (!res.ok || !Array.isArray(body.segments)) {
+      if (res.status === 401) {
+        sessionExpiredHandler?.();
+      }
       return {
         ok: false,
         status: res.status,

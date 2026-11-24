@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { X, Film, LayoutTemplate } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import type {
@@ -28,8 +28,27 @@ export function CreateProjectModal() {
   const [fps, setFps] = useState<24 | 30 | 60>(sessionUser.defaultFps);
   const [error, setError] = useState<string | null>(null);
 
-  if (!createProjectModalOpen) return null;
+  const resetAndClose = useCallback(() => {
+    setMode("blank");
+    setName("");
+    setDescription("");
+    setError(null);
+    setCreateProjectModalOpen(false);
+  }, [setCreateProjectModalOpen]);
 
+  useEffect(() => {
+    if (!createProjectModalOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        resetAndClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [createProjectModalOpen, resetAndClose]);
+
+  if (!createProjectModalOpen) return null;
   const selectedTemplate =
     mode !== "blank" ? PROJECT_TEMPLATES.find((t) => t.id === mode) ?? null : null;
 
@@ -45,15 +64,6 @@ export function CreateProjectModal() {
       }
     }
   };
-
-  const resetAndClose = () => {
-    setMode("blank");
-    setName("");
-    setDescription("");
-    setError(null);
-    setCreateProjectModalOpen(false);
-  };
-
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedTemplate) {

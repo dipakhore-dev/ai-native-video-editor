@@ -1,9 +1,12 @@
 import fs from "fs/promises";
 import type { FileHandle } from "fs/promises";
+import path from "path";
 import crypto from "crypto";
 import { PassThrough, Readable } from "stream";
 import mongoose from "mongoose";
 import { getEnvConfig } from "../config/env.ts";
+import { isDatabaseConnected } from "../config/database.ts";
+import { sanitizeErrorMessage, sanitizeFilenameForDisposition } from "../middleware/security.middleware.ts";
 import { MediaAssetModel } from "../models/MediaAsset.ts";
 import { ProjectModel } from "../models/Project.ts";
 import { VideoJobModel, type IVideoJob, type VideoOperationType } from "../models/VideoJob.ts";
@@ -107,6 +110,181 @@ interface ActiveExportEntry extends ExportProgressSnapshot {
 
 const activeExportRegistry = new Map<string, ActiveExportEntry>();
 const preCancelledExports = new Map<string, { userId: string; expiresAtMs: number }>();
+
+const activeExportSlots = new Map<string, string>(); // slotToken -> userId
+const exportSlotWaiters: Array<() => void> = [];
+let shuttingDown = false;
+
+export function isVideoServerShuttingDown(): boolean {
+  return shuttingDown;
+}
+
+export function setVideoServerShuttingDown(value: boolean): void {
+  shuttingDown = value;
+  if (value) {
+    notifyExportSlotWaiters();
+  }
+}
+
+function notifyExportSlotWaiters(): void {
+  while (exportSlotWaiters.length > 0) {
+    const wake = exportSlotWaiters.shift();
+    if (wake) wake();
+  }
+}
+
+function countUserActiveExportSlots(userId: string): number {
+  let count = 0;
+  for (const owner of activeExportSlots.values()) {
+    if (owner === userId) count += 1;
+  }
+  return count;
+}
+
+export function getActiveExportSlotStats(): { total: number } {
+  return { total: activeExportSlots.size };
+}
+
+export async function acquireExportSlot(
+  userId: string,
+  signal?: AbortSignal
+): Promise<string> {
+  if (shuttingDown) {
+    throw Object.assign(
+      new Error("Server is shutting down. New exports are temporarily unavailable."),
+      { statusCode: 503 }
+    );
+  }
+
+  const { maxConcurrentExports, maxUserActiveExports, maxExportQueueWaitMs } = getEnvConfig();
+  const deadlineMs = Date.now() + maxExportQueueWaitMs;
+
+  while (true) {
+    if (shuttingDown) {
+      throw Object.assign(
+        new Error("Server is shutting down. Export aborted."),
+        { statusCode: 503 }
+      );
+    }
+    if (signal?.aborted) {
+      throw Object.assign(new Error("Export cancelled by user."), {
+        statusCode: 499,
+        cancelled: true,
+      });
+    }
+
+    const userCount = countUserActiveExportSlots(userId);
+    if (userCount < maxUserActiveExports && activeExportSlots.size < maxConcurrentExports) {
+      const slotToken = crypto.randomUUID();
+      activeExportSlots.set(slotToken, userId);
+      return slotToken;
+    }
+
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      throw Object.assign(
+        new Error(
+          userCount >= maxUserActiveExports
+            ? "You already have an active MP4 export running. Wait for it to finish or cancel it first."
+            : "Export workers are currently at full capacity. Please retry in a few seconds."
+        ),
+        { statusCode: 429 }
+      );
+    }
+
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        const idx = exportSlotWaiters.indexOf(done);
+        if (idx >= 0) exportSlotWaiters.splice(idx, 1);
+        resolve();
+      };
+      const timer = setTimeout(done, Math.min(remainingMs, 500));
+      exportSlotWaiters.push(done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+}
+
+export function releaseExportSlot(slotToken: string | null | undefined): void {
+  if (!slotToken) return;
+  if (activeExportSlots.delete(slotToken)) {
+    notifyExportSlotWaiters();
+  }
+}
+
+export async function shutdownVideoExports(): Promise<void> {
+  setVideoServerShuttingDown(true);
+  const activeEntries = Array.from(activeExportRegistry.values()).filter(
+    (entry) => entry.status === "processing" || entry.status === "queued"
+  );
+  await Promise.allSettled(
+    activeEntries.map((entry) => cancelActiveExport(entry.userId, entry.jobId))
+  );
+}
+
+export async function cleanupStaleExpressUploads(
+  uploadDir: string,
+  maxAgeMs = getEnvConfig().uploadTempMaxAgeMs
+): Promise<number> {
+  const activePaths = new Set<string>();
+  for (const entry of activeExportRegistry.values()) {
+    const isActive = !entry.cancelled && entry.status !== "completed" && entry.status !== "failed";
+    if (!isActive) continue;
+    for (const p of entry.tempFilePaths) {
+      if (p) activePaths.add(path.resolve(p));
+    }
+  }
+
+  let removedCount = 0;
+  try {
+    const entries = await fs.readdir(uploadDir, { withFileTypes: true });
+    const now = Date.now();
+    for (const item of entries) {
+      if (!item.isFile()) continue;
+      const fullPath = path.resolve(uploadDir, item.name);
+      if (activePaths.has(fullPath)) continue;
+      try {
+        const stat = await fs.stat(fullPath);
+        if (now - stat.mtimeMs >= maxAgeMs) {
+          await unlinkFileWithRetry(fullPath, 2);
+          removedCount += 1;
+        }
+      } catch {
+        // Ignore individual stat/unlink races
+      }
+    }
+  } catch {
+    // Upload dir may not exist yet
+  }
+  return removedCount;
+}
+
+export async function reconcileOrphanedVideoJobsOnStartup(maxAgeMinutes = 30): Promise<number> {
+  if (!isDatabaseConnected()) {
+    return 0;
+  }
+  const cutoff = new Date(Date.now() - maxAgeMinutes * 60 * 1000);
+  const result = await VideoJobModel.updateMany(
+    {
+      executionMode: "sync",
+      status: { $in: ["queued", "processing"] },
+      updatedAt: { $lt: cutoff },
+    },
+    {
+      $set: {
+        status: "failed",
+        errorMessage: "Processing interrupted by server restart or worker timeout.",
+        completedAt: new Date(),
+      },
+    }
+  );
+  return result.modifiedCount ?? 0;
+}
 
 function pruneActiveExports(): void {
   const now = Date.now();
@@ -487,7 +665,7 @@ function createCombinedSignal(externalSignal?: AbortSignal): {
   signal: AbortSignal;
   cleanup: () => void;
 } {
-  const timeoutSignal = AbortSignal.timeout(360_000);
+  const timeoutSignal = AbortSignal.timeout(getEnvConfig().exportTimeoutMs);
   if (!externalSignal) {
     return { signal: timeoutSignal, cleanup: () => undefined };
   }
@@ -792,7 +970,7 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       return {
         configured: true,
         reachable: true,
-        url: videoProcessorUrl,
+        url: "",
         status: "degraded",
         ffmpegAvailable: false,
         ffprobeAvailable: false,
@@ -817,7 +995,7 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
     return {
       configured: true,
       reachable: true,
-      url: videoProcessorUrl,
+      url: "",
       status: body.status === "ok" ? "ok" : "degraded",
       ffmpegAvailable: Boolean(body.ffmpeg_available),
       ffprobeAvailable: Boolean(body.ffprobe_available),
@@ -832,7 +1010,7 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
     return {
       configured: true,
       reachable: false,
-      url: videoProcessorUrl,
+      url: "",
       status: "unreachable",
       ffmpegAvailable: false,
       ffprobeAvailable: false,
@@ -841,10 +1019,12 @@ export async function checkVideoProcessorHealth(): Promise<ProcessorHealthStatus
       recommendedEncoder: "libx264",
       encoderCapabilities: {},
       exportProfiles: {},
-      error:
+      error: sanitizeErrorMessage(
         err instanceof Error
           ? `Python FastAPI service unreachable: ${err.message}`
           : "Unable to reach Python FastAPI video processor.",
+        "Unable to reach Python FastAPI video processor."
+      ),
     };
   }
 }
@@ -889,7 +1069,7 @@ export async function forwardMetadataFileToPython(params: {
     }
     throw Object.assign(
       new Error(
-        `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
+        "Python FastAPI video processor is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md)."
       ),
       {
         statusCode: 503,
@@ -909,7 +1089,8 @@ export async function forwardMetadataFileToPython(params: {
   };
 
   if (!res.ok || !body.metadata) {
-    const message = body.error || body.detail || `Video processor failed (${res.status}).`;
+    const rawMsg = body.error || body.detail || `Video processor failed (${res.status}).`;
+    const message = sanitizeErrorMessage(rawMsg, `Video processor failed (${res.status}).`);
     throw Object.assign(new Error(message), {
       statusCode: res.status >= 400 && res.status < 600 ? res.status : 502,
     });
@@ -1116,12 +1297,17 @@ export async function runSyncBinaryVideoOperation(params: {
     return Boolean(activeEntry.cancelled || st === "cancelled");
   };
 
+  let acquiredExportSlot: string | null = null;
   try {
     if (hasCancelled()) {
       throw Object.assign(new Error("Export cancelled by user."), {
         statusCode: 499,
         cancelled: true,
       });
+    }
+
+    if (params.operation === "export_mp4") {
+      acquiredExportSlot = await acquireExportSlot(params.userId, signal);
     }
 
     const videoProcessorUrl = requireConfiguredProcessorUrl();
@@ -1168,7 +1354,7 @@ export async function runSyncBinaryVideoOperation(params: {
       }
       throw Object.assign(
         new Error(
-          `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
+          "Python FastAPI video processor is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md)."
         ),
         { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
       );
@@ -1188,7 +1374,10 @@ export async function runSyncBinaryVideoOperation(params: {
           cancelled: true,
         });
       }
-      const message = errBody.error || errBody.detail || `Video processing failed (${res.status}).`;
+      const message = sanitizeErrorMessage(
+        errBody.error || errBody.detail || `Video processing failed (${res.status}).`,
+        `Video processing failed (${res.status}).`
+      );
       throw Object.assign(new Error(message), {
         statusCode: res.status >= 400 && res.status < 600 ? res.status : 502,
       });
@@ -1210,7 +1399,10 @@ export async function runSyncBinaryVideoOperation(params: {
     const hardwareFallbackUsed = res.headers.get("x-export-fallback") === "1";
     const disposition = res.headers.get("content-disposition") || "";
     const nameMatch = /filename="?([^";]+)"?/i.exec(disposition);
-    const filename = nameMatch?.[1] || params.defaultOutputFilename;
+    const filename = sanitizeFilenameForDisposition(
+      nameMatch?.[1] || params.defaultOutputFilename,
+      params.defaultOutputFilename
+    );
 
     if (hasCancelled()) {
       throw Object.assign(new Error("Export cancelled by user."), {
@@ -1304,6 +1496,7 @@ export async function runSyncBinaryVideoOperation(params: {
     }
     throw err;
   } finally {
+    releaseExportSlot(acquiredExportSlot);
     cleanup();
   }
 }
@@ -1368,7 +1561,7 @@ export async function runSyncSubtitlesGeneration(params: {
       }
       throw Object.assign(
         new Error(
-          `Python FastAPI video processor at ${videoProcessorUrl} is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md).`
+          "Python FastAPI video processor is unreachable. Start uvicorn locally (see docs/WINDOWS_LOCAL_SETUP.md)."
         ),
         { statusCode: 503, integrationPoint: "Python FastAPI Video Processor", cause: err }
       );
@@ -1382,7 +1575,10 @@ export async function runSyncSubtitlesGeneration(params: {
     };
 
     if (!res.ok || !Array.isArray(body.segments)) {
-      const message = body.error || body.detail || `Subtitle generation failed (${res.status}).`;
+      const message = sanitizeErrorMessage(
+        body.error || body.detail || `Subtitle generation failed (${res.status}).`,
+        `Subtitle generation failed (${res.status}).`
+      );
       throw Object.assign(new Error(message), {
         statusCode: res.status >= 400 && res.status < 600 ? res.status : 502,
       });
@@ -1416,7 +1612,10 @@ export async function runSyncSubtitlesGeneration(params: {
     const statusCode = (err as { statusCode?: number }).statusCode;
     jobDoc.status = statusCode === 503 ? "integration_required" : "failed";
     jobDoc.progress = 100;
-    jobDoc.errorMessage = err instanceof Error ? err.message : "Subtitle generation failed.";
+    jobDoc.errorMessage = sanitizeErrorMessage(
+      err instanceof Error ? err.message : "Subtitle generation failed.",
+      "Subtitle generation failed."
+    );
     jobDoc.completedAt = new Date();
     await jobDoc.save();
     throw err;
@@ -1426,16 +1625,21 @@ export async function runSyncSubtitlesGeneration(params: {
 export async function listUserVideoJobs(
   userId: string,
   projectId?: string,
-  operation?: VideoOperationType
+  operation?: VideoOperationType,
+  limit = 50
 ): Promise<IVideoJob[]> {
   const filter: Record<string, unknown> = { userId };
-  if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
-    filter.projectId = projectId;
+  if (projectId !== undefined && projectId.trim() !== "") {
+    if (!mongoose.Types.ObjectId.isValid(projectId.trim())) {
+      throw Object.assign(new Error("Invalid projectId filter."), { statusCode: 400 });
+    }
+    filter.projectId = projectId.trim();
   }
   if (operation) {
     filter.operation = operation;
   }
-  return VideoJobModel.find(filter).sort({ createdAt: -1 }).limit(50);
+  const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)));
+  return VideoJobModel.find(filter).sort({ createdAt: -1 }).limit(safeLimit);
 }
 
 export async function getUserVideoJobWithQueueState(

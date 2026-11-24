@@ -6,7 +6,10 @@ import {
   isVideoGenProviderConfigured,
 } from "../config/env.ts";
 import { getVideoQueueStatus } from "../queues/videoQueue.ts";
-import { checkVideoProcessorHealth } from "../services/videoProcessor.service.ts";
+import {
+  checkVideoProcessorHealth,
+  isVideoServerShuttingDown,
+} from "../services/videoProcessor.service.ts";
 import { authRouter } from "./auth.routes.ts";
 import { projectRouter } from "./project.routes.ts";
 import { mediaRouter } from "./media.routes.ts";
@@ -19,12 +22,41 @@ export const apiRouter = Router();
 apiRouter.get("/health", (_req, res) => {
   const db = getDatabaseStatus();
   const queue = getVideoQueueStatus();
+  const shuttingDown = isVideoServerShuttingDown();
   res.json({
-    status: "ok",
+    status: shuttingDown ? "shutting_down" : "ok",
     runtime: `Node ${process.version}`,
     uptimeSeconds: Math.round(process.uptime()),
-    database: db,
+    database: {
+      configured: db.configured,
+      connected: db.connected,
+      readyState: db.readyState,
+    },
     redisQueue: queue,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+apiRouter.get("/health/live", (_req, res) => {
+  res.status(200).json({
+    status: "ok",
+    live: true,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+apiRouter.get("/health/ready", (_req, res) => {
+  const db = getDatabaseStatus();
+  const shuttingDown = isVideoServerShuttingDown();
+  const dbRequiredButDisconnected = db.configured && !db.connected;
+  const ready = !shuttingDown && !dbRequiredButDisconnected;
+
+  res.status(ready ? 200 : 503).json({
+    status: ready ? "ready" : "not_ready",
+    ready,
+    shuttingDown,
+    databaseConnected: db.connected,
+    databaseConfigured: db.configured,
     timestamp: new Date().toISOString(),
   });
 });

@@ -37,6 +37,7 @@ export function signAuthToken(user: IUser): string {
   }
   const { jwtSecret, jwtExpiresIn } = getEnvConfig();
   const options: SignOptions = {
+    algorithm: "HS256",
     expiresIn: normalizeJwtExpiresIn(jwtExpiresIn) as SignOptions["expiresIn"],
   };
   return jwt.sign({ sub: user._id.toString(), email: user.email }, jwtSecret, options);

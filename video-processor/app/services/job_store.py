@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,20 @@ from typing import Any, Literal, Optional
 
 
 JobState = Literal["queued", "processing", "completed", "failed", "cancelled"]
+
+_URL_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:\\(?:[^\s\"'<>|:*?]+\\)*[^\s\"'<>|:*?]*")
+_POSIX_PATH_RE = re.compile(r"(?:(?<=^)|(?<=[\s(]))/(?:tmp|var|app|home|Users|etc|opt|usr)/[^\s\"')]+")
+
+
+def sanitize_error_text(raw: str | None, fallback: str = "Processing failed.") -> str:
+    text = (raw or "").strip()
+    if not text:
+        return fallback
+    cleaned = _URL_RE.sub("[service-endpoint]", text)
+    cleaned = _WIN_PATH_RE.sub("[server-path]", cleaned)
+    cleaned = _POSIX_PATH_RE.sub("[server-path]", cleaned).strip()
+    return cleaned or fallback
 
 
 def terminate_subprocess_tree(proc: Optional[subprocess.Popen[Any]], *, wait_sec: float = 1.5) -> None:
@@ -226,7 +241,7 @@ class InMemoryJobStore:
             if cancelled is not None:
                 record["cancelled"] = bool(cancelled)
             if error is not None:
-                record["error"] = error
+                record["error"] = sanitize_error_text(error)
             if result is not None:
                 record["result"] = result
             record["elapsed_ms"] = self._compute_elapsed_ms(runtime)
@@ -350,6 +365,30 @@ class InMemoryJobStore:
             _safe_rmtree(job_dir)
 
         return snapshot
+
+    def list_active_job_ids(self) -> set[str]:
+        with self._lock:
+            active: set[str] = set()
+            for job_id, record in self._jobs.items():
+                runtime = self._runtimes.get(job_id) or {}
+                if record.get("status") in ("queued", "processing") or runtime.get("worker_active"):
+                    active.add(job_id)
+            return active
+
+    def terminate_all_active(self, reason: str = "Video processor shutting down.") -> int:
+        with self._lock:
+            candidate_ids = [
+                job_id
+                for job_id, record in self._jobs.items()
+                if record.get("status") in ("queued", "processing")
+            ]
+        terminated = 0
+        for job_id in candidate_ids:
+            snap = self.request_cancel(job_id, allow_precreate=False)
+            if snap is not None:
+                self.update(job_id, error=sanitize_error_text(reason, "Export interrupted during shutdown."))
+                terminated += 1
+        return terminated
 
 
 job_store = InMemoryJobStore()

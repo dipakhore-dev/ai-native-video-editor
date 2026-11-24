@@ -13,6 +13,7 @@ import {
   LogIn,
   Menu,
   X,
+  AlertCircle,
 } from "lucide-react";
 import { useStudio } from "../../context/StudioContext";
 import type { AppRoute } from "../../types/studio";
@@ -59,6 +60,12 @@ export function StudioShell({ children, headerAction, fullBleed = false }: Studi
     setSidebarCollapsed,
     activeProject,
     sessionUser,
+    isAuthenticated,
+    sessionNotice,
+    dismissSessionNotice,
+    lastSaveError,
+    saveTimelineToMongo,
+    saveTimelineLocally,
     setCreateProjectModalOpen,
   } = useStudio();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -291,6 +298,50 @@ export function StudioShell({ children, headerAction, fullBleed = false }: Studi
             )}
           </div>
         </header>
+
+        {(sessionNotice || lastSaveError) && (
+          <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+              <span className="truncate">{sessionNotice || lastSaveError}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {sessionNotice && (
+                <button
+                  type="button"
+                  onClick={() => navigate("auth")}
+                  className="rounded border border-amber-400/40 bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-amber-500/30"
+                >
+                  Sign In
+                </button>
+              )}
+              {lastSaveError && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    saveTimelineLocally();
+                    if (isAuthenticated) {
+                      void saveTimelineToMongo();
+                    }
+                  }}
+                  className="rounded border border-amber-400/40 bg-amber-500/20 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-amber-500/30"
+                >
+                  Retry Save
+                </button>
+              )}
+              {sessionNotice && (
+                <button
+                  type="button"
+                  onClick={dismissSessionNotice}
+                  className="rounded p-0.5 text-amber-200 hover:bg-amber-500/20 hover:text-white"
+                  aria-label="Dismiss notice"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         <main className={fullBleed ? "flex-1 min-h-0 flex flex-col" : "flex-1 p-4 sm:p-6 lg:p-8"}>
           {children}

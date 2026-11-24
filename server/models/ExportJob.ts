@@ -23,7 +23,6 @@ const ExportJobSchema = new Schema<IExportJob>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
     },
     projectId: {
       type: Schema.Types.ObjectId,

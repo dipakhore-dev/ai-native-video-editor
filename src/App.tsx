@@ -1,5 +1,6 @@
 import { StudioProvider, useStudio } from "./context/StudioContext";
 import { CreateProjectModal } from "./components/common/CreateProjectModal";
+import { ErrorBoundary } from "./components/common/ErrorBoundary";
 import { LandingPage } from "./pages/LandingPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { EditorPage } from "./pages/EditorPage";
@@ -39,9 +40,11 @@ function ActiveRouteView() {
 
 export default function App() {
   return (
-    <StudioProvider>
-      <ActiveRouteView />
-      <CreateProjectModal />
-    </StudioProvider>
+    <ErrorBoundary>
+      <StudioProvider>
+        <ActiveRouteView />
+        <CreateProjectModal />
+      </StudioProvider>
+    </ErrorBoundary>
   );
 }

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import logging
 import re
+import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -12,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from .config import ProcessorSettings, get_settings
+from .config import ProcessorSettings, get_settings, validate_runtime_settings
 from .schemas import (
     HealthResponse,
     JobStatusResponse,
@@ -35,7 +39,7 @@ from .services.ffmpeg_service import (
     validate_timeline_export_spec,
 )
 from .services.ffprobe_service import VideoMetadataError, check_binary, extract_video_metadata
-from .services.job_store import job_store
+from .services.job_store import job_store, sanitize_error_text
 from .services.whisper_service import (
     SubtitleGenerationError,
     is_faster_whisper_available,
@@ -45,18 +49,126 @@ from .services.whisper_service import (
 from .utils.file_cleanup import (
     FileValidationError,
     cleanup_path,
+    cleanup_stale_job_dirs,
+    get_directory_size_bytes,
     managed_job_temp_dir,
+    resolve_within_base,
     validate_upload_headers,
+    validate_uploaded_file_magic,
     write_stream_with_limit,
 )
+
+logger = logging.getLogger("video_processor.app")
+
+_CLIENT_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+_export_semaphore_lock = threading.Lock()
+_export_semaphore_capacity: int = 0
+_export_semaphore: Optional[threading.BoundedSemaphore] = None
+
+
+def _get_export_semaphore(capacity: int) -> threading.BoundedSemaphore:
+    global _export_semaphore_capacity, _export_semaphore
+    with _export_semaphore_lock:
+        if _export_semaphore is None or _export_semaphore_capacity != capacity:
+            _export_semaphore_capacity = capacity
+            _export_semaphore = threading.BoundedSemaphore(capacity)
+        return _export_semaphore
+
+
+def acquire_export_slot(settings: ProcessorSettings) -> threading.BoundedSemaphore:
+    sem = _get_export_semaphore(settings.max_concurrent_exports)
+    acquired = sem.acquire(timeout=settings.export_queue_wait_sec)
+    if not acquired:
+        raise VideoProcessingError(
+            "Video processor export queue is busy. Please wait for the active export to finish.",
+            status_code=429,
+        )
+    return sem
+
+
+def assert_processor_key_matches(
+    provided_key: Optional[str],
+    settings: ProcessorSettings,
+) -> bool:
+    if settings.app_env == "production" and not settings.api_key:
+        return False
+    if not settings.api_key:
+        return True
+    if not provided_key:
+        return False
+    return hmac.compare_digest(provided_key.encode("utf-8"), settings.api_key.encode("utf-8"))
+
+
+def check_temp_storage_quota(settings: ProcessorSettings) -> None:
+    max_bytes = settings.max_temp_storage_mb * 1024 * 1024
+    used_bytes = get_directory_size_bytes(settings.temp_dir)
+    if used_bytes >= max_bytes:
+        cleanup_stale_job_dirs(
+            settings.temp_dir,
+            max_age_sec=min(settings.temp_cleanup_max_age_sec, 300),
+            active_job_ids=job_store.list_active_job_ids(),
+        )
+        used_bytes = get_directory_size_bytes(settings.temp_dir)
+        if used_bytes >= max_bytes:
+            raise VideoProcessingError(
+                "Video processor temporary workspace is temporarily full. Retry once active jobs finish.",
+                status_code=503,
+            )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings = get_settings()
+    config_errors = validate_runtime_settings(settings)
+    if config_errors:
+        for msg in config_errors:
+            logger.error("Configuration error: %s", msg)
+        raise RuntimeError("; ".join(config_errors))
+
+    settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_job_dirs(
+        settings.temp_dir,
+        max_age_sec=settings.temp_cleanup_max_age_sec,
+        active_job_ids=job_store.list_active_job_ids(),
+    )
+
+    stop_cleanup = asyncio.Event()
+
+    async def _periodic_cleanup() -> None:
+        while not stop_cleanup.is_set():
+            try:
+                await asyncio.wait_for(stop_cleanup.wait(), timeout=600.0)
+                break
+            except asyncio.TimeoutError:
+                cur_settings = get_settings()
+                cleanup_stale_job_dirs(
+                    cur_settings.temp_dir,
+                    max_age_sec=cur_settings.temp_cleanup_max_age_sec,
+                    active_job_ids=job_store.list_active_job_ids(),
+                )
+
+    cleanup_task = asyncio.create_task(_periodic_cleanup())
+    try:
+        yield
+    finally:
+        stop_cleanup.set()
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+        job_store.terminate_all_active("Video processor shutting down cleanly.")
+        cleanup_stale_job_dirs(
+            settings.temp_dir,
+            max_age_sec=0,
+            active_job_ids=job_store.list_active_job_ids(),
+        )
+
 
 app = FastAPI(
     title="AI Studio Local Video Processor",
     description="Free local Python FastAPI microservice powered by FFmpeg, FFprobe, and faster-whisper.",
     version="0.2.0",
+    lifespan=lifespan,
 )
-
-_CLIENT_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 @app.middleware("http")
@@ -64,7 +176,7 @@ async def pre_register_export_job_middleware(request: Request, call_next):
     if request.method == "POST" and request.url.path == "/api/v1/export-mp4":
         settings = get_settings()
         provided_key = request.headers.get("x-processor-key")
-        if not settings.api_key or provided_key == settings.api_key:
+        if assert_processor_key_matches(provided_key, settings):
             raw_header_id = (request.headers.get("x-export-job-id") or "").strip()
             if _CLIENT_JOB_ID_RE.match(raw_header_id):
                 job_store.create(
@@ -82,33 +194,41 @@ def verify_processor_key(
     x_processor_key: Optional[str] = Header(default=None),
     settings: ProcessorSettings = Depends(get_settings),
 ) -> None:
-    if settings.api_key and x_processor_key != settings.api_key:
+    if settings.app_env == "production" and not settings.api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Processor API key is not configured for production mode.",
+        )
+    if not assert_processor_key_matches(x_processor_key, settings):
         raise HTTPException(status_code=401, detail="Invalid or missing processor API key.")
 
 
 @app.exception_handler(FileValidationError)
 async def handle_file_validation_error(_request, exc: FileValidationError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
+    return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
 
 
 @app.exception_handler(VideoMetadataError)
 async def handle_metadata_error(_request, exc: VideoMetadataError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
+    return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
 
 
 @app.exception_handler(VideoProcessingCancelledError)
 async def handle_cancelled_error(_request, exc: VideoProcessingCancelledError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": str(exc), "cancelled": True})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": sanitize_error_text(str(exc), "Export cancelled by user."), "cancelled": True},
+    )
 
 
 @app.exception_handler(VideoProcessingError)
 async def handle_processing_error(_request, exc: VideoProcessingError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
+    return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
 
 
 @app.exception_handler(SubtitleGenerationError)
 async def handle_subtitle_error(_request, exc: SubtitleGenerationError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
+    return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -131,8 +251,8 @@ def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthRespons
         ffmpeg_available=bool(ffmpeg_path),
         ffprobe_available=bool(ffprobe_path),
         faster_whisper_available=whisper_ok,
-        ffmpeg_path=ffmpeg_path,
-        ffprobe_path=ffprobe_path,
+        ffmpeg_path=None,
+        ffprobe_path=None,
         hardware_encoders=list(hw_caps.get("available_hardware_encoders") or []),  # type: ignore[arg-type]
         recommended_encoder=str(hw_caps.get("recommended_encoder") or "libx264"),
         encoder_capabilities=dict(hw_caps.get("encoders") or {}),  # type: ignore[arg-type]
@@ -169,7 +289,8 @@ def cancel_job(
 
 
 def _prepare_job_dir(settings: ProcessorSettings, job_id: str) -> Path:
-    job_dir = settings.temp_dir / f"job_{job_id}"
+    safe_job_id = re.sub(r"[^A-Za-z0-9_-]", "_", job_id)[:64] or "job"
+    job_dir = resolve_within_base(settings.temp_dir, settings.temp_dir / f"job_{safe_job_id}")
     job_dir.mkdir(parents=True, exist_ok=True)
     return job_dir
 
@@ -188,9 +309,19 @@ async def _save_single_upload(
         allow_audio=allow_audio,
         allow_images=allow_images,
     )
-    target_path = dest_dir / f"{prefix}{safe_name}"
+    target_path = resolve_within_base(dest_dir, dest_dir / f"{prefix}{safe_name}")
     file.file.seek(0)
     write_stream_with_limit(file.file, target_path, max_bytes)
+    try:
+        validate_uploaded_file_magic(
+            target_path,
+            original_filename=safe_name,
+            allow_audio=allow_audio,
+            allow_images=allow_images,
+        )
+    except Exception:
+        cleanup_path(target_path)
+        raise
     return safe_name, target_path
 
 
@@ -207,13 +338,20 @@ async def extract_metadata_endpoint(
     job_store.create(job_id, operation="metadata_extraction")
 
     try:
+        check_temp_storage_quota(settings)
         safe_name = validate_upload_headers(file.filename, file.content_type)
         job_store.update(job_id, status="processing", progress=25)
 
         with managed_job_temp_dir(settings.temp_dir, job_id) as temp_dir:
-            target_path = temp_dir / safe_name
+            target_path = resolve_within_base(temp_dir, temp_dir / safe_name)
             file.file.seek(0)
             write_stream_with_limit(file.file, target_path, settings.max_upload_bytes)
+            validate_uploaded_file_magic(
+                target_path,
+                original_filename=safe_name,
+                allow_audio=False,
+                allow_images=False,
+            )
             job_store.update(job_id, progress=60)
 
             metadata = extract_video_metadata(
@@ -226,12 +364,13 @@ async def extract_metadata_endpoint(
         job_store.update(job_id, status="completed", progress=100, result=metadata)
         return VideoMetadataResponse(status="completed", job_id=job_id, metadata=metadata)
 
-    except (FileValidationError, VideoMetadataError) as exc:
+    except (FileValidationError, VideoMetadataError, VideoProcessingError) as exc:
         job_store.update(job_id, status="failed", progress=100, error=str(exc))
         raise
     except Exception as exc:
+        logger.exception("Unexpected metadata extraction error: %s", exc)
         job_store.update(job_id, status="failed", progress=100, error="Unexpected metadata extraction error.")
-        raise HTTPException(status_code=500, detail=f"Unexpected error inspecting video: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Unexpected error inspecting uploaded video.") from exc
     finally:
         await file.close()
 
@@ -251,6 +390,7 @@ async def thumbnail_endpoint(
     job_dir = _prepare_job_dir(settings, job_id)
 
     try:
+        check_temp_storage_quota(settings)
         job_store.update(job_id, status="processing", progress=20)
         safe_name, input_path = await _save_single_upload(
             file, job_dir, settings.max_upload_bytes
@@ -297,6 +437,7 @@ async def trim_endpoint(
     job_dir = _prepare_job_dir(settings, job_id)
 
     try:
+        check_temp_storage_quota(settings)
         job_store.update(job_id, status="processing", progress=20)
         safe_name, input_path = await _save_single_upload(
             file, job_dir, settings.max_upload_bytes
@@ -345,6 +486,7 @@ async def aspect_ratio_endpoint(
     job_dir = _prepare_job_dir(settings, job_id)
 
     try:
+        check_temp_storage_quota(settings)
         job_store.update(job_id, status="processing", progress=20)
         safe_name, input_path = await _save_single_upload(
             file, job_dir, settings.max_upload_bytes
@@ -394,6 +536,7 @@ async def merge_endpoint(
     job_dir = _prepare_job_dir(settings, job_id)
 
     try:
+        check_temp_storage_quota(settings)
         job_store.update(job_id, status="processing", progress=20)
         input_paths: list[Path] = []
         for idx, upload in enumerate(files):
@@ -467,6 +610,8 @@ async def export_mp4_endpoint(
                 status_code=400,
             )
 
+        check_temp_storage_quota(settings)
+
         eff_profile_id, eff_profile_resolution, _ = resolve_export_profile_spec(
             raw_profile,
             resolution,
@@ -526,6 +671,7 @@ async def export_mp4_endpoint(
     job_store.register_job_dir(job_id, job_dir)
     cancel_event = job_store.get_cancel_event(job_id)
     disconnect_task: Optional[asyncio.Task[None]] = None
+    acquired_semaphore: Optional[threading.BoundedSemaphore] = None
 
     async def _watch_client_disconnect() -> None:
         try:
@@ -544,6 +690,8 @@ async def export_mp4_endpoint(
     try:
         if (cancel_event is not None and cancel_event.is_set()) or job_store.is_cancelled(job_id):
             raise VideoProcessingCancelledError()
+
+        acquired_semaphore = await run_in_threadpool(acquire_export_slot, settings)
 
         client_host = getattr(request.client, "host", None)
         if client_host and client_host != "testclient":
@@ -691,6 +839,8 @@ async def export_mp4_endpoint(
         )
         raise
     finally:
+        if acquired_semaphore is not None:
+            acquired_semaphore.release()
         if disconnect_task is not None:
             disconnect_task.cancel()
             await asyncio.gather(disconnect_task, return_exceptions=True)
@@ -712,14 +862,21 @@ async def subtitles_endpoint(
     job_store.create(job_id, operation="subtitles")
 
     try:
+        check_temp_storage_quota(settings)
         normalized_language = validate_subtitle_language(language)
         safe_name = validate_upload_headers(file.filename, file.content_type)
         job_store.update(job_id, status="processing", progress=20)
 
         with managed_job_temp_dir(settings.temp_dir, job_id) as temp_dir:
-            input_path = temp_dir / safe_name
+            input_path = resolve_within_base(temp_dir, temp_dir / safe_name)
             file.file.seek(0)
             write_stream_with_limit(file.file, input_path, settings.max_upload_bytes)
+            validate_uploaded_file_magic(
+                input_path,
+                original_filename=safe_name,
+                allow_audio=True,
+                allow_images=False,
+            )
             job_store.update(job_id, progress=50)
 
             result = transcribe_video_subtitles(
@@ -737,11 +894,12 @@ async def subtitles_endpoint(
         job_store.update(job_id, status="completed", progress=100, result=result)
         return SubtitleGenerationResponse(status="completed", job_id=job_id, **result)
 
-    except (FileValidationError, VideoMetadataError, SubtitleGenerationError) as exc:
+    except (FileValidationError, VideoMetadataError, SubtitleGenerationError, VideoProcessingError) as exc:
         job_store.update(job_id, status="failed", progress=100, error=str(exc))
         raise
     except Exception as exc:
+        logger.exception("Unexpected subtitle generation error: %s", exc)
         job_store.update(job_id, status="failed", progress=100, error="Unexpected subtitle generation error.")
-        raise HTTPException(status_code=500, detail=f"Subtitle generation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Subtitle generation failed unexpectedly.") from exc
     finally:
         await file.close()

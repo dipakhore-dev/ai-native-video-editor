@@ -20,10 +20,16 @@ export async function listMediaController(
   try {
     const projectId =
       typeof req.query.projectId === "string" ? req.query.projectId : undefined;
-    const assets = await listUserMediaAssets(req.userId!, projectId);
+    const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 100;
+    const assets = await listUserMediaAssets(
+      req.userId!,
+      projectId,
+      Number.isFinite(rawLimit) ? rawLimit : 100
+    );
     res.json({ status: "ok", assets });
   } catch (err) {
-    res.status(500).json({
+    const status = (err as { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
       error: err instanceof Error ? err.message : "Failed to list media metadata.",
     });
   }

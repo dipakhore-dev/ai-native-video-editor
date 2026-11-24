@@ -211,7 +211,7 @@ export function ExportModal({
   initialRetryConfig,
   onClose,
 }: ExportModalProps) {
-  const { mediaAssets, recordExportAttempt, navigate } = useStudio();
+  const { mediaAssets, recordExportAttempt, navigate, setExportInProgress } = useStudio();
   const [format, setFormat] = useState<"mp4" | "webm" | "mov">(
     initialRetryConfig?.format ?? "mp4"
   );
@@ -316,6 +316,22 @@ export function ExportModal({
       }
     };
   }, [feedback?.downloadUrl]);
+
+  useEffect(() => {
+    setExportInProgress(submitting);
+    return () => setExportInProgress(false);
+  }, [setExportInProgress, submitting]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !submitting) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose, submitting]);
 
   useEffect(() => {
     return () => {

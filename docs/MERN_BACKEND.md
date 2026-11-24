@@ -87,3 +87,24 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
      -H "Content-Type: application/json" \
      -d '{"name":"Launch Cut","aspectRatio":"16:9","resolution":"1080p","fps":24}'
    ```
+
+---
+
+## Production Hardening & Deployment Readiness
+
+- **Required Production Secrets (`NODE_ENV=production`)**:
+  - `JWT_SECRET`: must be at least 32 characters (startup fails closed in production otherwise).
+  - `APP_URL` / `CORS_ALLOWED_ORIGINS`: explicit origin allowlist (never wildcard `*`) for CORS and CSRF protection.
+  - `VIDEO_PROCESSOR_API_KEY`: required (>= 16 characters) whenever `VIDEO_PROCESSOR_URL` is configured in production.
+- **Transport & Proxy Settings**:
+  - Serve Express over HTTPS behind a TLS-terminating reverse proxy (`trust proxy` enabled when `TRUST_PROXY=true`). HTTP-only auth cookies automatically gain `Secure` over HTTPS.
+  - Configure reverse-proxy request timeouts >= `360s` (`EXPORT_TIMEOUT_MS`) and `client_max_body_size` matching `VIDEO_UPLOAD_MAX_MB`.
+- **Rate Limits & Concurrency Guards**:
+  - Auth routes (`/api/auth/*`), AI routes (`/api/ai/*`), and video processing/export routes (`/api/video/*`) enforce bounded per-client rate limits returning `429` with `Retry-After`.
+  - MP4 exports enforce global (`MAX_CONCURRENT_EXPORTS`) and per-user (`MAX_USER_ACTIVE_EXPORTS`) concurrency slots plus magic-byte file verification on uploaded media.
+- **Health Probes, Shutdown & Backups**:
+  - Liveness probe: `GET /api/health/live` (returns `200`).
+  - Readiness probe: `GET /api/health/ready` (returns `503` when shutting down or when `MONGODB_URI` is set but disconnected).
+  - On `SIGINT`/`SIGTERM`, Express stops accepting new connections, signals active video jobs, cleans stale temp files, and closes Mongoose cleanly.
+  - Schedule automated `mongodump` / MongoDB Atlas snapshots for `users`, `projects`, `mediaassets`, `videojobs`, `exportjobs`, and `aieditrequests`.
+

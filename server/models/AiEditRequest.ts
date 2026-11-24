@@ -23,13 +23,11 @@ const AiEditRequestSchema = new Schema<IAiEditRequest>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
     },
     projectId: {
       type: Schema.Types.ObjectId,
       ref: "Project",
       required: true,
-      index: true,
     },
     prompt: {
       type: String,
@@ -66,6 +64,7 @@ const AiEditRequestSchema = new Schema<IAiEditRequest>(
   }
 );
 
+AiEditRequestSchema.index({ userId: 1, createdAt: -1 });
 AiEditRequestSchema.index({ userId: 1, projectId: 1, createdAt: -1 });
 
 export const AiEditRequestModel: Model<IAiEditRequest> =

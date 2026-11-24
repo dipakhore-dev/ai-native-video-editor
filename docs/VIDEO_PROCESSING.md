@@ -47,3 +47,20 @@ gcloud run deploy ai-studio-video-processor \
 
 ### Option B: Railway / Render / Any Docker Host
 Point the service root directory to `video-processor/` and deploy using `video-processor/Dockerfile`. It binds to `0.0.0.0:$PORT` automatically.
+
+---
+
+## Production Hardening & Deployment Checklist
+
+- **Shared Authentication (`APP_ENV=production`)**: FastAPI fails startup if `VIDEO_PROCESSOR_API_KEY` is missing or shorter than 16 characters when `APP_ENV=production`. Set the exact same random secret on both Express and FastAPI; requests are compared using constant-time HMAC equality.
+- **FFmpeg & Subtitle Safety**: FFmpeg and FFprobe invocations enforce `-protocol_whitelist file,pipe` to block unintended network/protocol access, and ASS subtitle font names are allowlisted to safe characters.
+- **Concurrency & Temp Disk Caps**:
+  - `MAX_CONCURRENT_EXPORTS` (default `2`) and `EXPORT_QUEUE_WAIT_SEC` (default `5`) prevent CPU/RAM exhaustion; excess concurrent export requests receive HTTP `429` with `Retry-After`.
+  - `MAX_TEMP_STORAGE_MB` (default `2048`) and `TEMP_CLEANUP_MAX_AGE_SEC` (default `3600`) cap temporary job storage and purge stale temp directories while preserving active export jobs.
+- **Reverse Proxy Configuration (Nginx / Caddy / Cloud LB)**:
+  - Set request & proxy timeouts to at least `360s` (`proxy_read_timeout 360s; proxy_send_timeout 360s;`) so long 1080p MP4 renders do not terminate early.
+  - Set `client_max_body_size 512m;` (or match `VIDEO_UPLOAD_MAX_MB`).
+- **Health Checks & Graceful Shutdown**:
+  - Point readiness probes to Express `GET /api/health/ready` and FastAPI `GET /health` (system paths are redacted).
+  - On `SIGTERM` / `SIGINT`, FastAPI stops new work, terminates active FFmpeg child processes, and cleans temp job directories.
+

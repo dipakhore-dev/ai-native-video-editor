@@ -45,7 +45,6 @@ const VideoJobSchema = new Schema<IVideoJob>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
     },
     projectId: {
       type: Schema.Types.ObjectId,
@@ -57,7 +56,6 @@ const VideoJobSchema = new Schema<IVideoJob>(
       type: Schema.Types.ObjectId,
       ref: "MediaAsset",
       default: null,
-      index: true,
     },
     operation: {
       type: String,
@@ -77,7 +75,6 @@ const VideoJobSchema = new Schema<IVideoJob>(
       type: String,
       enum: ["queued", "processing", "completed", "failed", "cancelled", "integration_required"],
       default: "queued",
-      index: true,
     },
     progress: {
       type: Number,
@@ -131,6 +128,8 @@ const VideoJobSchema = new Schema<IVideoJob>(
 );
 
 VideoJobSchema.index({ userId: 1, createdAt: -1 });
+VideoJobSchema.index({ userId: 1, operation: 1, createdAt: -1 });
+VideoJobSchema.index({ status: 1, updatedAt: 1 });
 
 export const VideoJobModel: Model<IVideoJob> =
   mongoose.models.VideoJob || mongoose.model<IVideoJob>("VideoJob", VideoJobSchema);

@@ -22,13 +22,11 @@ const MediaAssetSchema = new Schema<IMediaAsset>(
       type: Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      index: true,
     },
     projectId: {
       type: Schema.Types.ObjectId,
       ref: "Project",
       default: null,
-      index: true,
     },
     name: {
       type: String,
@@ -79,6 +77,7 @@ const MediaAssetSchema = new Schema<IMediaAsset>(
 );
 
 MediaAssetSchema.index({ userId: 1, createdAt: -1 });
+MediaAssetSchema.index({ userId: 1, projectId: 1, createdAt: -1 });
 
 export const MediaAssetModel: Model<IMediaAsset> =
   mongoose.models.MediaAsset || mongoose.model<IMediaAsset>("MediaAsset", MediaAssetSchema);

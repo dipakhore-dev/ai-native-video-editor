@@ -1475,17 +1475,32 @@ export const AiAssistantPanel = React.memo(function AiAssistantPanel({
                             Proposed Timeline Changes
                           </p>
                           <ul className="space-y-1.5">
-                            {supportedOps.map((op, idx) => (
-                              <li
-                                key={idx}
-                                className="rounded-lg border border-zinc-800/80 bg-[#09090B] p-2.5 text-xs space-y-0.5"
-                              >
-                                <p className="text-zinc-100 font-medium">
-                                  {describeAiOperation(op, project)}
-                                </p>
-                                <p className="text-[11px] text-zinc-500">{op.reason}</p>
-                              </li>
-                            ))}
+                            {supportedOps.map((op, idx) => {
+                              const isDestructive =
+                                op.type === "delete_clip" || op.type === "clear_clip_keyframes";
+                              return (
+                                <li
+                                  key={idx}
+                                  className={`rounded-lg border p-2.5 text-xs space-y-1 ${
+                                    isDestructive
+                                      ? "border-rose-500/40 bg-rose-500/10"
+                                      : "border-zinc-800/80 bg-[#09090B]"
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-zinc-100 font-medium">
+                                      {describeAiOperation(op, project)}
+                                    </p>
+                                    {isDestructive && (
+                                      <span className="shrink-0 rounded border border-rose-400/40 bg-rose-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-rose-200">
+                                        Destructive change
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-[11px] text-zinc-400">{op.reason}</p>
+                                </li>
+                              );
+                            })}
                           </ul>
                         </div>
                       )}
