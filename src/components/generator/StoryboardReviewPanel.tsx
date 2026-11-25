@@ -1,18 +1,31 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Check,
   Clock,
+  ExternalLink,
+  Eye,
   Film,
+  FolderOpen,
+  Image as ImageIcon,
   Plus,
   RefreshCw,
   Save,
+  Search,
   Trash2,
+  Type,
+  Upload,
+  X,
 } from "lucide-react";
+import type { StockSearchItemDto } from "../../services/api";
 import type {
+  AspectRatioHandlingMode,
   EffectPreset,
+  GeneratedSlideConfig,
+  MediaAsset,
   StoryboardCameraMotion,
   StoryboardMediaType,
   StoryboardScene,
@@ -20,6 +33,7 @@ import type {
   VideoStoryboard,
 } from "../../types/studio";
 import { EFFECT_PRESETS, TRANSITION_OPTIONS } from "../../utils/effects";
+import { formatTimecode } from "../../utils/media";
 import {
   buildCaptionsFromScenes,
   buildNarrationFromScenes,
@@ -34,6 +48,14 @@ import {
   validateStoryboardInvariants,
   VOICEOVER_PREFERENCE_OPTIONS,
 } from "../../utils/storyboard";
+import {
+  clampVideoSourceStartTime,
+  computeStoryboardMediaSummary,
+  evaluateSceneMediaReadiness,
+} from "../../utils/storyboardMedia";
+import { MediaPickerModal } from "./MediaPickerModal";
+import { SlideGeneratorModal } from "./SlideGeneratorModal";
+import { StoryboardMediaPrepSection } from "./StoryboardMediaPrepSection";
 
 interface StoryboardReviewPanelProps {
   storyboard: VideoStoryboard;
@@ -45,11 +67,54 @@ interface StoryboardReviewPanelProps {
   saveError: string | null;
   regenerating: boolean;
   isAuthenticated: boolean;
+  mediaAssets?: MediaAsset[];
+  idbHydrating?: boolean;
+  mediaPrepActive?: boolean;
+  mediaPrepStatusMessage?: string | null;
+  onAutoMatchMedia?: (options: { overwriteManual: boolean }) => void;
+  onUploadBatchMedia?: (files: FileList) => Promise<void> | void;
+  onUploadSceneFile?: (files: FileList, sceneId: string) => Promise<void> | void;
+  onSelectLibraryAsset?: (asset: MediaAsset, sceneId: string) => void;
+  onImportStockResult?: (
+    item: StockSearchItemDto,
+    sceneId: string,
+    signal: AbortSignal
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onGenerateAndAssignSlide?: (result: {
+    file: File;
+    config: GeneratedSlideConfig;
+    sceneId: string;
+  }) => Promise<void> | void;
+  onRelinkMissingSceneMedia?: (
+    assetId: string,
+    file: File,
+    sceneId: string
+  ) => Promise<void> | void;
+  onCancelMediaPrep?: () => void;
 }
 
 function formatClockRange(start: number, duration: number): string {
   const end = Number((start + duration).toFixed(2));
   return `${start.toFixed(1)}s – ${end.toFixed(1)}s`;
+}
+
+function isSafeHttpsUrl(raw?: string): raw is string {
+  if (!raw) return false;
+  try {
+    return new URL(raw).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function formatSourceOriginLabel(
+  mediaSource: NonNullable<StoryboardScene["mediaAssignment"]>["mediaSource"],
+  providerName?: string
+): string {
+  if (mediaSource === "generated_slide") return "Generated Slide";
+  if (mediaSource === "stock") return `Stock (${providerName || "Pexels"})`;
+  if (mediaSource === "uploaded") return "Uploaded";
+  return "Library";
 }
 
 export function StoryboardReviewPanel({
@@ -62,8 +127,40 @@ export function StoryboardReviewPanel({
   saveError,
   regenerating,
   isAuthenticated,
+  mediaAssets = [],
+  idbHydrating = false,
+  mediaPrepActive = false,
+  mediaPrepStatusMessage = null,
+  onAutoMatchMedia,
+  onUploadBatchMedia,
+  onUploadSceneFile,
+  onSelectLibraryAsset,
+  onImportStockResult,
+  onGenerateAndAssignSlide,
+  onRelinkMissingSceneMedia,
+  onCancelMediaPrep,
 }: StoryboardReviewPanelProps) {
   const [keywordsDraftById, setKeywordsDraftById] = useState<Record<string, string>>({});
+  const [overwriteManual, setOverwriteManual] = useState(false);
+
+  const [pickerState, setPickerState] = useState<{
+    open: boolean;
+    sceneId: string | null;
+    initialTab: "library" | "stock";
+  }>({ open: false, sceneId: null, initialTab: "library" });
+
+  const [slideModalSceneId, setSlideModalSceneId] = useState<string | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<{
+    scene: StoryboardScene;
+    asset: MediaAsset;
+  } | null>(null);
+
+  const sceneFileInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingSceneUploadRef = useRef<{
+    sceneId: string;
+    mode: "upload" | "relink";
+    assetId?: string;
+  } | null>(null);
 
   const validation = useMemo(
     () =>
@@ -72,6 +169,26 @@ export function StoryboardReviewPanel({
         scenes: storyboard.scenes,
       }),
     [storyboard.scenes, storyboard.totalDuration]
+  );
+
+  const assetsById = useMemo(
+    () => new Map(mediaAssets.map((asset) => [asset.id, asset])),
+    [mediaAssets]
+  );
+
+  const mediaSummary = useMemo(
+    () => computeStoryboardMediaSummary(storyboard, mediaAssets, !idbHydrating),
+    [storyboard, mediaAssets, idbHydrating]
+  );
+
+  const pickerScene = useMemo(
+    () => storyboard.scenes.find((s) => s.id === pickerState.sceneId) ?? null,
+    [storyboard.scenes, pickerState.sceneId]
+  );
+
+  const slideModalScene = useMemo(
+    () => storyboard.scenes.find((s) => s.id === slideModalSceneId) ?? null,
+    [storyboard.scenes, slideModalSceneId]
   );
 
   const voiceoverLabel =
@@ -86,6 +203,11 @@ export function StoryboardReviewPanel({
     onChange({
       ...storyboard,
       scenes: timed,
+      mediaReadinessSummary: computeStoryboardMediaSummary(
+        { ...storyboard, scenes: timed },
+        mediaAssets,
+        !idbHydrating
+      ),
       updatedAt: new Date().toISOString(),
     });
   };
@@ -94,6 +216,18 @@ export function StoryboardReviewPanel({
     const updated = storyboard.scenes.map((scene) =>
       scene.id === sceneId ? { ...scene, ...patch } : scene
     );
+    commitScenes(updated);
+  };
+
+  const handleClearSceneAssignment = (sceneId: string) => {
+    handleScenePatch(sceneId, { mediaAssignment: undefined });
+  };
+
+  const handleClearAllAssignments = () => {
+    const updated = storyboard.scenes.map((scene) => ({
+      ...scene,
+      mediaAssignment: undefined,
+    }));
     commitScenes(updated);
   };
 
@@ -141,11 +275,57 @@ export function StoryboardReviewPanel({
     });
   };
 
+  const triggerSingleSceneFileUpload = (
+    sceneId: string,
+    mode: "upload" | "relink",
+    assetId?: string
+  ) => {
+    pendingSceneUploadRef.current = { sceneId, mode, assetId };
+    sceneFileInputRef.current?.click();
+  };
+
+  const openFirstUnassignedLibrary = () => {
+    const firstNeedsMedia =
+      storyboard.scenes.find((scene) => {
+        const evalRes = evaluateSceneMediaReadiness(scene, storyboard, assetsById, !idbHydrating);
+        return !evalRes.isReady;
+      }) ?? storyboard.scenes[0];
+
+    if (firstNeedsMedia) {
+      setPickerState({
+        open: true,
+        sceneId: firstNeedsMedia.id,
+        initialTab: "library",
+      });
+    }
+  };
+
   return (
     <section
       aria-label="Editable Storyboard Review"
       className="rounded-2xl border border-zinc-800/80 bg-[#111114] divide-y divide-zinc-800/80"
     >
+      <input
+        ref={sceneFileInputRef}
+        type="file"
+        multiple={false}
+        accept="video/*,image/*,.mp4,.mov,.webm,.mkv,.png,.jpg,.jpeg,.webp"
+        className="hidden"
+        onChange={(e) => {
+          const files = e.target.files;
+          const target = pendingSceneUploadRef.current;
+          pendingSceneUploadRef.current = null;
+          if (files && files.length > 0 && target) {
+            if (target.mode === "relink" && target.assetId && onRelinkMissingSceneMedia) {
+              void onRelinkMissingSceneMedia(target.assetId, files[0], target.sceneId);
+            } else if (onUploadSceneFile) {
+              void onUploadSceneFile(files, target.sceneId);
+            }
+          }
+          e.target.value = "";
+        }}
+      />
+
       {/* Top Storyboard Summary & Controls */}
       <div className="p-6 space-y-5">
         <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
@@ -254,6 +434,20 @@ export function StoryboardReviewPanel({
             </button>
           )}
         </div>
+
+        {/* Phase 5.5.2 Media Preparation Bar */}
+        <StoryboardMediaPrepSection
+          summary={mediaSummary}
+          mediaPrepActive={mediaPrepActive}
+          overwriteManual={overwriteManual}
+          onToggleOverwriteManual={setOverwriteManual}
+          onAutoMatch={() => onAutoMatchMedia?.({ overwriteManual })}
+          onUploadBatch={(files) => onUploadBatchMedia?.(files)}
+          onOpenLibraryForFirstUnassigned={openFirstUnassignedLibrary}
+          onClearAllAssignments={handleClearAllAssignments}
+          onCancelPrep={() => onCancelMediaPrep?.()}
+          statusMessage={mediaPrepStatusMessage}
+        />
 
         {saveStatusMessage && (
           <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs text-emerald-300 flex items-center gap-2">
@@ -369,12 +563,12 @@ export function StoryboardReviewPanel({
           <div className="flex items-center gap-2">
             <Film className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
             <span>
-              Voiceover audio is not synthesized yet; saved preferences prepare Phase 5.5.2+ FFmpeg
-              composition.
+              Phase 5.5.2 matches and validates local visual media for scenes. Voiceover synthesis,
+              captions, and FFmpeg MP4 composition arrive in Phase 5.5.3.
             </span>
           </div>
           <span className="font-mono text-[11px] text-zinc-500 whitespace-nowrap">
-            Rendering locked until composition phase
+            Composition locked until Phase 5.5.3
           </span>
         </div>
       </div>
@@ -387,8 +581,8 @@ export function StoryboardReviewPanel({
               Scene Breakdown ({storyboard.scenes.length})
             </h3>
             <p className="text-xs text-zinc-400 mt-0.5">
-              Edit timing, narration, captions, visual prompts, and editor-compatible transitions or
-              effects.
+              Edit timing, narration, captions, visual media assignments, and editor-compatible
+              transitions or effects.
             </p>
           </div>
 
@@ -407,6 +601,15 @@ export function StoryboardReviewPanel({
           {storyboard.scenes.map((scene, index) => {
             const keywordsValue =
               keywordsDraftById[scene.id] ?? scene.mediaKeywords.join(", ");
+            const readiness = evaluateSceneMediaReadiness(
+              scene,
+              storyboard,
+              assetsById,
+              !idbHydrating
+            );
+            const assignment = scene.mediaAssignment;
+            const assignedAsset = readiness.asset;
+            const thumbSrc = assignedAsset?.thumbnailUrl || (assignedAsset?.kind === "image" ? assignedAsset.objectUrl : undefined);
 
             return (
               <article
@@ -476,6 +679,309 @@ export function StoryboardReviewPanel({
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
+                  </div>
+                </div>
+
+                {/* Scene Visual Media Assignment Slot (Lightweight Thumbnails Only) */}
+                <div className="rounded-lg border border-zinc-800/90 bg-[#111114] p-3.5 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-start gap-3.5">
+                    {/* Lightweight Preview Thumbnail (never mounts <video> in scene list) */}
+                    <div className="w-full sm:w-36 h-20 rounded-md border border-zinc-800 bg-black overflow-hidden shrink-0 flex items-center justify-center relative">
+                      {thumbSrc ? (
+                        <img
+                          src={thumbSrc}
+                          alt={assignment?.assetTitle || scene.title}
+                          loading="lazy"
+                          className="h-full w-full object-cover"
+                        />
+                      ) : readiness.isMissing || readiness.isInvalid ? (
+                        <AlertTriangle className="h-5 w-5 text-rose-400" />
+                      ) : scene.mediaType === "image" || scene.mediaType === "text_card" ? (
+                        <ImageIcon className="h-5 w-5 text-zinc-600" />
+                      ) : (
+                        <Film className="h-5 w-5 text-zinc-600" />
+                      )}
+                      {assignment && (
+                        <span className="absolute bottom-1 left-1 rounded bg-black/80 px-1.5 py-0.5 text-[10px] font-mono text-zinc-200 uppercase">
+                          {assignment.mediaType === "generated_slide"
+                            ? "SLIDE"
+                            : assignment.mediaType}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Assignment Status & Metadata */}
+                    <div className="flex-1 min-w-0 space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2 min-w-0">
+                          <span
+                            className={`text-[11px] font-mono font-medium uppercase ${
+                              readiness.status === "assigned"
+                                ? "text-emerald-400"
+                                : readiness.status === "missing" ||
+                                    readiness.status === "invalid" ||
+                                    readiness.status === "failed"
+                                  ? "text-rose-400"
+                                  : readiness.status === "matching"
+                                    ? "text-violet-400"
+                                    : "text-amber-400"
+                            }`}
+                          >
+                            {readiness.status === "assigned"
+                              ? "Assigned"
+                              : readiness.status === "missing"
+                                ? "Missing in IndexedDB"
+                                : readiness.status === "invalid"
+                                  ? "Invalid Media"
+                                  : readiness.status === "matching"
+                                    ? "Restoring..."
+                                    : readiness.status === "failed"
+                                      ? "Import Failed"
+                                      : "Unassigned"}
+                          </span>
+
+                          {assignment && (
+                            <>
+                              <span className="text-zinc-600">·</span>
+                              <span className="text-[11px] text-zinc-400">
+                                {formatSourceOriginLabel(
+                                  assignment.mediaSource,
+                                  assignment.providerName
+                                )}
+                              </span>
+                            </>
+                          )}
+
+                          {assignment?.matchScore !== undefined && (
+                            <>
+                              <span className="text-zinc-600">·</span>
+                              <span className="font-mono text-[11px] text-violet-400 tabular-nums">
+                                {assignment.matchScore}% match
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {assignment ? (
+                        <div className="space-y-1">
+                          <p className="text-xs font-medium text-white truncate">
+                            {assignment.assetTitle}
+                          </p>
+                          <p className="text-[11px] font-mono text-zinc-400 tabular-nums">
+                            {assignedAsset?.width && assignedAsset?.height
+                              ? `${assignedAsset.width}×${assignedAsset.height}`
+                              : assignment.width && assignment.height
+                                ? `${assignment.width}×${assignment.height}`
+                                : "Dimensions pending"}
+                            {assignedAsset?.kind === "video"
+                              ? ` · Source ${formatTimecode(assignedAsset.duration)}`
+                              : ""}
+                          </p>
+                          {assignment.matchExplanation && (
+                            <p className="text-[11px] text-zinc-400 leading-snug">
+                              {assignment.matchExplanation}
+                            </p>
+                          )}
+                          {assignment.mediaSource === "stock" &&
+                            isSafeHttpsUrl(assignment.attributionUrl) && (
+                              <a
+                                href={assignment.attributionUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[11px] text-violet-300 hover:text-violet-200 underline"
+                              >
+                                <span>
+                                  {assignment.mediaType === "video" ? "Video" : "Photo"} by{" "}
+                                  {assignment.creatorName || "Contributor"} on Pexels
+                                </span>
+                                <ExternalLink className="h-3 w-3" />
+                              </a>
+                            )}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-zinc-400 leading-relaxed">
+                          No visual asset assigned yet. Pick from IndexedDB Library, import free
+                          Pexels stock media, upload a local file, or render a PNG text slide.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Per-Scene Framing & Trim Controls (when assigned) */}
+                  {assignment && readiness.isReady && (
+                    <div className="pt-2.5 border-t border-zinc-800/80 flex flex-wrap items-center gap-3 text-[11px]">
+                      <label className="inline-flex items-center gap-1.5 text-zinc-300">
+                        <span className="text-zinc-400">Framing:</span>
+                        <select
+                          aria-label={`Scene ${index + 1} aspect ratio framing`}
+                          value={assignment.aspectRatioHandling}
+                          onChange={(e) =>
+                            handleScenePatch(scene.id, {
+                              mediaAssignment: {
+                                ...assignment,
+                                aspectRatioHandling: e.target.value as AspectRatioHandlingMode,
+                              },
+                            })
+                          }
+                          className="rounded border border-zinc-800 bg-[#09090B] px-2 py-1 text-[11px] text-zinc-100 focus:border-violet-500 focus:outline-none"
+                        >
+                          <option value="fit">Fit (Preserve Frame)</option>
+                          <option value="fill">Fill (Crop to {storyboard.aspectRatio})</option>
+                          <option value="preserve">Preserve Source</option>
+                        </select>
+                      </label>
+
+                      {assignedAsset?.kind === "video" && (
+                        <label className="inline-flex items-center gap-1.5 text-zinc-300">
+                          <span className="text-zinc-400">Clip Start (s):</span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={Math.max(0, readiness.maxSourceStartTime)}
+                            step={0.1}
+                            aria-label={`Scene ${index + 1} source start time`}
+                            value={assignment.sourceStartTime}
+                            onChange={(e) => {
+                              const parsed = Number(e.target.value);
+                              if (!Number.isFinite(parsed)) return;
+                              const clamped = clampVideoSourceStartTime(
+                                parsed,
+                                scene.duration,
+                                assignedAsset.duration
+                              );
+                              handleScenePatch(scene.id, {
+                                mediaAssignment: {
+                                  ...assignment,
+                                  sourceStartTime: clamped,
+                                },
+                              });
+                            }}
+                            className="w-20 rounded border border-zinc-800 bg-[#09090B] px-2 py-1 text-[11px] font-mono text-zinc-100 tabular-nums focus:border-violet-500 focus:outline-none"
+                          />
+                        </label>
+                      )}
+
+                      {readiness.shorterThanScene &&
+                        assignedAsset?.kind === "video" &&
+                        assignedAsset.duration >= 0.5 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleScenePatch(scene.id, {
+                                duration: Number(
+                                  Math.max(0.5, Math.min(60, assignedAsset.duration)).toFixed(2)
+                                ),
+                                mediaAssignment: {
+                                  ...assignment,
+                                  sourceStartTime: 0,
+                                },
+                              })
+                            }
+                            className="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200 hover:bg-amber-500/20"
+                          >
+                            Match Scene Duration ({assignedAsset.duration.toFixed(1)}s)
+                          </button>
+                        )}
+                    </div>
+                  )}
+
+                  {/* Warnings */}
+                  {readiness.warnings.length > 0 && (
+                    <div
+                      className={`rounded-md border px-3 py-2 text-[11px] space-y-0.5 ${
+                        readiness.isMissing || readiness.isInvalid
+                          ? "border-rose-500/30 bg-rose-500/10 text-rose-200"
+                          : "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                      }`}
+                    >
+                      {readiness.warnings.map((w, wIdx) => (
+                        <p key={wIdx}>{w}</p>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Scene Media Action Buttons */}
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    {readiness.isMissing && assignment && onRelinkMissingSceneMedia && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          triggerSingleSceneFileUpload(
+                            scene.id,
+                            "relink",
+                            assignment.mediaAssetId
+                          )
+                        }
+                        className="inline-flex items-center gap-1 rounded-md bg-rose-600 hover:bg-rose-500 px-2.5 py-1 text-[11px] font-medium text-white"
+                      >
+                        <Upload className="h-3 w-3" />
+                        <span>Re-link File</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPickerState({ open: true, sceneId: scene.id, initialTab: "library" })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:text-white"
+                    >
+                      <FolderOpen className="h-3 w-3 text-emerald-400" />
+                      <span>{assignment ? "Replace From Library" : "Choose Library"}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPickerState({ open: true, sceneId: scene.id, initialTab: "stock" })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:text-white"
+                    >
+                      <Search className="h-3 w-3 text-violet-400" />
+                      <span>Free Stock</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => triggerSingleSceneFileUpload(scene.id, "upload")}
+                      className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:text-white"
+                    >
+                      <Upload className="h-3 w-3 text-blue-400" />
+                      <span>Upload File</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setSlideModalSceneId(scene.id)}
+                      className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:text-white"
+                    >
+                      <Type className="h-3 w-3 text-amber-400" />
+                      <span>Generate Slide</span>
+                    </button>
+
+                    {readiness.isReady && assignedAsset && (
+                      <button
+                        type="button"
+                        onClick={() => setPreviewTarget({ scene, asset: assignedAsset })}
+                        className="inline-flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 hover:text-white"
+                      >
+                        <Eye className="h-3 w-3 text-zinc-300" />
+                        <span>Preview</span>
+                      </button>
+                    )}
+
+                    {assignment && (
+                      <button
+                        type="button"
+                        onClick={() => handleClearSceneAssignment(scene.id)}
+                        className="inline-flex items-center gap-1 rounded-md border border-zinc-800 bg-[#09090B] px-2.5 py-1 text-[11px] text-zinc-400 hover:text-rose-300 hover:border-rose-500/40"
+                        title="Remove scene assignment without deleting file from IndexedDB"
+                      >
+                        <X className="h-3 w-3" />
+                        <span>Clear Slot</span>
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -675,6 +1181,111 @@ export function StoryboardReviewPanel({
           })}
         </div>
       </div>
+
+      {/* Library & Stock Picker Modal */}
+      <MediaPickerModal
+        open={pickerState.open}
+        initialTab={pickerState.initialTab}
+        scene={pickerScene}
+        aspectRatio={storyboard.aspectRatio}
+        mediaAssets={mediaAssets}
+        isAuthenticated={isAuthenticated}
+        onClose={() => setPickerState({ open: false, sceneId: null, initialTab: "library" })}
+        onSelectLibraryAsset={(asset, sceneId) => onSelectLibraryAsset?.(asset, sceneId)}
+        onUploadFilesForScene={async (files, sceneId) => {
+          await onUploadSceneFile?.(files, sceneId);
+        }}
+        onImportStockResult={async (item, sceneId, signal) => {
+          if (!onImportStockResult) {
+            return { ok: false, error: "Stock media import handler is unavailable." };
+          }
+          return onImportStockResult(item, sceneId, signal);
+        }}
+      />
+
+      {/* Local HTML5 Canvas Text Slide Generator Modal */}
+      <SlideGeneratorModal
+        open={Boolean(slideModalScene)}
+        scene={slideModalScene}
+        aspectRatio={storyboard.aspectRatio}
+        language={storyboard.language}
+        onClose={() => setSlideModalSceneId(null)}
+        onGenerateAndAssign={async (result) => {
+          await onGenerateAndAssignSlide?.(result);
+        }}
+      />
+
+      {/* On-Demand Single-Asset Media Preview Modal */}
+      {previewTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Scene Assigned Media Preview"
+        >
+          <div className="w-full max-w-3xl rounded-2xl border border-zinc-800 bg-[#111114] overflow-hidden shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  {previewTarget.scene.title} — {previewTarget.asset.name}
+                </p>
+                <p className="text-[11px] font-mono text-zinc-400 tabular-nums">
+                  {previewTarget.asset.kind.toUpperCase()}
+                  {previewTarget.asset.width && previewTarget.asset.height
+                    ? ` · ${previewTarget.asset.width}×${previewTarget.asset.height}`
+                    : ""}
+                  {previewTarget.asset.kind === "video"
+                    ? ` · ${formatTimecode(previewTarget.asset.duration)}`
+                    : ""}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewTarget(null)}
+                className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white"
+                aria-label="Close media preview"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="bg-black flex items-center justify-center min-h-[280px] max-h-[65vh] p-4">
+              {previewTarget.asset.kind === "video" ? (
+                <video
+                  src={previewTarget.asset.objectUrl}
+                  controls
+                  autoPlay
+                  className="max-h-[58vh] w-full rounded-lg"
+                />
+              ) : (
+                <img
+                  src={previewTarget.asset.objectUrl}
+                  alt={previewTarget.asset.name}
+                  className="max-h-[58vh] max-w-full object-contain rounded-lg"
+                />
+              )}
+            </div>
+
+            <div className="px-5 py-3.5 border-t border-zinc-800 flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
+              <div className="min-w-0">
+                {previewTarget.asset.creatorName && (
+                  <span>
+                    Creator: {previewTarget.asset.creatorName}
+                    {previewTarget.asset.licenseInfo ? ` · ${previewTarget.asset.licenseInfo}` : ""}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewTarget(null)}
+                className="rounded-lg border border-zinc-800 bg-zinc-900 px-3.5 py-1.5 text-xs font-medium text-zinc-200 hover:text-white"
+              >
+                Close Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

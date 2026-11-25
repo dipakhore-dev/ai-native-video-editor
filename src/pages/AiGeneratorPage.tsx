@@ -21,11 +21,15 @@ import {
   deleteServerStoryboardDraft,
   fetchServerStoryboardDrafts,
   generateAiStoryboard,
+  importStockMediaApi,
   updateServerStoryboardDraft,
   type ServerStoryboardDraftDto,
+  type StockSearchItemDto,
 } from "../services/api";
 import type {
   AspectRatioOption,
+  GeneratedSlideConfig,
+  MediaAsset,
   StoryboardCaptionPreference,
   StoryboardDraftRecord,
   StoryboardGenerationStatus,
@@ -37,6 +41,7 @@ import type {
   VideoGeneratorMode,
   VideoStoryboard,
 } from "../types/studio";
+import { detectMediaKind } from "../utils/media";
 import {
   CAPTION_PREFERENCE_OPTIONS,
   clearLocalStoryboardDraft,
@@ -50,9 +55,23 @@ import {
   validateStoryboardInvariants,
   VOICEOVER_PREFERENCE_OPTIONS,
 } from "../utils/storyboard";
+import {
+  autoMatchStoryboardScenes,
+  computeStoryboardMediaSummary,
+  createAssignmentFromAsset,
+} from "../utils/storyboardMedia";
 
 export function AiGeneratorPage() {
-  const { isAuthenticated, sessionUser, integrations, navigate } = useStudio();
+  const {
+    isAuthenticated,
+    sessionUser,
+    integrations,
+    navigate,
+    mediaAssets,
+    idbHydrating,
+    importMediaFileWithMetadata,
+    relinkMissingClipAsset,
+  } = useStudio();
 
   const [mode, setMode] = useState<VideoGeneratorMode>("prompt-to-video");
   const [title, setTitle] = useState("");
@@ -88,17 +107,23 @@ export function AiGeneratorPage() {
   const [savingDraft, setSavingDraft] = useState(false);
   const [saveStatusMessage, setSaveStatusMessage] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [mediaPrepActive, setMediaPrepActive] = useState(false);
+  const [mediaPrepStatusMessage, setMediaPrepStatusMessage] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const mediaPrepAbortRef = useRef<AbortController | null>(null);
+  const storyboardRef = useRef<VideoStoryboard | null>(storyboard);
+  storyboardRef.current = storyboard;
   const inFlightRef = useRef(false);
   const draftScopeKey = sessionUser.id || "local";
 
   const geminiConfigured = integrations?.aiAssistant?.connected ?? true;
 
-  // Cleanup active request abort controller on unmount
+  // Cleanup active request abort controllers on unmount
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
+      mediaPrepAbortRef.current?.abort();
     };
   }, []);
 
@@ -144,20 +169,353 @@ export function AiGeneratorPage() {
   // Keep isolated local draft synced whenever user edits an existing storyboard
   const handleStoryboardChange = useCallback(
     (next: VideoStoryboard) => {
-      setStoryboard(next);
+      const withSummary: VideoStoryboard = {
+        ...next,
+        mediaReadinessSummary: computeStoryboardMediaSummary(next, mediaAssets, !idbHydrating),
+      };
+      storyboardRef.current = withSummary;
+      setStoryboard(withSummary);
       setSaveStatusMessage(null);
       setSaveError(null);
       const record: StoryboardDraftRecord = {
-        id: next.id,
+        id: withSummary.id,
         ...(activeServerDraftId ? { serverDraftId: activeServerDraftId } : {}),
-        title: next.title,
-        status: validateStoryboardInvariants(next).valid ? "validated" : "draft",
-        storyboard: next,
+        title: withSummary.title,
+        status: validateStoryboardInvariants(withSummary).valid ? "validated" : "draft",
+        storyboard: withSummary,
         savedAt: new Date().toISOString(),
       };
       saveLocalStoryboardDraft(record, draftScopeKey);
     },
-    [activeServerDraftId, draftScopeKey]
+    [activeServerDraftId, draftScopeKey, idbHydrating, mediaAssets]
+  );
+
+  const handleCancelMediaPrep = useCallback(() => {
+    mediaPrepAbortRef.current?.abort();
+    mediaPrepAbortRef.current = null;
+    setMediaPrepActive(false);
+    setMediaPrepStatusMessage("Media preparation cancelled. Existing assignments remain intact.");
+  }, []);
+
+  const handleAutoMatchMedia = useCallback(
+    ({ overwriteManual }: { overwriteManual: boolean }) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      mediaPrepAbortRef.current?.abort();
+      const controller = new AbortController();
+      mediaPrepAbortRef.current = controller;
+      setMediaPrepActive(true);
+      setMediaPrepStatusMessage(null);
+
+      try {
+        const visualCount = mediaAssets.filter(
+          (a) => a.kind === "video" || a.kind === "image"
+        ).length;
+        if (visualCount === 0) {
+          setMediaPrepStatusMessage(
+            "No local video or image assets exist in IndexedDB yet. Upload files, search free Pexels stock, or render text slides."
+          );
+          return;
+        }
+
+        const result = autoMatchStoryboardScenes(current, mediaAssets, {
+          overwriteManual,
+          avoidDuplicates: true,
+          minScore: 24,
+          signal: controller.signal,
+        });
+
+        if (result.cancelled) {
+          setMediaPrepStatusMessage("Auto-matching cancelled.");
+          return;
+        }
+
+        handleStoryboardChange(result.storyboard);
+        setMediaPrepStatusMessage(
+          `Auto-matched ${result.matchedCount} scene(s) from IndexedDB filenames and metadata` +
+            (result.skippedCount > 0 ? ` (${result.skippedCount} already assigned preserved)` : "") +
+            (result.unmatchedSceneIds.length > 0
+              ? `. ${result.unmatchedSceneIds.length} scene(s) left unassigned — upload media, search Pexels stock, or generate a text slide.`
+              : ".")
+        );
+      } finally {
+        setMediaPrepActive(false);
+        if (mediaPrepAbortRef.current === controller) {
+          mediaPrepAbortRef.current = null;
+        }
+      }
+    },
+    [handleStoryboardChange, mediaAssets]
+  );
+
+  const handleSelectLibraryAsset = useCallback(
+    (asset: MediaAsset, sceneId: string) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene) return;
+      const assignment = createAssignmentFromAsset(targetScene, asset, current.aspectRatio);
+      const nextScenes = current.scenes.map((s) =>
+        s.id === sceneId ? { ...s, mediaAssignment: assignment } : s
+      );
+      handleStoryboardChange({
+        ...current,
+        scenes: nextScenes,
+        updatedAt: new Date().toISOString(),
+      });
+      setMediaPrepStatusMessage(`Assigned "${asset.name}" to "${targetScene.title}".`);
+    },
+    [handleStoryboardChange]
+  );
+
+  const handleUploadSceneFile = useCallback(
+    async (files: FileList, sceneId: string) => {
+      const file = files[0];
+      if (!file) return;
+      const kind = detectMediaKind(file);
+      if (kind !== "video" && kind !== "image") {
+        setMediaPrepStatusMessage(
+          `Cannot assign '${file.name}' (${kind || "unsupported"}): scene visual slots accept video or image files only.`
+        );
+        return;
+      }
+
+      setMediaPrepActive(true);
+      setMediaPrepStatusMessage(null);
+      try {
+        const asset = await importMediaFileWithMetadata(
+          file,
+          { sourceOrigin: "uploaded" },
+          { reuseDuplicate: true }
+        );
+        if (!asset) return;
+        const latest = storyboardRef.current;
+        const scene = latest?.scenes.find((s) => s.id === sceneId);
+        if (!latest || !scene) return;
+        const assignment = createAssignmentFromAsset(scene, asset, latest.aspectRatio, {
+          mediaSource: "uploaded",
+        });
+        handleStoryboardChange({
+          ...latest,
+          scenes: latest.scenes.map((s) =>
+            s.id === sceneId ? { ...s, mediaAssignment: assignment } : s
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+        setMediaPrepStatusMessage(`Imported "${asset.name}" to IndexedDB and assigned to "${scene.title}".`);
+      } finally {
+        setMediaPrepActive(false);
+      }
+    },
+    [handleStoryboardChange, importMediaFileWithMetadata]
+  );
+
+  const handleUploadBatchMedia = useCallback(
+    async (files: FileList) => {
+      const current = storyboardRef.current;
+      if (!current || files.length === 0) return;
+      mediaPrepAbortRef.current?.abort();
+      const controller = new AbortController();
+      mediaPrepAbortRef.current = controller;
+
+      setMediaPrepActive(true);
+      setMediaPrepStatusMessage(null);
+      const imported: MediaAsset[] = [];
+      let skippedAudio = 0;
+
+      try {
+        for (const file of Array.from(files)) {
+          if (controller.signal.aborted) break;
+          const kind = detectMediaKind(file);
+          if (kind !== "video" && kind !== "image") {
+            skippedAudio += 1;
+            continue;
+          }
+          const asset = await importMediaFileWithMetadata(
+            file,
+            { sourceOrigin: "uploaded" },
+            { reuseDuplicate: true }
+          );
+          if (asset) {
+            imported.push(asset);
+          }
+        }
+
+        if (controller.signal.aborted) {
+          setMediaPrepStatusMessage("Batch upload cancelled.");
+          return;
+        }
+
+        const latest = storyboardRef.current ?? current;
+        const mergedPoolMap = new Map<string, MediaAsset>();
+        for (const a of [...imported, ...mediaAssets]) {
+          mergedPoolMap.set(a.id, a);
+        }
+        const matchResult = autoMatchStoryboardScenes(latest, Array.from(mergedPoolMap.values()), {
+          overwriteManual: false,
+          avoidDuplicates: true,
+          minScore: 24,
+          signal: controller.signal,
+        });
+        handleStoryboardChange(matchResult.storyboard);
+        setMediaPrepStatusMessage(
+          `Saved ${imported.length} visual file(s) to IndexedDB and matched ${matchResult.matchedCount} unassigned scene(s).` +
+            (skippedAudio > 0
+              ? ` Skipped ${skippedAudio} audio/unsupported file(s) from visual slots.`
+              : "")
+        );
+      } finally {
+        setMediaPrepActive(false);
+        if (mediaPrepAbortRef.current === controller) {
+          mediaPrepAbortRef.current = null;
+        }
+      }
+    },
+    [handleStoryboardChange, importMediaFileWithMetadata, mediaAssets]
+  );
+
+  const handleImportStockResult = useCallback(
+    async (
+      item: StockSearchItemDto,
+      sceneId: string,
+      signal: AbortSignal
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const res = await importStockMediaApi(
+        {
+          provider: "pexels",
+          providerAssetId: item.providerAssetId,
+          mediaType: item.mediaType,
+        },
+        { signal }
+      );
+      if (res.cancelled) {
+        return { ok: false, error: "Stock media download was cancelled." };
+      }
+      if (!res.ok || !res.data) {
+        return { ok: false, error: res.error || "Failed to import stock media." };
+      }
+
+      const asset = await importMediaFileWithMetadata(
+        res.data.file,
+        {
+          sourceOrigin: "stock",
+          providerName: res.data.providerName,
+          providerAssetId: res.data.providerAssetId,
+          creatorName: res.data.creatorName,
+          attributionUrl: res.data.attributionUrl,
+          licenseInfo: res.data.licenseInfo,
+          sourceUrl: res.data.sourceUrl,
+          tags: [item.title],
+        },
+        { reuseDuplicate: true }
+      );
+
+      if (!asset) {
+        return {
+          ok: false,
+          error: "Downloaded stock media could not be stored inside browser IndexedDB.",
+        };
+      }
+
+      const latest = storyboardRef.current;
+      const scene = latest?.scenes.find((s) => s.id === sceneId);
+      if (latest && scene) {
+        const assignment = createAssignmentFromAsset(scene, asset, latest.aspectRatio, {
+          mediaSource: "stock",
+        });
+        handleStoryboardChange({
+          ...latest,
+          scenes: latest.scenes.map((s) =>
+            s.id === sceneId ? { ...s, mediaAssignment: assignment } : s
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+        setMediaPrepStatusMessage(
+          `Imported stock ${item.mediaType} by ${res.data.creatorName || "contributor"} to IndexedDB and assigned to "${scene.title}".`
+        );
+      }
+      return { ok: true };
+    },
+    [handleStoryboardChange, importMediaFileWithMetadata]
+  );
+
+  const handleGenerateAndAssignSlide = useCallback(
+    async (result: { file: File; config: GeneratedSlideConfig; sceneId: string }) => {
+      const asset = await importMediaFileWithMetadata(
+        result.file,
+        {
+          sourceOrigin: "generated_slide",
+          generatedSlideConfig: result.config,
+          tags: [result.config.headingText, result.config.template, result.config.language],
+          description: result.config.bodyText || undefined,
+        },
+        { reuseDuplicate: false }
+      );
+      if (!asset) return;
+
+      const latest = storyboardRef.current;
+      const scene = latest?.scenes.find((s) => s.id === result.sceneId);
+      if (!latest || !scene) return;
+      const assignment = createAssignmentFromAsset(scene, asset, latest.aspectRatio, {
+        mediaSource: "generated_slide",
+      });
+      handleStoryboardChange({
+        ...latest,
+        scenes: latest.scenes.map((s) =>
+          s.id === result.sceneId ? { ...s, mediaAssignment: assignment } : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+      setMediaPrepStatusMessage(`Generated PNG text slide saved to IndexedDB for "${scene.title}".`);
+    },
+    [handleStoryboardChange, importMediaFileWithMetadata]
+  );
+
+  const handleRelinkMissingSceneMedia = useCallback(
+    async (assetId: string, file: File, sceneId: string) => {
+      const kind = detectMediaKind(file);
+      if (kind !== "video" && kind !== "image") {
+        setMediaPrepStatusMessage(
+          `Selected file '${file.name}' is ${kind || "unsupported"}; pick a video or image file to re-link this scene.`
+        );
+        return;
+      }
+
+      setMediaPrepActive(true);
+      try {
+        const res = await relinkMissingClipAsset(assetId, file);
+        if (!res.ok) {
+          setMediaPrepStatusMessage(res.error || "Failed to re-link local media file.");
+          return;
+        }
+        const latest = storyboardRef.current;
+        const scene = latest?.scenes.find((s) => s.id === sceneId);
+        if (latest && scene && scene.mediaAssignment) {
+          handleStoryboardChange({
+            ...latest,
+            scenes: latest.scenes.map((s) =>
+              s.id === sceneId
+                ? {
+                    ...s,
+                    mediaAssignment: {
+                      ...s.mediaAssignment!,
+                      assetTitle: file.name,
+                      mimeType: file.type || s.mediaAssignment!.mimeType,
+                      assignmentStatus: "assigned",
+                      assignedAt: new Date().toISOString(),
+                    },
+                  }
+                : s
+            ),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        setMediaPrepStatusMessage(`Re-linked '${file.name}' into IndexedDB cleanly.`);
+      } finally {
+        setMediaPrepActive(false);
+      }
+    },
+    [handleStoryboardChange, relinkMissingClipAsset]
   );
 
   const clientValidation = useMemo(() => {
@@ -366,31 +724,35 @@ export function AiGeneratorPage() {
       return;
     }
 
+    const summary = computeStoryboardMediaSummary(storyboard, mediaAssets, !idbHydrating);
+    const updatedStoryboard: VideoStoryboard = {
+      ...storyboard,
+      mediaReadinessSummary: summary,
+      updatedAt: new Date().toISOString(),
+    };
+
     setSavingDraft(true);
     const localRecord: StoryboardDraftRecord = {
-      id: storyboard.id,
+      id: updatedStoryboard.id,
       ...(activeServerDraftId ? { serverDraftId: activeServerDraftId } : {}),
-      title: storyboard.title,
-      status: "validated",
-      storyboard: {
-        ...storyboard,
-        updatedAt: new Date().toISOString(),
-      },
-      savedAt: new Date().toISOString(),
+      title: updatedStoryboard.title,
+      status: summary.isMediaReady ? "validated" : "draft",
+      storyboard: updatedStoryboard,
+      savedAt: updatedStoryboard.updatedAt,
     };
     saveLocalStoryboardDraft(localRecord, draftScopeKey);
 
     if (!isAuthenticated) {
       setSavingDraft(false);
       setSaveStatusMessage(
-        "Storyboard draft saved to local browser storage (sign in to sync drafts to MongoDB)."
+        "Storyboard draft and media assignments saved to local browser storage (sign in to sync metadata to MongoDB)."
       );
       return;
     }
 
     const res = activeServerDraftId
-      ? await updateServerStoryboardDraft(activeServerDraftId, localRecord.storyboard, "validated")
-      : await createServerStoryboardDraft(localRecord.storyboard, "validated");
+      ? await updateServerStoryboardDraft(activeServerDraftId, localRecord.storyboard, localRecord.status)
+      : await createServerStoryboardDraft(localRecord.storyboard, localRecord.status);
 
     setSavingDraft(false);
 
@@ -413,17 +775,27 @@ export function AiGeneratorPage() {
         draftScopeKey
       );
     }
-    setSaveStatusMessage("Storyboard draft saved to your account and restored across refreshes.");
+    setSaveStatusMessage(
+      summary.missingOrInvalidCount > 0
+        ? "Storyboard draft saved, though some scenes reference missing IndexedDB media."
+        : "Storyboard draft and scene media assignments saved and restored across refreshes."
+    );
     void loadServerDrafts();
   };
 
   const handleLoadDraftFromServer = (draft: ServerStoryboardDraftDto) => {
     const serverId = String(draft._id || draft.id || "");
+    const summary = computeStoryboardMediaSummary(draft.storyboard, mediaAssets, !idbHydrating);
     setStoryboard(draft.storyboard);
     setActiveServerDraftId(serverId || null);
     setGenerationStatus("ready");
     setErrorBanner(null);
     setSaveError(null);
+    setMediaPrepStatusMessage(
+      summary.missingOrInvalidCount > 0
+        ? `${summary.missingOrInvalidCount} scene(s) in "${draft.title}" reference missing IndexedDB media on this browser — use Re-link File or Replace.`
+        : null
+    );
     setSaveStatusMessage(`Loaded saved draft "${draft.title}".`);
     saveLocalStoryboardDraft(
       {
@@ -467,8 +839,8 @@ export function AiGeneratorPage() {
               AI Script &amp; Storyboard Generator
             </h1>
             <p className="mt-1 text-sm text-zinc-400 max-w-3xl">
-              Plan structured video scripts, scene timing, captions, and editor-compatible visual
-              effects using Gemini. Final MP4 composition from storyboards arrives in Phase 5.5.2.
+              Plan structured video scripts, match scene visual media, render local text slides, and
+              prepare drafts for Phase 5.5.3 FFmpeg composition.
             </p>
           </div>
 
@@ -808,7 +1180,7 @@ export function AiGeneratorPage() {
                       ))}
                     </select>
                     <p className="text-[11px] text-zinc-500">
-                      Controls caption formatting metadata for Phase 5.5.2.
+                      Controls caption formatting metadata for Phase 5.5.3.
                     </p>
                   </div>
                 </div>
@@ -951,6 +1323,18 @@ export function AiGeneratorPage() {
                 saveError={saveError}
                 regenerating={generationStatus === "generating"}
                 isAuthenticated={isAuthenticated}
+                mediaAssets={mediaAssets}
+                idbHydrating={idbHydrating}
+                mediaPrepActive={mediaPrepActive}
+                mediaPrepStatusMessage={mediaPrepStatusMessage}
+                onAutoMatchMedia={handleAutoMatchMedia}
+                onUploadBatchMedia={handleUploadBatchMedia}
+                onUploadSceneFile={handleUploadSceneFile}
+                onSelectLibraryAsset={handleSelectLibraryAsset}
+                onImportStockResult={handleImportStockResult}
+                onGenerateAndAssignSlide={handleGenerateAndAssignSlide}
+                onRelinkMissingSceneMedia={handleRelinkMissingSceneMedia}
+                onCancelMediaPrep={handleCancelMediaPrep}
               />
             ) : (
               generationStatus !== "generating" && (
@@ -968,8 +1352,9 @@ export function AiGeneratorPage() {
                     </h2>
                     <p className="text-xs text-zinc-400 leading-relaxed">
                       Enter a prompt or existing narration script on the left and select target
-                      duration, aspect ratio, style, and language. You will be able to edit every
-                      scene and save drafts before moving to timeline composition in Phase 5.5.2.
+                      duration, aspect ratio, style, and language. Next you can auto-match local
+                      IndexedDB media, import free stock, or generate PNG text slides before Phase
+                      5.5.3 FFmpeg timeline composition.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[11px] text-zinc-500">

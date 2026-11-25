@@ -17,6 +17,8 @@ import { mediaRouter } from "./media.routes.ts";
 import { aiRouter } from "./ai.routes.ts";
 import { exportRouter } from "./export.routes.ts";
 import { videoProcessingRouter } from "./videoProcessing.routes.ts";
+import { stockMediaRouter } from "./stockMedia.routes.ts";
+import { getStockMediaStatus } from "../services/stockMedia.service.ts";
 
 export const apiRouter = Router();
 
@@ -70,6 +72,7 @@ apiRouter.get("/integrations/status", async (_req, res) => {
   const videoGenReady = isVideoGenProviderConfigured();
   const queueStatus = getVideoQueueStatus();
   const processorHealth = await checkVideoProcessorHealth();
+  const stockStatus = getStockMediaStatus();
 
   res.json({
     integrations: {
@@ -188,6 +191,18 @@ apiRouter.get("/integrations/status", async (_req, res) => {
             ? "User registration, bcrypt password hashing, and HTTP-only JWT cookie authentication are active."
             : "Auth routes, bcrypt hashing, and HTTP-only cookie middleware are ready once MONGODB_URI and JWT_SECRET are set.",
       },
+      stockMedia: {
+        id: "stockMedia",
+        label: "Free Stock Media Provider",
+        connected: stockStatus.enabled,
+        provider: stockStatus.enabled
+          ? "Pexels Free Stock API (Active Proxy)"
+          : stockStatus.provider === "pexels"
+            ? "Pexels (Set PEXELS_API_KEY)"
+            : "Optional (Set STOCK_MEDIA_PROVIDER=pexels)",
+        endpoint: "POST /api/stock-media/search",
+        summary: stockStatus.message,
+      },
     },
     checkedAt: new Date().toISOString(),
   });
@@ -199,3 +214,4 @@ apiRouter.use("/media", mediaRouter);
 apiRouter.use("/ai", aiRouter);
 apiRouter.use("/exports", exportRouter);
 apiRouter.use("/video", videoProcessingRouter);
+apiRouter.use("/stock-media", stockMediaRouter);

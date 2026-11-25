@@ -1,5 +1,6 @@
 import type {
   IntegrationStatusMap,
+  MediaSourceOrigin,
   Project,
   RenderTimelinePayload,
   SubtitleMetadata,
@@ -333,6 +334,192 @@ export async function deleteServerStoryboardDraft(
   return requestJson(`/api/ai/storyboards/${encodeURIComponent(draftId)}`, {
     method: "DELETE",
   });
+}
+
+export interface StockMediaStatusDto {
+  enabled: boolean;
+  configured: boolean;
+  provider: "none" | "pexels";
+  maxResults: number;
+  maxImportMb: number;
+  message: string;
+}
+
+export interface StockSearchItemDto {
+  providerName: "pexels";
+  providerAssetId: string;
+  mediaType: "image" | "video";
+  title: string;
+  previewImageUrl: string;
+  width: number;
+  height: number;
+  duration?: number;
+  creatorName: string;
+  attributionUrl: string;
+  licenseInfo: string;
+  suggestedFilename: string;
+}
+
+export interface StockImportedFileResult {
+  file: File;
+  providerName: "pexels";
+  providerAssetId: string;
+  mediaType: "image" | "video";
+  title: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  creatorName: string;
+  attributionUrl: string;
+  licenseInfo: string;
+  sourceUrl: string;
+}
+
+export async function fetchStockMediaStatus(): Promise<
+  ApiResult<{ status: string; stockMedia: StockMediaStatusDto }>
+> {
+  return requestJson("/api/stock-media/status");
+}
+
+export async function searchStockMediaApi(
+  payload: {
+    query: string;
+    mediaType: "image" | "video";
+    aspectRatio?: "16:9" | "9:16" | "1:1";
+    page?: number;
+    perPage?: number;
+  },
+  options?: { signal?: AbortSignal }
+): Promise<ApiResult<{ status: string; provider: "pexels"; items: StockSearchItemDto[] }>> {
+  return requestJson("/api/stock-media/search", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    signal: options?.signal,
+  });
+}
+
+export async function importStockMediaApi(
+  payload: {
+    provider: "pexels";
+    providerAssetId: string;
+    mediaType: "image" | "video";
+  },
+  options?: { signal?: AbortSignal }
+): Promise<ApiResult<StockImportedFileResult>> {
+  try {
+    const res = await fetch("/api/stock-media/import", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Requested-With": "AIStudioClient",
+      },
+      body: JSON.stringify(payload),
+      signal: options?.signal,
+    });
+
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+        integrationPoint?: string;
+      };
+      if (res.status === 401) {
+        sessionExpiredHandler?.();
+      }
+      return {
+        ok: false,
+        status: res.status,
+        error: errBody.error || errBody.message || `Stock media import failed (${res.status}).`,
+        integrationPoint: errBody.integrationPoint,
+      };
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      return {
+        ok: false,
+        status: 502,
+        error: "Server returned an empty stock media file.",
+      };
+    }
+
+    const disposition = res.headers.get("content-disposition") || "";
+    const match = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename =
+      match?.[1] ||
+      (payload.mediaType === "video"
+        ? `pexels_video_${payload.providerAssetId}.mp4`
+        : `pexels_photo_${payload.providerAssetId}.jpg`);
+
+    const mimeType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() ||
+      blob.type ||
+      (payload.mediaType === "video" ? "video/mp4" : "image/jpeg");
+
+    const file = new File([blob], filename, { type: mimeType });
+    const decodeHeader = (raw: string | null, fallback: string) => {
+      if (!raw) return fallback;
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    };
+
+    const rawWidth = Number(res.headers.get("x-stock-width"));
+    const rawHeight = Number(res.headers.get("x-stock-height"));
+    const rawDuration = Number(res.headers.get("x-stock-duration"));
+    const attributionUrl = res.headers.get("x-stock-attribution-url") || "";
+
+    return {
+      ok: true,
+      status: res.status,
+      data: {
+        file,
+        providerName: "pexels",
+        providerAssetId:
+          res.headers.get("x-stock-asset-id") || payload.providerAssetId,
+        mediaType: payload.mediaType,
+        title: decodeHeader(res.headers.get("x-stock-title"), filename),
+        ...(Number.isFinite(rawWidth) && rawWidth > 0 ? { width: rawWidth } : {}),
+        ...(Number.isFinite(rawHeight) && rawHeight > 0 ? { height: rawHeight } : {}),
+        ...(Number.isFinite(rawDuration) && rawDuration > 0
+          ? { duration: rawDuration }
+          : {}),
+        creatorName: decodeHeader(
+          res.headers.get("x-stock-creator"),
+          "Pexels Contributor"
+        ),
+        attributionUrl,
+        licenseInfo: decodeHeader(
+          res.headers.get("x-stock-license"),
+          "Pexels Free License"
+        ),
+        sourceUrl: attributionUrl,
+      },
+    };
+  } catch (err) {
+    const isAborted =
+      Boolean(options?.signal?.aborted) ||
+      (err instanceof Error && err.name === "AbortError");
+    if (isAborted) {
+      return {
+        ok: false,
+        status: 499,
+        cancelled: true,
+        error: "Stock media import cancelled.",
+      };
+    }
+    return {
+      ok: false,
+      status: 0,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Network error importing stock media.",
+    };
+  }
 }
 
 export async function submitExportJob(payload: {
@@ -931,6 +1118,15 @@ export interface ServerMediaAssetDto {
   height?: number;
   storageProvider: "local_browser" | "s3" | "gcs";
   storageKey?: string;
+  tags?: string[];
+  description?: string;
+  sourceOrigin?: MediaSourceOrigin;
+  providerName?: string;
+  providerAssetId?: string;
+  sourceUrl?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -952,10 +1148,33 @@ export async function createServerMediaMetadata(payload: {
   height?: number;
   storageProvider: "local_browser";
   storageKey: string;
+  tags?: string[];
+  description?: string;
+  sourceOrigin?: MediaSourceOrigin;
+  providerName?: string;
+  providerAssetId?: string;
+  sourceUrl?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
 }): Promise<ApiResult<{ status: string; asset: ServerMediaAssetDto }>> {
   return requestJson("/api/media", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function updateServerMediaMetadata(
+  mediaId: string,
+  updates: {
+    name?: string;
+    tags?: string[];
+    description?: string;
+  }
+): Promise<ApiResult<{ status: string; asset: ServerMediaAssetDto }>> {
+  return requestJson(`/api/media/${encodeURIComponent(mediaId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates),
   });
 }
 

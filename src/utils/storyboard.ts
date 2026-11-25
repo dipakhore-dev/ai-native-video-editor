@@ -201,6 +201,67 @@ export type ValidatedStoryboardInput = z.infer<typeof StoryboardGenerationInputS
   mode: StoryboardSourceMode;
 };
 
+const NonBlobUrlString = z
+  .string()
+  .trim()
+  .max(1000)
+  .refine((val) => val === "" || !/^blob:/i.test(val), {
+    message: "Temporary blob URLs cannot be saved permanently inside storyboard assignments.",
+  });
+
+export const SceneAssignedMediaTypeEnum = z.enum(["image", "video", "generated_slide"]);
+export const SceneMediaSourceEnum = z.enum([
+  "uploaded",
+  "existing_library",
+  "stock",
+  "generated_slide",
+]);
+export const SceneMediaAssignmentStatusEnum = z.enum([
+  "unassigned",
+  "matching",
+  "assigned",
+  "missing",
+  "invalid",
+  "failed",
+]);
+export const AspectRatioHandlingModeEnum = z.enum(["preserve", "fit", "fill"]);
+
+export const StoryboardSceneMediaAssignmentSchema = z.object({
+  sceneId: z.string().trim().min(1).max(64),
+  mediaAssetId: z.string().trim().min(1).max(160),
+  mediaType: SceneAssignedMediaTypeEnum,
+  mediaSource: SceneMediaSourceEnum,
+  assetTitle: z.string().trim().min(1).max(255),
+  mimeType: z.string().trim().min(1).max(120),
+  width: z.number().int().positive().max(16384).optional(),
+  height: z.number().int().positive().max(16384).optional(),
+  duration: z.number().finite().min(0).max(86_400).optional(),
+  thumbnailRef: NonBlobUrlString.optional(),
+  sourceUrl: NonBlobUrlString.optional(),
+  providerName: z.string().trim().max(80).optional(),
+  providerAssetId: z.string().trim().max(120).optional(),
+  creatorName: z.string().trim().max(160).optional(),
+  attributionUrl: NonBlobUrlString.optional(),
+  licenseInfo: z.string().trim().max(200).optional(),
+  matchScore: z.number().finite().min(0).max(100).optional(),
+  matchExplanation: z.string().trim().max(320).optional(),
+  assignmentStatus: SceneMediaAssignmentStatusEnum,
+  sourceStartTime: z.number().finite().min(0).max(86_400).default(0),
+  aspectRatioHandling: AspectRatioHandlingModeEnum.default("fit"),
+  assignedAt: z.string().trim().min(1).max(64),
+});
+
+export const StoryboardMediaSummarySchema = z.object({
+  totalScenes: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  assignedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  unassignedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  missingOrInvalidCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  readyCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  progressPercent: z.number().min(0).max(100),
+  overallStatus: SceneMediaAssignmentStatusEnum,
+  isMediaReady: z.boolean(),
+});
+
 export const StoryboardSceneSchema = z.object({
   id: z
     .string()
@@ -230,6 +291,7 @@ export const StoryboardSceneSchema = z.object({
   transition: TransitionTypeEnum,
   effect: EffectPresetEnum,
   cameraMotion: StoryboardCameraMotionEnum,
+  mediaAssignment: StoryboardSceneMediaAssignmentSchema.optional(),
 });
 
 export const AiStoryboardOutputSchema = z.object({
@@ -280,6 +342,7 @@ export const VideoStoryboardSchema = z.object({
   sourceMode: z.enum(["prompt-to-video", "script-to-video"]),
   model: z.string().trim().max(80).optional(),
   compositionReady: z.literal(false),
+  mediaReadinessSummary: StoryboardMediaSummarySchema.optional(),
   createdAt: z.string().trim().max(64),
   updatedAt: z.string().trim().max(64),
 });
@@ -583,6 +646,32 @@ function getLocalStorageDraftKey(scopeKey = "local"): string {
   return `${LOCAL_STORYBOARD_DRAFT_STORAGE_KEY}:${safeScope}`;
 }
 
+export function sanitizeStoryboardForPersistence(storyboard: VideoStoryboard): VideoStoryboard {
+  return {
+    ...storyboard,
+    scenes: storyboard.scenes.map((scene) => {
+      if (!scene.mediaAssignment) return scene;
+      const a = scene.mediaAssignment;
+      return {
+        ...scene,
+        mediaAssignment: {
+          ...a,
+          sceneId: scene.id,
+          ...(a.thumbnailRef && !/^blob:/i.test(a.thumbnailRef)
+            ? { thumbnailRef: a.thumbnailRef }
+            : { thumbnailRef: undefined }),
+          ...(a.sourceUrl && !/^blob:/i.test(a.sourceUrl)
+            ? { sourceUrl: a.sourceUrl }
+            : { sourceUrl: undefined }),
+          ...(a.attributionUrl && !/^blob:/i.test(a.attributionUrl)
+            ? { attributionUrl: a.attributionUrl }
+            : { attributionUrl: undefined }),
+        },
+      };
+    }),
+  };
+}
+
 export function saveLocalStoryboardDraft(
   draft: StoryboardDraftRecord,
   scopeKey = "local"
@@ -592,7 +681,11 @@ export function saveLocalStoryboardDraft(
   }
   try {
     const key = getLocalStorageDraftKey(scopeKey);
-    window.localStorage.setItem(key, JSON.stringify(draft));
+    const sanitizedDraft: StoryboardDraftRecord = {
+      ...draft,
+      storyboard: sanitizeStoryboardForPersistence(draft.storyboard),
+    };
+    window.localStorage.setItem(key, JSON.stringify(sanitizedDraft));
     return true;
   } catch {
     return false;
@@ -635,4 +728,26 @@ export function clearLocalStoryboardDraft(scopeKey = "local"): void {
   } catch {
     // Ignore storage removal errors
   }
+}
+
+export function loadAllLocalStoryboardDrafts(): StoryboardDraftRecord[] {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+  const results: StoryboardDraftRecord[] = [];
+  try {
+    const prefix = `${LOCAL_STORYBOARD_DRAFT_STORAGE_KEY}:`;
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(prefix)) continue;
+      const scope = key.slice(prefix.length);
+      const draft = loadLocalStoryboardDraft(scope);
+      if (draft) {
+        results.push(draft);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return results;
 }

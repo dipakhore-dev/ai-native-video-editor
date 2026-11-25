@@ -80,12 +80,20 @@ VIDEO_PROCESSOR_URL="http://127.0.0.1:8001"
 VIDEO_PROCESSOR_API_KEY="local-dev-processor-key"
 VIDEO_UPLOAD_MAX_MB="500"
 
+# Optional Free Stock Media Search (default: disabled / local uploads + slides)
+STOCK_MEDIA_PROVIDER="none"
+PEXELS_API_KEY=""
+STOCK_MEDIA_MAX_RESULTS="15"
+STOCK_MEDIA_MAX_IMPORT_MB="80"
+
 # Leave empty — Redis is not required for synchronous local processing
 REDIS_URL=""
 
 # Leave empty — Paid Text-to-Video stays disabled
 VIDEO_GEN_PROVIDER_URL=""
 ```
+
+*(Note: Keep real API keys in `.env` only—`.env.example` contains safe placeholders and is tracked cleanly in Git while `.env` remains gitignored.)*
 
 ---
 
@@ -163,11 +171,21 @@ python -m unittest discover -s video-processor/tests -t video-processor -v
 
 ---
 
-## Bengali (বাংলা) Subtitles & Windows Font Setup
+## Hindi, Bengali (বাংলা) Slides & Windows Font Setup
 
-- **Multilingual Model**: Bengali (`bn`) requires a multilingual `faster-whisper` model (`small`, `medium`, or `base`—never `*.en`). The default `WHISPER_MODEL_SIZE="small"` runs on CPU (`int8`) at ₹0 cost.
-- **Built-in Windows Font (`Nirmala UI`)**: Windows 10 and Windows 11 include **Nirmala UI** (`C:\Windows\Fonts\Nirmala.ttf`), which supports Bengali Unicode (`বাংলা`) glyphs. When Bengali text is present during MP4 subtitle burn-in, the Python processor automatically selects `Nirmala UI` (or `Noto Sans Bengali` if installed) instead of `Arial`.
-- **Optional `Noto Sans Bengali` Font on Windows**: If you prefer Google's **Noto Sans Bengali** for both MP4 burn-in and local preview fallback, download the free TTF from Google Fonts (`Noto Sans Bengali`), right-click `NotoSansBengali-Regular.ttf` -> **Install for all users** (or copy it to `C:\Windows\Fonts`), or override via `SUBTITLE_BENGALI_FONT` in `video-processor\.env`.
+- **Multilingual Model**: Bengali (`bn`) and Hindi (`hi`) subtitles require a multilingual `faster-whisper` model (`small`, `medium`, or `base`—never `*.en`). The default `WHISPER_MODEL_SIZE="small"` runs on CPU (`int8`) at ₹0 cost.
+- **Built-in Windows Font (`Nirmala UI`)**: Windows 10 and Windows 11 include **Nirmala UI** (`C:\Windows\Fonts\Nirmala.ttf`), which supports both **Devanagari (Hindi)** and **Bengali (`বাংলা`)** Unicode glyphs. Browser Canvas text slides (`src/utils/generatedSlides.ts`) and MP4 subtitle burn-in automatically include `Nirmala UI` as fallback alongside `Noto Sans Devanagari` / `Noto Sans Bengali`.
+- **Optional `Noto Sans` Fonts on Windows**: For identical typography in offline browser slides and MP4 burn-in without internet access, download free Google Fonts TTFs (**Noto Sans Devanagari** / **Noto Sans Bengali**), right-click -> **Install for all users** (or copy into `C:\Windows\Fonts`), or override via `SUBTITLE_BENGALI_FONT` in `video-processor\.env`.
+
+---
+
+## Optional Free Pexels Stock Media Setup (₹0)
+
+- Stock media search stays disabled by default (`STOCK_MEDIA_PROVIDER="none"`). You can always match existing library assets, upload local files, or generate local PNG text slides without any external stock account.
+- If you want to search & import Pexels photos and videos directly into browser IndexedDB:
+  1. Register a free API key at `https://www.pexels.com/api/` (200 requests/hour, 20,000/month, no credit card).
+  2. Set `STOCK_MEDIA_PROVIDER="pexels"` and `PEXELS_API_KEY="your-key"` in root `.env`, then restart `npm run dev`.
+  3. See `docs/STORYBOARD_MEDIA_INTEGRATION.md` for creator attribution and SSRF/import guard details.
 
 ---
 

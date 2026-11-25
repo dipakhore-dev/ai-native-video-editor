@@ -16,6 +16,7 @@ import {
   saveServerProjectSubtitles,
   saveServerProjectTimeline,
   submitAuthLogout,
+  updateServerMediaMetadata,
   updateServerProject,
   type AuthUserDto,
 } from "../services/api";
@@ -24,9 +25,11 @@ import type {
   AspectRatioOption,
   ExportAttempt,
   ExportRetryConfig,
+  GeneratedSlideConfig,
   IntegrationStatusMap,
   MediaAsset,
   MediaKind,
+  MediaSourceOrigin,
   Project,
   ProjectTemplateId,
   ResolutionOption,
@@ -63,6 +66,7 @@ import {
   findOrphanedAssetIds,
   findProjectsUsingAsset,
   getAllMediaFromIndexedDB,
+  getMediaFromIndexedDB,
   hydrateAssetFromStoredRecord,
   MediaStorageQuotaError,
   reconcileProjectsWithMediaAssets,
@@ -71,6 +75,8 @@ import {
   type BrowserStorageEstimate,
   type StoredMediaRecord,
 } from "../utils/mediaStorage";
+import { findDuplicateMediaAsset, findStoryboardsUsingAsset } from "../utils/storyboardMedia";
+import { loadAllLocalStoryboardDrafts } from "../utils/storyboard";
 import {
   applyClipSpeedOnTimeline,
   createDefaultTracks,
@@ -136,6 +142,26 @@ interface StudioContextValue {
   mediaError: string | null;
   clearMediaError: () => void;
   uploadLocalFiles: (files: FileList | File[]) => Promise<MediaAsset[]>;
+  importMediaFileWithMetadata: (
+    file: File,
+    metadata?: {
+      tags?: string[];
+      description?: string;
+      sourceOrigin?: MediaSourceOrigin;
+      providerName?: string;
+      providerAssetId?: string;
+      sourceUrl?: string;
+      creatorName?: string;
+      attributionUrl?: string;
+      licenseInfo?: string;
+      generatedSlideConfig?: GeneratedSlideConfig;
+    },
+    options?: { reuseDuplicate?: boolean }
+  ) => Promise<MediaAsset | null>;
+  updateMediaAssetDetails: (
+    assetId: string,
+    updates: { name?: string; tags?: string[]; description?: string }
+  ) => Promise<boolean>;
   relinkMissingClipAsset: (
     assetId: string,
     file: File
@@ -845,7 +871,17 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
   const cleanupOrphanedAssets = useCallback(
     async (candidateAssetIds: string[], remainingProjects: Project[]): Promise<number> => {
-      const orphanedIds = findOrphanedAssetIds(candidateAssetIds, remainingProjects);
+      const savedDrafts = loadAllLocalStoryboardDrafts();
+      const storyboardAssetIds = new Set<string>();
+      for (const rec of savedDrafts) {
+        for (const scene of rec.storyboard.scenes) {
+          if (scene.mediaAssignment?.mediaAssetId) {
+            storyboardAssetIds.add(scene.mediaAssignment.mediaAssetId);
+          }
+        }
+      }
+      const filteredCandidates = candidateAssetIds.filter((id) => !storyboardAssetIds.has(id));
+      const orphanedIds = findOrphanedAssetIds(filteredCandidates, remainingProjects);
       if (orphanedIds.length === 0) return 0;
 
       const orphanedSet = new Set(orphanedIds);
@@ -925,6 +961,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         ...(asset.height ? { height: Math.round(asset.height) } : {}),
         storageProvider: "local_browser",
         storageKey: asset.id,
+        ...(asset.tags ? { tags: asset.tags } : {}),
+        ...(asset.description ? { description: asset.description } : {}),
+        ...(asset.sourceOrigin ? { sourceOrigin: asset.sourceOrigin } : {}),
+        ...(asset.providerName ? { providerName: asset.providerName } : {}),
+        ...(asset.providerAssetId ? { providerAssetId: asset.providerAssetId } : {}),
+        ...(asset.sourceUrl && !/^blob:/i.test(asset.sourceUrl)
+          ? { sourceUrl: asset.sourceUrl }
+          : {}),
+        ...(asset.creatorName ? { creatorName: asset.creatorName } : {}),
+        ...(asset.attributionUrl && !/^blob:/i.test(asset.attributionUrl)
+          ? { attributionUrl: asset.attributionUrl }
+          : {}),
+        ...(asset.licenseInfo ? { licenseInfo: asset.licenseInfo } : {}),
       });
 
       if (res.ok && res.data?.asset) {
@@ -935,6 +984,187 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [activeProjectId, isAuthenticated]
+  );
+
+  const importMediaFileWithMetadata = useCallback(
+    async (
+      file: File,
+      metadata?: {
+        tags?: string[];
+        description?: string;
+        sourceOrigin?: MediaSourceOrigin;
+        providerName?: string;
+        providerAssetId?: string;
+        sourceUrl?: string;
+        creatorName?: string;
+        attributionUrl?: string;
+        licenseInfo?: string;
+        generatedSlideConfig?: GeneratedSlideConfig;
+      },
+      options?: { reuseDuplicate?: boolean }
+    ): Promise<MediaAsset | null> => {
+      if (options?.reuseDuplicate !== false) {
+        const existing = findDuplicateMediaAsset(file, mediaAssetsRef.current);
+        if (existing) {
+          return existing;
+        }
+        if (metadata?.providerName && metadata?.providerAssetId) {
+          const existingStock = mediaAssetsRef.current.find(
+            (a) =>
+              a.providerName === metadata.providerName &&
+              a.providerAssetId === metadata.providerAssetId
+          );
+          if (existingStock) {
+            return existingStock;
+          }
+        }
+      }
+
+      setUploadingMedia(true);
+      setMediaError(null);
+      let extractedAsset: MediaAsset | null = null;
+
+      try {
+        const quotaCheck = await checkStorageQuotaForBytes(file.size, file.name);
+        if (!quotaCheck.canFit) {
+          throw new MediaStorageQuotaError(
+            quotaCheck.reason || `Browser storage quota exceeded for '${file.name}'.`,
+            file.size,
+            quotaCheck.estimate.availableBytes
+          );
+        }
+
+        const extracted = await extractMediaAsset(file);
+        extractedAsset = {
+          ...extracted,
+          ...(metadata?.tags ? { tags: metadata.tags } : {}),
+          ...(metadata?.description ? { description: metadata.description } : {}),
+          ...(metadata?.sourceOrigin ? { sourceOrigin: metadata.sourceOrigin } : { sourceOrigin: "uploaded" }),
+          ...(metadata?.providerName ? { providerName: metadata.providerName } : {}),
+          ...(metadata?.providerAssetId ? { providerAssetId: metadata.providerAssetId } : {}),
+          ...(metadata?.sourceUrl && !/^blob:/i.test(metadata.sourceUrl)
+            ? { sourceUrl: metadata.sourceUrl }
+            : {}),
+          ...(metadata?.creatorName ? { creatorName: metadata.creatorName } : {}),
+          ...(metadata?.attributionUrl && !/^blob:/i.test(metadata.attributionUrl)
+            ? { attributionUrl: metadata.attributionUrl }
+            : {}),
+          ...(metadata?.licenseInfo ? { licenseInfo: metadata.licenseInfo } : {}),
+          ...(metadata?.generatedSlideConfig
+            ? { generatedSlideConfig: metadata.generatedSlideConfig }
+            : {}),
+        };
+
+        const now = new Date().toISOString();
+        const record: StoredMediaRecord = {
+          id: extractedAsset.id,
+          name: extractedAsset.name,
+          kind: extractedAsset.kind as Exclude<MediaKind, "text">,
+          mimeType: extractedAsset.mimeType,
+          sizeBytes: extractedAsset.sizeBytes,
+          duration: extractedAsset.duration,
+          width: extractedAsset.width,
+          height: extractedAsset.height,
+          thumbnailDataUrl: extractedAsset.thumbnailUrl?.startsWith("data:")
+            ? extractedAsset.thumbnailUrl
+            : undefined,
+          waveformPeaks: extractedAsset.waveformPeaks,
+          ...(extractedAsset.tags ? { tags: extractedAsset.tags } : {}),
+          ...(extractedAsset.description ? { description: extractedAsset.description } : {}),
+          ...(extractedAsset.sourceOrigin ? { sourceOrigin: extractedAsset.sourceOrigin } : {}),
+          ...(extractedAsset.providerName ? { providerName: extractedAsset.providerName } : {}),
+          ...(extractedAsset.providerAssetId
+            ? { providerAssetId: extractedAsset.providerAssetId }
+            : {}),
+          ...(extractedAsset.sourceUrl ? { sourceUrl: extractedAsset.sourceUrl } : {}),
+          ...(extractedAsset.creatorName ? { creatorName: extractedAsset.creatorName } : {}),
+          ...(extractedAsset.attributionUrl
+            ? { attributionUrl: extractedAsset.attributionUrl }
+            : {}),
+          ...(extractedAsset.licenseInfo ? { licenseInfo: extractedAsset.licenseInfo } : {}),
+          ...(extractedAsset.generatedSlideConfig
+            ? { generatedSlideConfig: extractedAsset.generatedSlideConfig }
+            : {}),
+          blob: file,
+          addedAt: extractedAsset.addedAt,
+          updatedAt: now,
+        };
+
+        await saveMediaToIndexedDB(record);
+        registerTrackedObjectUrl(extractedAsset.id, extractedAsset.objectUrl);
+        mediaAssetsRef.current = [extractedAsset, ...mediaAssetsRef.current];
+        setMediaAssets((prev) => [extractedAsset!, ...prev]);
+        void syncAssetMetadataToMongo(extractedAsset);
+        await refreshStorageEstimate();
+        return extractedAsset;
+      } catch (err) {
+        if (extractedAsset?.objectUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(extractedAsset.objectUrl);
+        }
+        setMediaError(err instanceof Error ? err.message : `Could not import '${file.name}'.`);
+        return null;
+      } finally {
+        setUploadingMedia(false);
+      }
+    },
+    [refreshStorageEstimate, registerTrackedObjectUrl, syncAssetMetadataToMongo]
+  );
+
+  const updateMediaAssetDetails = useCallback(
+    async (
+      assetId: string,
+      updates: { name?: string; tags?: string[]; description?: string }
+    ): Promise<boolean> => {
+      const cleanName = updates.name?.trim();
+      const cleanTags = updates.tags
+        ?.map((t) => t.trim())
+        .filter(Boolean)
+        .slice(0, 20);
+      const cleanDescription = updates.description?.trim().slice(0, 400);
+
+      try {
+        const stored = await getMediaFromIndexedDB(assetId);
+        if (stored) {
+          await saveMediaToIndexedDB({
+            ...stored,
+            ...(cleanName ? { name: cleanName } : {}),
+            ...(cleanTags !== undefined ? { tags: cleanTags } : {}),
+            ...(cleanDescription !== undefined ? { description: cleanDescription } : {}),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      } catch (err) {
+        setMediaError(
+          err instanceof Error ? err.message : "Failed to update media metadata in IndexedDB."
+        );
+        return false;
+      }
+
+      setMediaAssets((prev) =>
+        prev.map((asset) =>
+          asset.id === assetId
+            ? {
+                ...asset,
+                ...(cleanName ? { name: cleanName } : {}),
+                ...(cleanTags !== undefined ? { tags: cleanTags } : {}),
+                ...(cleanDescription !== undefined ? { description: cleanDescription } : {}),
+              }
+            : asset
+        )
+      );
+
+      const serverMediaId = serverMediaIdByClientIdRef.current.get(assetId);
+      if (serverMediaId && isAuthenticated) {
+        void updateServerMediaMetadata(serverMediaId, {
+          ...(cleanName ? { name: cleanName } : {}),
+          ...(cleanTags !== undefined ? { tags: cleanTags } : {}),
+          ...(cleanDescription !== undefined ? { description: cleanDescription } : {}),
+        });
+      }
+
+      return true;
+    },
+    [isAuthenticated]
   );
 
   const uploadLocalFiles = useCallback(
@@ -1019,6 +1249,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (added.length > 0) {
+        mediaAssetsRef.current = [...added, ...mediaAssetsRef.current];
         setMediaAssets((prev) => [...added, ...prev]);
 
         // Reconnect any restored clips missing media whose stable ID or original filename/size matches
@@ -1222,9 +1453,27 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       force = false
     ): Promise<{ deleted: boolean; blockedByProjects?: Project[]; error?: string }> => {
       const referencingProjects = findProjectsUsingAsset(assetId, projectsRef.current);
-      if (referencingProjects.length > 0 && !force) {
-        const names = referencingProjects.map((p) => `'${p.name}'`).join(", ");
-        const msg = `Cannot delete media while still used by ${referencingProjects.length} project(s): ${names}.`;
+      const referencingDrafts = findStoryboardsUsingAsset(
+        assetId,
+        loadAllLocalStoryboardDrafts().map((d) => d.storyboard)
+      );
+      if ((referencingProjects.length > 0 || referencingDrafts.length > 0) && !force) {
+        const parts: string[] = [];
+        if (referencingProjects.length > 0) {
+          parts.push(
+            `${referencingProjects.length} project(s): ${referencingProjects
+              .map((p) => `'${p.name}'`)
+              .join(", ")}`
+          );
+        }
+        if (referencingDrafts.length > 0) {
+          parts.push(
+            `${referencingDrafts.length} storyboard draft(s): ${referencingDrafts
+              .map((sb) => `'${sb.title}'`)
+              .join(", ")}`
+          );
+        }
+        const msg = `Cannot delete media while still used by ${parts.join(" and ")}.`;
         setMediaError(msg);
         return { deleted: false, blockedByProjects: referencingProjects, error: msg };
       }
@@ -2278,6 +2527,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       mediaError,
       clearMediaError,
       uploadLocalFiles,
+      importMediaFileWithMetadata,
+      updateMediaAssetDetails,
       relinkMissingClipAsset,
       getProjectsUsingAsset,
       removeMediaAsset,
@@ -2360,6 +2611,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       mediaError,
       clearMediaError,
       uploadLocalFiles,
+      importMediaFileWithMetadata,
+      updateMediaAssetDetails,
       relinkMissingClipAsset,
       getProjectsUsingAsset,
       removeMediaAsset,

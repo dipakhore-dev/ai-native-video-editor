@@ -13,6 +13,7 @@ import {
   X,
   HardDrive,
   AlertTriangle,
+  Tag,
 } from "lucide-react";
 import { StudioShell } from "../components/layout/StudioShell";
 import { IntegrationNotice } from "../components/common/IntegrationNotice";
@@ -33,6 +34,7 @@ export function MediaLibraryPage() {
     getProjectsUsingAsset,
     removeMediaAsset,
     cleanupUnusedMediaAssets,
+    updateMediaAssetDetails,
     addClipToTimeline,
     navigate,
   } = useStudio();
@@ -45,12 +47,48 @@ export function MediaLibraryPage() {
   const [previewAsset, setPreviewAsset] = useState<MediaAsset | null>(null);
   const [confirmDeleteAssetId, setConfirmDeleteAssetId] = useState<string | null>(null);
   const [cleanupNotice, setCleanupNotice] = useState<string | null>(null);
+  const [editingMetaAsset, setEditingMetaAsset] = useState<MediaAsset | null>(null);
+  const [metaTagsInput, setMetaTagsInput] = useState("");
+  const [metaDescriptionInput, setMetaDescriptionInput] = useState("");
+  const [savingMeta, setSavingMeta] = useState(false);
+
+  const openMetaEditor = (asset: MediaAsset) => {
+    setEditingMetaAsset(asset);
+    setMetaTagsInput((asset.tags ?? []).join(", "));
+    setMetaDescriptionInput(asset.description ?? "");
+  };
+
+  const handleSaveMeta = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingMetaAsset || savingMeta) return;
+    setSavingMeta(true);
+    const parsedTags = metaTagsInput
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    await updateMediaAssetDetails(editingMetaAsset.id, {
+      tags: parsedTags,
+      description: metaDescriptionInput.trim(),
+    });
+    setSavingMeta(false);
+    setEditingMetaAsset(null);
+  };
 
   const filteredAssets = useMemo(() => {
+    const q = search.trim().toLowerCase();
     return mediaAssets.filter((asset) => {
       const matchesKind = filter === "all" || asset.kind === filter;
-      const matchesSearch = asset.name.toLowerCase().includes(search.trim().toLowerCase());
-      return matchesKind && matchesSearch;
+      if (!q) return matchesKind;
+      const hay = [
+        asset.name,
+        asset.description || "",
+        ...(asset.tags ?? []),
+        asset.creatorName || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      return matchesKind && hay.includes(q);
     });
   }, [mediaAssets, filter, search]);
 
@@ -262,7 +300,7 @@ export function MediaLibraryPage() {
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search filenames..."
+                placeholder="Search filenames, tags, or descriptions..."
                 className="w-full rounded-lg border border-zinc-800 bg-[#111114] pl-9 pr-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none"
               />
             </div>
@@ -354,7 +392,20 @@ export function MediaLibraryPage() {
                     <p className="mt-1 text-[11px] font-mono text-zinc-500 tabular-nums">
                       {asset.width && asset.height ? `${asset.width}×${asset.height} · ` : ""}
                       {formatBytes(asset.sizeBytes)}
+                      {asset.sourceOrigin === "generated_slide"
+                        ? " · Generated Slide"
+                        : asset.sourceOrigin === "stock"
+                          ? ` · Stock (${asset.providerName || "Pexels"})`
+                          : ""}
                     </p>
+                    {(asset.tags?.length || asset.description) && (
+                      <p
+                        className="mt-1 text-[11px] text-zinc-400 truncate"
+                        title={asset.description || asset.tags?.join(", ")}
+                      >
+                        {asset.tags?.length ? `Tags: ${asset.tags.join(", ")}` : asset.description}
+                      </p>
+                    )}
                   </div>
 
                   {(() => {
@@ -377,6 +428,15 @@ export function MediaLibraryPage() {
                                 {usedBy.length} proj
                               </span>
                             )}
+                            <button
+                              type="button"
+                              onClick={() => openMetaEditor(asset)}
+                              className="rounded-md p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 transition-colors"
+                              aria-label={`Edit tags for ${asset.name}`}
+                              title="Edit tags & description for storyboard matching"
+                            >
+                              <Tag className="h-3.5 w-3.5" />
+                            </button>
                             <button
                               type="button"
                               onClick={() => void handleRequestDeleteAsset(asset.id)}
@@ -592,6 +652,87 @@ export function MediaLibraryPage() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Tags & Description Metadata Modal */}
+      {editingMetaAsset && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <form
+            onSubmit={handleSaveMeta}
+            className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#111114] overflow-hidden shadow-2xl"
+          >
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  Media Tags &amp; Description
+                </p>
+                <p className="text-[11px] text-zinc-400 truncate">{editingMetaAsset.name}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingMetaAsset(null)}
+                className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-white"
+                aria-label="Close metadata editor"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                  Keywords / Tags (comma-separated)
+                </label>
+                <input
+                  type="text"
+                  maxLength={320}
+                  value={metaTagsInput}
+                  onChange={(e) => setMetaTagsInput(e.target.value)}
+                  placeholder="e.g. sunrise, forest, studying, focus"
+                  className="w-full rounded-lg border border-zinc-800 bg-[#09090B] px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none"
+                />
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  Used by deterministic storyboard auto-matching alongside filenames.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                  Description (optional)
+                </label>
+                <textarea
+                  rows={3}
+                  maxLength={400}
+                  value={metaDescriptionInput}
+                  onChange={(e) => setMetaDescriptionInput(e.target.value)}
+                  placeholder="Describe what appears in this file for easier search and scene matching..."
+                  className="w-full rounded-lg border border-zinc-800 bg-[#09090B] px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="px-5 py-3.5 border-t border-zinc-800 flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setEditingMetaAsset(null)}
+                className="rounded-lg border border-zinc-800 bg-zinc-900 px-3.5 py-1.5 text-xs font-medium text-zinc-300 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={savingMeta}
+                className="rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-1.5 text-xs font-medium text-white hover:from-violet-500 hover:to-blue-500 disabled:opacity-50"
+              >
+                {savingMeta ? "Saving..." : "Save Metadata"}
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </StudioShell>

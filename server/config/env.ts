@@ -26,6 +26,11 @@ export interface AppEnvConfig {
   rateLimitAiMax: number;
   rateLimitVideoMax: number;
   rateLimitExportMax: number;
+  stockMediaProvider: "none" | "pexels";
+  pexelsApiKey: string;
+  stockMediaRequestTimeoutMs: number;
+  stockMediaMaxResults: number;
+  stockMediaMaxImportBytes: number;
 }
 
 function parseBoundedInt(
@@ -164,6 +169,20 @@ export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig
     rateLimitAiMax: parseBoundedInt(env.RATE_LIMIT_AI_MAX, 20, 1, 500),
     rateLimitVideoMax: parseBoundedInt(env.RATE_LIMIT_VIDEO_MAX, 40, 1, 1000),
     rateLimitExportMax: parseBoundedInt(env.RATE_LIMIT_EXPORT_MAX, 10, 1, 200),
+    stockMediaProvider:
+      (env.STOCK_MEDIA_PROVIDER || "none").trim().toLowerCase() === "pexels"
+        ? "pexels"
+        : "none",
+    pexelsApiKey: (env.PEXELS_API_KEY || "").trim(),
+    stockMediaRequestTimeoutMs: parseBoundedInt(
+      env.STOCK_MEDIA_REQUEST_TIMEOUT_MS,
+      15_000,
+      3_000,
+      60_000
+    ),
+    stockMediaMaxResults: parseBoundedInt(env.STOCK_MEDIA_MAX_RESULTS, 15, 1, 30),
+    stockMediaMaxImportBytes:
+      parseBoundedInt(env.STOCK_MEDIA_MAX_IMPORT_MB, 80, 5, 250) * 1024 * 1024,
   };
 }
 
@@ -234,6 +253,11 @@ export function isVideoGenProviderConfigured(env: NodeJS.ProcessEnv = process.en
   return Boolean(getEnvConfig(env).videoGenProviderUrl);
 }
 
+export function isStockMediaConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  const cfg = getEnvConfig(env);
+  return cfg.stockMediaProvider === "pexels" && Boolean(cfg.pexelsApiKey);
+}
+
 export interface StartupValidationResult {
   ok: boolean;
   errors: string[];
@@ -287,6 +311,12 @@ export function validateStartupEnv(env: NodeJS.ProcessEnv = process.env): Startu
         `GEMINI_MODEL value is invalid; falling back to default model "${DEFAULT_GEMINI_MODEL}".`
       );
     }
+  }
+
+  if (cfg.stockMediaProvider === "pexels" && !cfg.pexelsApiKey) {
+    warnings.push(
+      "STOCK_MEDIA_PROVIDER=pexels is set without PEXELS_API_KEY; free stock search remains disabled until PEXELS_API_KEY is configured."
+    );
   }
 
   if (cfg.isProd) {

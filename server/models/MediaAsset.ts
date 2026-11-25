@@ -12,6 +12,15 @@ export interface IMediaAsset extends Document {
   height?: number;
   storageProvider: "local_browser" | "s3" | "gcs";
   storageKey?: string;
+  tags?: string[];
+  description?: string;
+  sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide";
+  providerName?: string;
+  providerAssetId?: string;
+  sourceUrl?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -69,6 +78,50 @@ const MediaAssetSchema = new Schema<IMediaAsset>(
     storageKey: {
       type: String,
       default: "",
+    },
+    tags: {
+      type: [String],
+      default: undefined,
+    },
+    description: {
+      type: String,
+      trim: true,
+      maxlength: 400,
+    },
+    sourceOrigin: {
+      type: String,
+      enum: ["uploaded", "existing_library", "stock", "generated_slide"],
+      default: "uploaded",
+    },
+    providerName: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+    },
+    providerAssetId: {
+      type: String,
+      trim: true,
+      maxlength: 120,
+    },
+    sourceUrl: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+    creatorName: {
+      type: String,
+      trim: true,
+      maxlength: 160,
+    },
+    attributionUrl: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+    licenseInfo: {
+      type: String,
+      trim: true,
+      maxlength: 200,
     },
   },
   {

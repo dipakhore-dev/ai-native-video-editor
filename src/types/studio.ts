@@ -11,6 +11,33 @@ export type AppRoute =
 
 export type MediaKind = "video" | "image" | "audio" | "text";
 
+export type MediaSourceOrigin =
+  | "uploaded"
+  | "existing_library"
+  | "stock"
+  | "generated_slide";
+
+export type GeneratedSlideTemplate =
+  | "title"
+  | "educational"
+  | "section_heading"
+  | "closing";
+
+export interface GeneratedSlideConfig {
+  template: GeneratedSlideTemplate;
+  headingText: string;
+  bodyText?: string;
+  footerText?: string;
+  backgroundColor: string;
+  gradientColor?: string;
+  useGradient?: boolean;
+  textColor: string;
+  textAlign: "left" | "center" | "right";
+  fontSize: number;
+  aspectRatio: AspectRatioOption;
+  language: StoryboardLanguage;
+}
+
 export interface MediaAsset {
   id: string;
   name: string;
@@ -24,6 +51,16 @@ export interface MediaAsset {
   thumbnailUrl?: string;
   waveformPeaks?: number[]; // normalized 0..1 amplitude buckets across source duration
   sourceFile?: File;
+  tags?: string[];
+  description?: string;
+  sourceOrigin?: MediaSourceOrigin;
+  providerName?: string;
+  providerAssetId?: string;
+  sourceUrl?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
+  generatedSlideConfig?: GeneratedSlideConfig;
   addedAt: string;
 }
 
@@ -388,6 +425,53 @@ export interface StoryboardSettings {
   additionalInstructions: string;
 }
 
+export type SceneAssignedMediaType = "image" | "video" | "generated_slide";
+export type SceneMediaSource = "uploaded" | "existing_library" | "stock" | "generated_slide";
+export type SceneMediaAssignmentStatus =
+  | "unassigned"
+  | "matching"
+  | "assigned"
+  | "missing"
+  | "invalid"
+  | "failed";
+export type AspectRatioHandlingMode = "preserve" | "fit" | "fill";
+
+export interface StoryboardSceneMediaAssignment {
+  sceneId: string;
+  mediaAssetId: string;
+  mediaType: SceneAssignedMediaType;
+  mediaSource: SceneMediaSource;
+  assetTitle: string;
+  mimeType: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  thumbnailRef?: string; // Stable non-blob reference key only; live object URLs come from IndexedDB MediaAsset
+  sourceUrl?: string; // External reference/attribution URL only; never a temporary blob URL
+  providerName?: string;
+  providerAssetId?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
+  matchScore?: number;
+  matchExplanation?: string;
+  assignmentStatus: SceneMediaAssignmentStatus;
+  sourceStartTime: number;
+  aspectRatioHandling: AspectRatioHandlingMode;
+  assignedAt: string;
+}
+
+export interface StoryboardMediaSummary {
+  totalScenes: number;
+  assignedCount: number;
+  unassignedCount: number;
+  missingOrInvalidCount: number;
+  readyCount: number;
+  progressPercent: number;
+  overallStatus: SceneMediaAssignmentStatus;
+  isMediaReady: boolean;
+}
+
 export interface StoryboardScene {
   id: string;
   title: string;
@@ -401,6 +485,7 @@ export interface StoryboardScene {
   transition: TransitionType;
   effect: EffectPreset;
   cameraMotion: StoryboardCameraMotion;
+  mediaAssignment?: StoryboardSceneMediaAssignment;
 }
 
 export interface VideoStoryboard {
@@ -420,6 +505,7 @@ export interface VideoStoryboard {
   sourceMode: StoryboardSourceMode;
   model?: string;
   compositionReady: false;
+  mediaReadinessSummary?: StoryboardMediaSummary;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,4 +1,10 @@
-import type { MediaAsset, MediaKind, Project } from "../types/studio";
+import type {
+  GeneratedSlideConfig,
+  MediaAsset,
+  MediaKind,
+  MediaSourceOrigin,
+  Project,
+} from "../types/studio";
 
 export const IDB_MEDIA_DB_NAME = "ai_studio_local_media_db";
 export const IDB_MEDIA_STORE_NAME = "media_assets";
@@ -15,6 +21,16 @@ export interface StoredMediaRecord {
   height?: number;
   thumbnailDataUrl?: string;
   waveformPeaks?: number[];
+  tags?: string[];
+  description?: string;
+  sourceOrigin?: MediaSourceOrigin;
+  providerName?: string;
+  providerAssetId?: string;
+  sourceUrl?: string;
+  creatorName?: string;
+  attributionUrl?: string;
+  licenseInfo?: string;
+  generatedSlideConfig?: GeneratedSlideConfig;
   blob: Blob;
   addedAt: string;
   updatedAt: string;
@@ -308,6 +324,18 @@ export function hydrateAssetFromStoredRecord(record: StoredMediaRecord): MediaAs
     thumbnailUrl: record.thumbnailDataUrl || (record.kind === "image" ? objectUrl : undefined),
     waveformPeaks: Array.isArray(record.waveformPeaks) ? record.waveformPeaks : undefined,
     sourceFile,
+    ...(Array.isArray(record.tags) ? { tags: record.tags } : {}),
+    ...(record.description ? { description: record.description } : {}),
+    ...(record.sourceOrigin ? { sourceOrigin: record.sourceOrigin } : {}),
+    ...(record.providerName ? { providerName: record.providerName } : {}),
+    ...(record.providerAssetId ? { providerAssetId: record.providerAssetId } : {}),
+    ...(record.sourceUrl ? { sourceUrl: record.sourceUrl } : {}),
+    ...(record.creatorName ? { creatorName: record.creatorName } : {}),
+    ...(record.attributionUrl ? { attributionUrl: record.attributionUrl } : {}),
+    ...(record.licenseInfo ? { licenseInfo: record.licenseInfo } : {}),
+    ...(record.generatedSlideConfig
+      ? { generatedSlideConfig: record.generatedSlideConfig }
+      : {}),
     addedAt: record.addedAt,
   };
 }

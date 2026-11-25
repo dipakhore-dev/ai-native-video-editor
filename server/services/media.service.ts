@@ -38,6 +38,15 @@ export async function createUserMediaMetadata(
     height?: number;
     storageProvider?: "local_browser" | "s3" | "gcs";
     storageKey?: string;
+    tags?: string[];
+    description?: string;
+    sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide";
+    providerName?: string;
+    providerAssetId?: string;
+    sourceUrl?: string;
+    creatorName?: string;
+    attributionUrl?: string;
+    licenseInfo?: string;
   }
 ): Promise<IMediaAsset> {
   if (data.projectId) {
@@ -67,6 +76,8 @@ export async function updateUserMediaMetadata(
     projectId?: string | null;
     storageProvider?: "local_browser" | "s3" | "gcs";
     storageKey?: string;
+    tags?: string[];
+    description?: string;
   }
 ): Promise<IMediaAsset | null> {
   if (updates.projectId) {

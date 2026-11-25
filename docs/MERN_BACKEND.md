@@ -6,14 +6,14 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 
 ## Architecture
 
-- `server/config/env.ts` — Environment configuration loader (`MONGODB_URI`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `AUTH_COOKIE_NAME`, `GEMINI_API_KEY`).
+- `server/config/env.ts` — Environment configuration loader (`MONGODB_URI`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `AUTH_COOKIE_NAME`, `GEMINI_API_KEY`, `STOCK_MEDIA_PROVIDER`, `PEXELS_API_KEY`).
 - `server/config/database.ts` — Mongoose connection lifecycle (`connectDatabase`, `isDatabaseConnected`, `getDatabaseStatus`).
 - `server/models/`
   - `User.ts` — Accounts, hashed passwords (`select: false`), workspace defaults.
   - `Project.ts` — Owner-scoped (`userId`) video projects with embedded `tracks` and `clips` (including `textStyle` overlays).
-  - `MediaAsset.ts` — Owner-scoped (`userId`) media metadata records (`name`, `kind`, `mimeType`, `sizeBytes`, `duration`, `width`, `height`, `storageProvider`, `storageKey`).
+  - `MediaAsset.ts` — Owner-scoped (`userId`) media metadata records (`name`, `kind`, `mimeType`, `sizeBytes`, `duration`, `width`, `height`, `storageProvider`, `storageKey`, plus `tags`, `description`, `sourceOrigin`, and optional stock attribution metadata `providerName`, `providerAssetId`, `sourceUrl`, `creatorName`, `attributionUrl`, `licenseInfo`).
   - `AiEditRequest.ts` — Audit trail of natural-language prompts, timeline snapshots, Zod-validated Gemini edit plans, and `proposed`/`applied`/`discarded` status.
-  - `StoryboardDraft.ts` — Lightweight, owner-scoped (`userId`) AI Script & Storyboard drafts storing editable scene breakdowns, narration, captions, and settings JSON separately from timeline `Project` records.
+  - `StoryboardDraft.ts` — Lightweight, owner-scoped (`userId`) AI Script & Storyboard drafts storing editable scene breakdowns (including `mediaAssignment` & `mediaReadinessSummary` without binary payloads or `blob:` URLs), narration, captions, and settings JSON separately from timeline `Project` records.
   - `ExportJob.ts` — Owner-scoped export job specifications and render status tracking.
 - `server/validators/` — Zod schemas validating request bodies for auth, projects/timelines, media metadata, AI edit requests, and export jobs.
 - `server/middleware/`
@@ -41,10 +41,15 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 
 ### Media Metadata Management (Owner-Scoped)
 - `GET /api/media` — List media asset metadata (optional `?projectId=` filter).
-- `POST /api/media` — Save media file metadata.
+- `POST /api/media` — Save media file metadata (`tags`, `description`, `sourceOrigin`, and optional stock attribution; rejects `blob:` URLs).
 - `GET /api/media/:id` — Fetch single media metadata document.
-- `PATCH /api/media/:id` — Update media metadata.
+- `PATCH /api/media/:id` — Update media metadata (`name`, `projectId`, `tags`, `description`, storage pointers).
 - `DELETE /api/media/:id` — Delete media metadata document.
+
+### Stock Media Proxy (Optional Free Pexels Provider, `requireAuth`)
+- `GET /api/stock-media/status` — Report whether `STOCK_MEDIA_PROVIDER=pexels` + `PEXELS_API_KEY` is active, plus result/import size bounds.
+- `POST /api/stock-media/search` — Search Pexels photos or videos using authenticated server-side API key (`503` when disabled; rate-limited; SSRF-guarded).
+- `POST /api/stock-media/import` — Server-side proxy download of an allowlisted Pexels asset with HTTPS/DNS SSRF checks, bounded byte streaming (`STOCK_MEDIA_MAX_IMPORT_MB`), magic-byte signature validation, and `X-Stock-*` attribution headers for client IndexedDB persistence.
 
 ### AI Editing & Export Job Tracking
 - `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using the configured Gemini model (default: `gemini-3.5-flash`); persists `AiEditRequest` when authenticated with MongoDB.

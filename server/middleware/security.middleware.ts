@@ -188,7 +188,7 @@ export function corsAllowlistMiddleware(req: Request, res: Response, next: NextF
     );
     res.setHeader(
       "Access-Control-Expose-Headers",
-      "X-Request-Id, X-Video-Job-Id, X-Export-Client-Job-Id, X-Export-Profile, X-Export-Encoder, X-Export-Fallback, Content-Disposition"
+      "X-Request-Id, X-Video-Job-Id, X-Export-Client-Job-Id, X-Export-Profile, X-Export-Encoder, X-Export-Fallback, Content-Disposition, X-Stock-Provider, X-Stock-Asset-Id, X-Stock-Media-Type, X-Stock-Title, X-Stock-Creator, X-Stock-Attribution-Url, X-Stock-License, X-Stock-Width, X-Stock-Height, X-Stock-Duration"
     );
   }
 
