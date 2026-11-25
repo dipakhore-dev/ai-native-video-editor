@@ -6,9 +6,12 @@ import type {
   SubtitleSegment,
   SubtitleStyle,
   TimelineClip,
+  VideoGenerationRequest,
+  VideoStoryboard,
 } from "../types/studio";
 import { AiEditPlanSchema, type AiEditPlan } from "../utils/aiOperations";
 import { clampClipRotation, sortAndDedupeKeyframes } from "../utils/keyframes";
+import { VideoStoryboardSchema } from "../utils/storyboard";
 import { createDefaultTracks, ensureProjectTracks } from "../utils/timeline";
 
 export interface ApiResult<T> {
@@ -66,6 +69,17 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiRe
       data: body as T,
     };
   } catch (err) {
+    const isAborted =
+      Boolean(options?.signal?.aborted) ||
+      (err instanceof Error && err.name === "AbortError");
+    if (isAborted) {
+      return {
+        ok: false,
+        status: 499,
+        cancelled: true,
+        error: "Request cancelled.",
+      };
+    }
     return {
       ok: false,
       status: 0,
@@ -209,6 +223,108 @@ export async function submitVideoGenerationRequest(payload: {
   return requestJson("/api/ai/generate-video", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export interface ServerStoryboardDraftDto {
+  _id?: string;
+  id?: string;
+  title: string;
+  sourceMode: "prompt-to-video" | "script-to-video";
+  aspectRatio: "16:9" | "9:16" | "1:1";
+  totalDuration: 15 | 30 | 60;
+  style: string;
+  language: string;
+  status: "draft" | "validated";
+  modelName?: string;
+  storyboard: VideoStoryboard;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function generateAiStoryboard(
+  payload: VideoGenerationRequest,
+  options?: { signal?: AbortSignal }
+): Promise<ApiResult<{ status: string; model?: string; storyboard?: VideoStoryboard }>> {
+  const res = await requestJson<{ status: string; model?: string; storyboard?: unknown }>(
+    "/api/ai/storyboard",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal: options?.signal,
+    }
+  );
+
+  if (res.cancelled) {
+    return {
+      ok: false,
+      status: 499,
+      cancelled: true,
+      error: "Storyboard generation was cancelled.",
+    };
+  }
+
+  if (!res.ok || !res.data?.storyboard) {
+    return {
+      ok: false,
+      status: res.status,
+      error: res.error || "Unable to generate storyboard.",
+      integrationPoint: res.integrationPoint,
+    };
+  }
+
+  const parsed = VideoStoryboardSchema.safeParse(res.data.storyboard);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      status: 422,
+      error: "Server returned a storyboard payload that failed client schema validation.",
+    };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    data: {
+      status: res.data.status,
+      model: res.data.model,
+      storyboard: parsed.data,
+    },
+  };
+}
+
+export async function fetchServerStoryboardDrafts(): Promise<
+  ApiResult<{ status: string; drafts: ServerStoryboardDraftDto[] }>
+> {
+  return requestJson("/api/ai/storyboards");
+}
+
+export async function createServerStoryboardDraft(
+  storyboard: VideoStoryboard,
+  status: "draft" | "validated" = "validated"
+): Promise<ApiResult<{ status: string; draft: ServerStoryboardDraftDto }>> {
+  return requestJson("/api/ai/storyboards", {
+    method: "POST",
+    body: JSON.stringify({ status, storyboard }),
+  });
+}
+
+export async function updateServerStoryboardDraft(
+  draftId: string,
+  storyboard: VideoStoryboard,
+  status: "draft" | "validated" = "validated"
+): Promise<ApiResult<{ status: string; draft: ServerStoryboardDraftDto }>> {
+  return requestJson(`/api/ai/storyboards/${encodeURIComponent(draftId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ status, storyboard }),
+  });
+}
+
+export async function deleteServerStoryboardDraft(
+  draftId: string
+): Promise<ApiResult<{ status: string; deleted: boolean }>> {
+  return requestJson(`/api/ai/storyboards/${encodeURIComponent(draftId)}`, {
+    method: "DELETE",
   });
 }
 

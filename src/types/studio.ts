@@ -320,3 +320,116 @@ export interface SessionUser {
   defaultFps: 24 | 30 | 60;
   defaultResolution: ResolutionOption;
 }
+
+export type VideoGeneratorMode = "prompt-to-video" | "script-to-video" | "image-animation";
+export type StoryboardSourceMode = "prompt-to-video" | "script-to-video";
+export type StoryboardTargetDuration = 15 | 30 | 60;
+export type StoryboardStyle =
+  | "Cinematic"
+  | "Educational"
+  | "Motivational"
+  | "Minimal"
+  | "Social Media";
+export type StoryboardLanguage = "English" | "Hindi" | "Bengali";
+export type StoryboardVoiceoverPreference =
+  | "none"
+  | "natural_narrator"
+  | "energetic_host"
+  | "calm_explainer";
+export type StoryboardCaptionPreference =
+  | "none"
+  | "clean_subtitles"
+  | "bold_social"
+  | "minimal_lower";
+export type StoryboardMediaType = "video" | "image" | "text_card" | "motion_graphic";
+export type StoryboardCameraMotion =
+  | "static"
+  | "slow-dolly-in"
+  | "slow-dolly-out"
+  | "pan-left"
+  | "pan-right"
+  | "aerial-orbit"
+  | "handheld-subtle";
+export type StoryboardGenerationStatus =
+  | "idle"
+  | "generating"
+  | "ready"
+  | "error"
+  | "cancelled";
+
+export interface VideoGenerationRequest {
+  mode: VideoGeneratorMode;
+  title?: string;
+  prompt: string;
+  targetDurationSec: StoryboardTargetDuration;
+  aspectRatio: AspectRatioOption;
+  style: StoryboardStyle;
+  language: StoryboardLanguage;
+  voiceoverEnabled: boolean;
+  voiceoverPreference: StoryboardVoiceoverPreference;
+  captionsEnabled: boolean;
+  captionStyle: StoryboardCaptionPreference;
+  targetAudience?: string;
+  additionalInstructions?: string;
+  requestKey?: string;
+}
+
+export interface StoryboardSettings {
+  mode: StoryboardSourceMode;
+  targetDurationSec: StoryboardTargetDuration;
+  aspectRatio: AspectRatioOption;
+  style: StoryboardStyle;
+  language: StoryboardLanguage;
+  voiceoverEnabled: boolean;
+  voiceoverPreference: StoryboardVoiceoverPreference;
+  captionsEnabled: boolean;
+  captionStyle: StoryboardCaptionPreference;
+  targetAudience: string;
+  additionalInstructions: string;
+}
+
+export interface StoryboardScene {
+  id: string;
+  title: string;
+  startTime: number;
+  duration: number;
+  narration: string;
+  onScreenText: string;
+  visualDescription: string;
+  mediaKeywords: string[];
+  mediaType: StoryboardMediaType;
+  transition: TransitionType;
+  effect: EffectPreset;
+  cameraMotion: StoryboardCameraMotion;
+}
+
+export interface VideoStoryboard {
+  id: string;
+  title: string;
+  description: string;
+  targetAudience: string;
+  language: StoryboardLanguage;
+  totalDuration: StoryboardTargetDuration;
+  aspectRatio: AspectRatioOption;
+  style: StoryboardStyle;
+  fullNarrationScript: string;
+  backgroundMusicMood: string;
+  captionText: string;
+  settings: StoryboardSettings;
+  scenes: StoryboardScene[];
+  sourceMode: StoryboardSourceMode;
+  model?: string;
+  compositionReady: false;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StoryboardDraftRecord {
+  id: string;
+  serverDraftId?: string;
+  title: string;
+  status: "draft" | "validated";
+  storyboard: VideoStoryboard;
+  savedAt: string;
+}
+

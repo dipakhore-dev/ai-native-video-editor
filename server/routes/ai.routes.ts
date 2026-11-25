@@ -2,9 +2,15 @@ import { Router } from "express";
 import { getEnvConfig } from "../config/env.ts";
 import {
   aiAssistantController,
+  createStoryboardDraftController,
+  deleteStoryboardDraftController,
+  generateStoryboardController,
   generateVideoStubController,
+  getStoryboardDraftController,
   listAiRequestsController,
+  listStoryboardDraftsController,
   updateAiRequestStatusController,
+  updateStoryboardDraftController,
 } from "../controllers/ai.controller.ts";
 import { optionalAuth, requireAuth } from "../middleware/auth.middleware.ts";
 import { createRateLimiter } from "../middleware/rateLimit.middleware.ts";
@@ -12,6 +18,8 @@ import { validateBody, validateObjectId } from "../middleware/validate.middlewar
 import {
   AssistantRequestSchema,
   GenerateVideoRequestSchema,
+  SaveStoryboardDraftSchema,
+  StoryboardGenerationInputSchema,
   UpdateAiRequestStatusSchema,
 } from "../validators/aiAndExport.validators.ts";
 
@@ -40,6 +48,43 @@ aiRouter.patch(
   validateObjectId("id"),
   validateBody(UpdateAiRequestStatusSchema),
   updateAiRequestStatusController
+);
+
+aiRouter.post(
+  "/storyboard",
+  requireAuth,
+  aiRateLimiter,
+  validateBody(StoryboardGenerationInputSchema),
+  generateStoryboardController
+);
+
+aiRouter.get("/storyboards", requireAuth, listStoryboardDraftsController);
+aiRouter.post(
+  "/storyboards",
+  requireAuth,
+  aiRateLimiter,
+  validateBody(SaveStoryboardDraftSchema),
+  createStoryboardDraftController
+);
+aiRouter.get(
+  "/storyboards/:id",
+  requireAuth,
+  validateObjectId("id"),
+  getStoryboardDraftController
+);
+aiRouter.patch(
+  "/storyboards/:id",
+  requireAuth,
+  aiRateLimiter,
+  validateObjectId("id"),
+  validateBody(SaveStoryboardDraftSchema),
+  updateStoryboardDraftController
+);
+aiRouter.delete(
+  "/storyboards/:id",
+  requireAuth,
+  validateObjectId("id"),
+  deleteStoryboardDraftController
 );
 
 aiRouter.post(

@@ -221,10 +221,10 @@ export function LandingPage() {
                   <span className="text-xs font-medium">03. AI Video &amp; Editorial Hooks</span>
                 </div>
                 <h3 className="font-display text-lg font-semibold text-white">
-                  Text-to-Video &amp; Image-to-Video dispatch
+                  AI Script &amp; Storyboard planning
                 </h3>
                 <p className="mt-2 text-sm text-zinc-400 leading-relaxed">
-                  Structured generation controls for aspect ratio, camera motion, duration, and reference frames routed cleanly to your Express backend.
+                  Plan structured multi-scene scripts, narration, captions, and editor-compatible visual styles with Gemini before composing timelines via local FFmpeg.
                 </p>
               </div>
               <div className="mt-6 pt-4 border-t border-zinc-800/80">
@@ -233,7 +233,7 @@ export function LandingPage() {
                   onClick={() => navigate("generator")}
                   className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-200 hover:text-white transition-colors"
                 >
-                  <span>Explore AI Generator</span>
+                  <span>Open Storyboard Studio</span>
                   <ArrowRight className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -254,7 +254,7 @@ export function LandingPage() {
                 </p>
               </div>
               <div className="mt-6 pt-4 border-t border-zinc-800/80 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs font-mono text-zinc-400">
-                <span>POST /api/ai/generate-video</span>
+                <span>POST /api/ai/storyboard</span>
                 <span>POST /api/ai/assistant</span>
                 <span>POST /api/exports</span>
                 <span>GET /api/integrations/status</span>

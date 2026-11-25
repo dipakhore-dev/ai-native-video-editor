@@ -1,4 +1,15 @@
 import { z } from "zod";
+import {
+  StoryboardGenerationInputSchema,
+  VideoStoryboardSchema,
+} from "../../src/utils/storyboard.ts";
+
+export { StoryboardGenerationInputSchema };
+
+export const SaveStoryboardDraftSchema = z.object({
+  status: z.enum(["draft", "validated"]).optional().default("validated"),
+  storyboard: VideoStoryboardSchema,
+});
 
 export const AssistantRequestSchema = z.object({
   prompt: z.string().trim().min(1, "Please enter a video editing instruction.").max(1000),

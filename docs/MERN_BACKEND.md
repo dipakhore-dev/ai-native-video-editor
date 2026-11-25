@@ -13,6 +13,7 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
   - `Project.ts` — Owner-scoped (`userId`) video projects with embedded `tracks` and `clips` (including `textStyle` overlays).
   - `MediaAsset.ts` — Owner-scoped (`userId`) media metadata records (`name`, `kind`, `mimeType`, `sizeBytes`, `duration`, `width`, `height`, `storageProvider`, `storageKey`).
   - `AiEditRequest.ts` — Audit trail of natural-language prompts, timeline snapshots, Zod-validated Gemini edit plans, and `proposed`/`applied`/`discarded` status.
+  - `StoryboardDraft.ts` — Lightweight, owner-scoped (`userId`) AI Script & Storyboard drafts storing editable scene breakdowns, narration, captions, and settings JSON separately from timeline `Project` records.
   - `ExportJob.ts` — Owner-scoped export job specifications and render status tracking.
 - `server/validators/` — Zod schemas validating request bodies for auth, projects/timelines, media metadata, AI edit requests, and export jobs.
 - `server/middleware/`
@@ -47,6 +48,9 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 
 ### AI Editing & Export Job Tracking
 - `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using Gemini (`gemini-4-hydrogen`); persists `AiEditRequest` when authenticated with MongoDB.
+- `POST /api/ai/storyboard` — Generate a Zod-validated `VideoStoryboard` from a prompt or script using Gemini (`gemini-4-hydrogen`) with per-user concurrency guard and cancellation support (`requireAuth`).
+- `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`).
+- `GET /api/ai/storyboards/:id`, `PATCH /api/ai/storyboards/:id`, `DELETE /api/ai/storyboards/:id` — Fetch, update, or delete an owner-scoped `StoryboardDraft` (`requireAuth`).
 - `GET /api/ai/requests` — List user's saved AI editing requests (`requireAuth`).
 - `PATCH /api/ai/requests/:id` — Mark an AI edit proposal `applied` or `discarded` (`requireAuth`).
 - `GET /api/exports` — List user's export jobs (`requireAuth`).
@@ -106,5 +110,5 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
   - Liveness probe: `GET /api/health/live` (returns `200`).
   - Readiness probe: `GET /api/health/ready` (returns `503` when shutting down or when `MONGODB_URI` is set but disconnected).
   - On `SIGINT`/`SIGTERM`, Express stops accepting new connections, signals active video jobs, cleans stale temp files, and closes Mongoose cleanly.
-  - Schedule automated `mongodump` / MongoDB Atlas snapshots for `users`, `projects`, `mediaassets`, `videojobs`, `exportjobs`, and `aieditrequests`.
+  - Schedule automated `mongodump` / MongoDB Atlas snapshots for `users`, `projects`, `mediaassets`, `videojobs`, `exportjobs`, `aieditrequests`, and `storyboarddrafts`.
 
