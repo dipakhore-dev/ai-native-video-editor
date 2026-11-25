@@ -273,21 +273,39 @@ export function AiGeneratorPage() {
 
       if (!res.ok || !res.data?.storyboard) {
         setGenerationStatus("error");
+        const cat = res.errorCategory;
         const isIntegration =
-          res.status === 503 &&
-          Boolean(res.integrationPoint || /GEMINI_API_KEY|MongoDB/i.test(res.error || ""));
+          cat === "MISSING_API_KEY" ||
+          cat === "INVALID_API_KEY" ||
+          cat === "UNAUTHENTICATED" ||
+          cat === "PERMISSION_DENIED" ||
+          cat === "NOT_FOUND" ||
+          (res.status === 503 &&
+            Boolean(res.integrationPoint || /GEMINI_API_KEY|MongoDB/i.test(res.error || "")));
         const titleLabel =
-          res.status === 429
+          cat === "RESOURCE_EXHAUSTED" || res.status === 429
             ? "Gemini Quota / Rate Limit Reached"
-            : res.status === 504
+            : cat === "TIMEOUT" || res.status === 504
               ? "Request Timed Out"
               : res.status === 409
                 ? "Generation Already In Progress"
-                : res.status === 422
-                  ? "Storyboard Validation Failed"
-                  : isIntegration
-                    ? "Gemini Service Configuration Required"
-                    : "Storyboard Generation Failed";
+                : cat === "SAFETY_BLOCK"
+                  ? "Blocked by Safety Filters"
+                  : cat === "NOT_FOUND"
+                    ? "Configured Gemini Model Unavailable"
+                    : cat === "UNAUTHENTICATED" || cat === "INVALID_API_KEY"
+                      ? "Gemini Authentication Failed"
+                      : cat === "PERMISSION_DENIED"
+                        ? "Gemini Model Access Denied"
+                        : cat === "INVALID_ARGUMENT"
+                          ? "Invalid AI Request Parameters"
+                          : cat === "UNAVAILABLE"
+                            ? "Gemini Service Temporarily Unavailable"
+                            : res.status === 422
+                              ? "Storyboard Validation Failed"
+                              : isIntegration
+                                ? "Gemini Service Configuration Required"
+                                : "Storyboard Generation Failed";
 
         setErrorBanner({
           kind: isIntegration ? "integration" : "error",
@@ -296,7 +314,12 @@ export function AiGeneratorPage() {
             res.error ||
             "Could not generate storyboard. Try again or continue editing locally.",
           endpoint: res.integrationPoint,
-          retryable: res.status === 0 || res.status === 503 || res.status === 504,
+          retryable:
+            res.status === 0 ||
+            cat === "UNAVAILABLE" ||
+            cat === "TIMEOUT" ||
+            res.status === 504 ||
+            (res.status === 503 && !isIntegration),
         });
         return;
       }
@@ -445,8 +468,7 @@ export function AiGeneratorPage() {
             </h1>
             <p className="mt-1 text-sm text-zinc-400 max-w-3xl">
               Plan structured video scripts, scene timing, captions, and editor-compatible visual
-              effects using Gemini (`gemini-4-hydrogen`). Final MP4 composition from storyboards
-              arrives in Phase 5.5.2.
+              effects using Gemini. Final MP4 composition from storyboards arrives in Phase 5.5.2.
             </p>
           </div>
 

@@ -47,8 +47,8 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 - `DELETE /api/media/:id` — Delete media metadata document.
 
 ### AI Editing & Export Job Tracking
-- `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using Gemini (`gemini-4-hydrogen`); persists `AiEditRequest` when authenticated with MongoDB.
-- `POST /api/ai/storyboard` — Generate a Zod-validated `VideoStoryboard` from a prompt or script using Gemini (`gemini-4-hydrogen`) with per-user concurrency guard and cancellation support (`requireAuth`).
+- `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using the configured Gemini model (default: `gemini-3.5-flash`); persists `AiEditRequest` when authenticated with MongoDB.
+- `POST /api/ai/storyboard` — Generate a Zod-validated `VideoStoryboard` from a prompt or script using the configured Gemini model (default: `gemini-3.5-flash`) with optional transient fallback (`GEMINI_FALLBACK_MODELS`), per-user concurrency guard, and cancellation support (`requireAuth`).
 - `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`).
 - `GET /api/ai/storyboards/:id`, `PATCH /api/ai/storyboards/:id`, `DELETE /api/ai/storyboards/:id` — Fetch, update, or delete an owner-scoped `StoryboardDraft` (`requireAuth`).
 - `GET /api/ai/requests` — List user's saved AI editing requests (`requireAuth`).
@@ -66,6 +66,8 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 2. Copy `.env.example` to `.env` and populate credentials:
    ```env
    GEMINI_API_KEY="your_gemini_api_key"
+   GEMINI_MODEL="gemini-3.5-flash"
+   GEMINI_FALLBACK_MODELS=""
    MONGODB_URI="mongodb://127.0.0.1:27017/ai_studio"
    JWT_SECRET="replace-with-a-long-random-secret-key"
    JWT_EXPIRES_IN="7d"

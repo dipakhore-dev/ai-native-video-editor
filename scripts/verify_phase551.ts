@@ -19,7 +19,7 @@ import {
 } from "../server/middleware/security.middleware.ts";
 import { validateBody, validateObjectId } from "../server/middleware/validate.middleware.ts";
 import {
-  aiAssistantController,
+  createAiAssistantController,
   createGenerateStoryboardController,
   createStoryboardDraftController,
   deleteStoryboardDraftController,
@@ -37,8 +37,14 @@ import { UserModel } from "../server/models/User.ts";
 import {
   generateVideoStoryboard,
   hasActiveStoryboardGeneration,
+  type GeminiJsonInvoker,
   type StoryboardGeminiInvoker,
 } from "../server/services/ai.service.ts";
+import {
+  DEFAULT_GEMINI_MODEL,
+  getEnvConfig,
+  resolveGeminiModelCandidates,
+} from "../server/config/env.ts";
 import { AiEditPlanSchema, applyAiOperationsToProject } from "../src/utils/aiOperations.ts";
 import {
   buildCaptionsFromScenes,
@@ -145,9 +151,13 @@ async function withMockedDbAndAuth(
   const prevJwt = process.env.JWT_SECRET;
   const prevMongo = process.env.MONGODB_URI;
   const prevGemini = process.env.GEMINI_API_KEY;
+  const prevGeminiModel = process.env.GEMINI_MODEL;
+  const prevGeminiFallback = process.env.GEMINI_FALLBACK_MODELS;
   process.env.JWT_SECRET = jwtSecret;
   process.env.MONGODB_URI = "mongodb://127.0.0.1:27017/verify_phase551";
   process.env.GEMINI_API_KEY = "test-gemini-placeholder-for-mock";
+  delete process.env.GEMINI_MODEL;
+  delete process.env.GEMINI_FALLBACK_MODELS;
 
   // Simulate Mongoose connection readyState = 1 cleanly for requireAuth & in-memory draft CRUD
   const connObj = mongoose.connection as unknown as { readyState: number };
@@ -207,7 +217,7 @@ async function withMockedDbAndAuth(
       style: String(doc.style),
       language: String(doc.language),
       status: String(doc.status || "validated"),
-      modelName: String(doc.modelName || "gemini-4-hydrogen"),
+      modelName: String(doc.modelName || DEFAULT_GEMINI_MODEL),
       storyboard: doc.storyboard as VideoStoryboard,
       createdAt: now,
       updatedAt: now,
@@ -325,7 +335,9 @@ async function withMockedDbAndAuth(
       limiter,
       optionalAuth,
       validateBody(AssistantRequestSchema),
-      aiAssistantController
+      createAiAssistantController(
+        options as { geminiInvoker?: GeminiJsonInvoker; timeoutMs?: number } | undefined
+      )
     );
 
     app.use(sanitizedErrorHandler);
@@ -354,6 +366,10 @@ async function withMockedDbAndAuth(
     else process.env.MONGODB_URI = prevMongo;
     if (prevGemini === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = prevGemini;
+    if (prevGeminiModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevGeminiModel;
+    if (prevGeminiFallback === undefined) delete process.env.GEMINI_FALLBACK_MODELS;
+    else process.env.GEMINI_FALLBACK_MODELS = prevGeminiFallback;
   }
 }
 
@@ -361,12 +377,14 @@ async function runTests() {
   console.log("Running Phase 5.5.1 AI Script & Storyboard verification suite (mocked Gemini)...");
 
   await withMockedDbAndAuth(async ({ userAId, cookieA, cookieB, createApp }) => {
-    // 1. Valid prompt-to-storyboard request (mocked Gemini)
+    // 1. Valid prompt-to-storyboard request (default gemini-3.5-flash, mocked Gemini)
     {
+      const seenModels: string[] = [];
       const app = createApp({
-        geminiInvoker: async () => ({
-          text: JSON.stringify(makeValidRawAiStoryboard()),
-        }),
+        geminiInvoker: async ({ model }) => {
+          seenModels.push(model);
+          return { text: JSON.stringify(makeValidRawAiStoryboard()) };
+        },
       });
       const { server, baseUrl } = await startTempServer(app);
       try {
@@ -394,7 +412,9 @@ async function runTests() {
           storyboard: VideoStoryboard;
         };
         assert.equal(body.status, "ok");
-        assert.equal(body.model, "gemini-4-hydrogen");
+        assert.deepEqual(seenModels, ["gemini-3.5-flash"]);
+        assert.equal(body.model, "gemini-3.5-flash");
+        assert.equal(body.storyboard.model, "gemini-3.5-flash");
         assert.equal(body.storyboard.title, "Morning Focus Routine");
         assert.equal(body.storyboard.totalDuration, 15);
         assert.equal(body.storyboard.scenes.length, 3);
@@ -403,7 +423,7 @@ async function runTests() {
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
-      console.log("[PASS] 1. Valid prompt-to-storyboard request (mocked Gemini)");
+      console.log("[PASS] 1. Valid prompt-to-storyboard request with default gemini-3.5-flash (mocked Gemini)");
     }
 
     // 2. Valid script-to-storyboard request (mocked Gemini, 30s Bengali)
@@ -1124,6 +1144,371 @@ async function runTests() {
       assert.ok(normalizedPanelHtml.includes("Scene Breakdown (3)"));
       assert.ok(normalizedPanelHtml.includes("Save Storyboard Draft"));
       console.log("[PASS] 20. Existing AI Editing Assistant compatibility & SSR UI verification");
+    }
+
+    // 21. Configurable primary model & deduplication
+    {
+      process.env.GEMINI_MODEL = "models/gemini-custom-flash";
+      process.env.GEMINI_FALLBACK_MODELS =
+        "gemini-custom-flash, gemini-backup-a, gemini-backup-a, gemini-backup-b, gemini-backup-c";
+      try {
+        const cfg = getEnvConfig();
+        assert.equal(cfg.geminiModel, "gemini-custom-flash");
+        assert.deepEqual(resolveGeminiModelCandidates(), [
+          "gemini-custom-flash",
+          "gemini-backup-a",
+          "gemini-backup-b",
+        ]);
+
+        const seen: string[] = [];
+        const app = createApp({
+          geminiInvoker: async ({ model }) => {
+            seen.push(model);
+            return { text: JSON.stringify(makeValidRawAiStoryboard()) };
+          },
+        });
+        const { server, baseUrl } = await startTempServer(app);
+        try {
+          const res = await fetch(`${baseUrl}/api/ai/storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: cookieA },
+            body: JSON.stringify({
+              mode: "prompt-to-video",
+              prompt: "Test custom configured primary Gemini model",
+              targetDurationSec: 15,
+              aspectRatio: "16:9",
+              style: "Cinematic",
+              language: "English",
+            }),
+          });
+          assert.equal(res.status, 200);
+          const body = (await res.json()) as { model: string; storyboard: VideoStoryboard };
+          assert.deepEqual(seen, ["gemini-custom-flash"]);
+          assert.equal(body.model, "gemini-custom-flash");
+          assert.equal(body.storyboard.model, "gemini-custom-flash");
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      } finally {
+        delete process.env.GEMINI_MODEL;
+        delete process.env.GEMINI_FALLBACK_MODELS;
+      }
+      console.log("[PASS] 21. Configurable primary model & duplicate candidate deduplication");
+    }
+
+    // 22. Optional fallback after 503 UNAVAILABLE & empty fallback handling
+    {
+      // 22a: Empty fallback fails immediately on 503 after 1 call
+      process.env.GEMINI_MODEL = "gemini-3.5-flash";
+      process.env.GEMINI_FALLBACK_MODELS = "";
+      {
+        const attempts: string[] = [];
+        const app = createApp({
+          geminiInvoker: async ({ model }) => {
+            attempts.push(model);
+            throw Object.assign(new Error("503 UNAVAILABLE: Model overloaded"), { status: 503 });
+          },
+        });
+        const { server, baseUrl } = await startTempServer(app);
+        try {
+          const res = await fetch(`${baseUrl}/api/ai/storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: cookieA },
+            body: JSON.stringify({
+              mode: "prompt-to-video",
+              prompt: "Test empty fallback on 503",
+              targetDurationSec: 15,
+              aspectRatio: "16:9",
+              style: "Cinematic",
+              language: "English",
+            }),
+          });
+          assert.equal(res.status, 503);
+          assert.deepEqual(attempts, ["gemini-3.5-flash"]);
+          const body = (await res.json()) as { errorCategory?: string };
+          assert.equal(body.errorCategory, "UNAVAILABLE");
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      }
+
+      // 22b: Configured fallback succeeds after primary 503 and records fallback model metadata
+      process.env.GEMINI_MODEL = "gemini-3.5-flash";
+      process.env.GEMINI_FALLBACK_MODELS = "gemini-fallback-ok";
+      {
+        const attempts: string[] = [];
+        const app = createApp({
+          geminiInvoker: async ({ model }) => {
+            attempts.push(model);
+            if (model === "gemini-3.5-flash") {
+              throw Object.assign(new Error("503 UNAVAILABLE"), { status: 503 });
+            }
+            return { text: JSON.stringify(makeValidRawAiStoryboard()) };
+          },
+        });
+        const { server, baseUrl } = await startTempServer(app);
+        try {
+          const res = await fetch(`${baseUrl}/api/ai/storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: cookieA },
+            body: JSON.stringify({
+              mode: "prompt-to-video",
+              prompt: "Test fallback after 503",
+              targetDurationSec: 15,
+              aspectRatio: "16:9",
+              style: "Cinematic",
+              language: "English",
+            }),
+          });
+          assert.equal(res.status, 200);
+          assert.deepEqual(attempts, ["gemini-3.5-flash", "gemini-fallback-ok"]);
+          const body = (await res.json()) as { model: string; storyboard: VideoStoryboard };
+          assert.equal(body.model, "gemini-fallback-ok");
+          assert.equal(body.storyboard.model, "gemini-fallback-ok");
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      }
+
+      // 22c: All configured models unavailable (capped at max 3 attempts)
+      process.env.GEMINI_MODEL = "m1";
+      process.env.GEMINI_FALLBACK_MODELS = "m2,m3,m4";
+      {
+        const attempts: string[] = [];
+        const app = createApp({
+          geminiInvoker: async ({ model }) => {
+            attempts.push(model);
+            throw Object.assign(new Error("503 UNAVAILABLE"), { status: 503 });
+          },
+        });
+        const { server, baseUrl } = await startTempServer(app);
+        try {
+          const res = await fetch(`${baseUrl}/api/ai/storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: cookieA },
+            body: JSON.stringify({
+              mode: "prompt-to-video",
+              prompt: "Test all models unavailable",
+              targetDurationSec: 15,
+              aspectRatio: "16:9",
+              style: "Cinematic",
+              language: "English",
+            }),
+          });
+          assert.equal(res.status, 503);
+          assert.deepEqual(attempts, ["m1", "m2", "m3"]);
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      }
+
+      delete process.env.GEMINI_MODEL;
+      delete process.env.GEMINI_FALLBACK_MODELS;
+      console.log("[PASS] 22. Empty fallback, 503 fallback recovery, and max-attempt limit");
+    }
+
+    // 23. No fallback on auth errors (401/403), invalid arguments (400), not found (404), safety blocks, or quota (429)
+    {
+      process.env.GEMINI_MODEL = "gemini-3.5-flash";
+      process.env.GEMINI_FALLBACK_MODELS = "gemini-fallback-should-not-run";
+      try {
+        const nonRetryCases = [
+          {
+            label: "401 UNAUTHENTICATED",
+            err: Object.assign(new Error("401 UNAUTHENTICATED"), { status: 401 }),
+            expectedHttp: 503,
+            expectedCategory: "UNAUTHENTICATED",
+          },
+          {
+            label: "403 PERMISSION_DENIED",
+            err: Object.assign(new Error("403 PERMISSION_DENIED"), { status: 403 }),
+            expectedHttp: 403,
+            expectedCategory: "PERMISSION_DENIED",
+          },
+          {
+            label: "400 INVALID_ARGUMENT",
+            err: Object.assign(new Error("400 INVALID_ARGUMENT"), { status: 400 }),
+            expectedHttp: 400,
+            expectedCategory: "INVALID_ARGUMENT",
+          },
+          {
+            label: "404 NOT_FOUND",
+            err: Object.assign(new Error("404 NOT_FOUND"), { status: 404 }),
+            expectedHttp: 404,
+            expectedCategory: "NOT_FOUND",
+          },
+          {
+            label: "429 RESOURCE_EXHAUSTED",
+            err: Object.assign(new Error("429 RESOURCE_EXHAUSTED"), { status: 429 }),
+            expectedHttp: 429,
+            expectedCategory: "RESOURCE_EXHAUSTED",
+          },
+          {
+            label: "SAFETY_BLOCK",
+            err: new Error("SAFETY: blocked by filter"),
+            expectedHttp: 422,
+            expectedCategory: "SAFETY_BLOCK",
+          },
+        ];
+
+        for (const c of nonRetryCases) {
+          const attempts: string[] = [];
+          const app = createApp({
+            geminiInvoker: async ({ model }) => {
+              attempts.push(model);
+              throw c.err;
+            },
+          });
+          const { server, baseUrl } = await startTempServer(app);
+          try {
+            const res = await fetch(`${baseUrl}/api/ai/storyboard`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Cookie: cookieA },
+              body: JSON.stringify({
+                mode: "prompt-to-video",
+                prompt: `Test non-retryable ${c.label}`,
+                targetDurationSec: 15,
+                aspectRatio: "16:9",
+                style: "Cinematic",
+                language: "English",
+              }),
+            });
+            assert.equal(res.status, c.expectedHttp, `${c.label} status mismatch`);
+            assert.deepEqual(
+              attempts,
+              ["gemini-3.5-flash"],
+              `${c.label} must NOT invoke fallback model`
+            );
+            const body = (await res.json()) as { errorCategory?: string };
+            assert.equal(body.errorCategory, c.expectedCategory);
+          } finally {
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+          }
+        }
+      } finally {
+        delete process.env.GEMINI_MODEL;
+        delete process.env.GEMINI_FALLBACK_MODELS;
+      }
+      console.log("[PASS] 23. No fallback on 400, 401, 403, 404, 429, or safety blocks");
+    }
+
+    // 24. Cancellation stops fallback immediately & AI Editing Assistant end-to-end compatibility
+    {
+      process.env.GEMINI_MODEL = "gemini-3.5-flash";
+      process.env.GEMINI_FALLBACK_MODELS = "gemini-assistant-fallback";
+      try {
+        // 24a: Cancellation during primary 503 / hang must not invoke fallback
+        const cancelAttempts: string[] = [];
+        const abortApp = createApp({
+          geminiInvoker: async ({ model, abortSignal }) => {
+            cancelAttempts.push(model);
+            return new Promise<{ text?: string }>((_resolve, reject) => {
+              abortSignal.addEventListener("abort", () => reject(new Error("Aborted")), {
+                once: true,
+              });
+            });
+          },
+        });
+        const abortSrv = await startTempServer(abortApp);
+        try {
+          const clientAbort = new AbortController();
+          const reqPromise = fetch(`${abortSrv.baseUrl}/api/ai/storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Cookie: cookieA },
+            body: JSON.stringify({
+              mode: "prompt-to-video",
+              prompt: "Cancel before fallback",
+              targetDurationSec: 15,
+              aspectRatio: "16:9",
+              style: "Cinematic",
+              language: "English",
+            }),
+            signal: clientAbort.signal,
+          });
+          await new Promise((r) => setTimeout(r, 30));
+          clientAbort.abort();
+          await assert.rejects(reqPromise);
+          await new Promise((r) => setTimeout(r, 40));
+          assert.deepEqual(cancelAttempts, ["gemini-3.5-flash"]);
+          assert.equal(hasActiveStoryboardGeneration(userAId), false);
+        } finally {
+          await new Promise<void>((resolve) => abortSrv.server.close(() => resolve()));
+        }
+
+        // 24b: POST /api/ai/assistant uses shared model selection + fallback and returns actual model
+        const assistantAttempts: string[] = [];
+        const assistantApp = createApp({
+          geminiInvoker: async ({ model }) => {
+            assistantAttempts.push(model);
+            if (model === "gemini-3.5-flash") {
+              throw Object.assign(new Error("503 UNAVAILABLE"), { status: 503 });
+            }
+            return {
+              text: JSON.stringify({
+                summary: "Applied cinematic preset to first clip.",
+                operations: [
+                  {
+                    type: "set_clip_effects",
+                    clipId: "clip_1",
+                    preset: "cinematic",
+                    reason: "Requested cinematic look",
+                  },
+                ],
+              }),
+            };
+          },
+        });
+        const assistantSrv = await startTempServer(assistantApp);
+        try {
+          const res = await fetch(`${assistantSrv.baseUrl}/api/ai/assistant`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: "Apply cinematic filter to clip 1",
+              timelineMetadata: {
+                projectId: "local_proj",
+                projectName: "Test Cut",
+                aspectRatio: "16:9",
+                resolution: "1080p",
+                fps: 24,
+                durationSeconds: 10,
+                selectedClipId: "clip_1",
+                playheadTime: 0,
+                clips: [
+                  {
+                    id: "clip_1",
+                    name: "Intro.mp4",
+                    kind: "video",
+                    trackId: "track_v1",
+                    startTime: 0,
+                    duration: 10,
+                    inPoint: 0,
+                    sourceDuration: 10,
+                    speed: 1,
+                    volume: 1,
+                  },
+                ],
+              },
+            }),
+          });
+          assert.equal(res.status, 200);
+          const body = (await res.json()) as {
+            status: string;
+            model: string;
+            plan: { summary: string; operations: unknown[] };
+          };
+          assert.equal(body.status, "ok");
+          assert.deepEqual(assistantAttempts, ["gemini-3.5-flash", "gemini-assistant-fallback"]);
+          assert.equal(body.model, "gemini-assistant-fallback");
+          assert.equal(body.plan.operations.length, 1);
+        } finally {
+          await new Promise<void>((resolve) => assistantSrv.server.close(() => resolve()));
+        }
+      } finally {
+        delete process.env.GEMINI_MODEL;
+        delete process.env.GEMINI_FALLBACK_MODELS;
+      }
+      console.log("[PASS] 24. Cancellation prevents fallback & AI Editing Assistant uses shared model selection");
     }
   });
 

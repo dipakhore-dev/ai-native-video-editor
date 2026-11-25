@@ -19,6 +19,7 @@ export interface ApiResult<T> {
   status: number;
   data?: T;
   error?: string;
+  errorCategory?: string;
   integrationPoint?: string;
   cancelled?: boolean;
   jobId?: string;
@@ -30,8 +31,13 @@ export function registerSessionExpiredHandler(handler: (() => void) | null): voi
   sessionExpiredHandler = handler;
 }
 
-function shouldTriggerSessionExpired(url: string, status: number): boolean {
+function shouldTriggerSessionExpired(
+  url: string,
+  status: number,
+  body?: { errorCategory?: string; integrationPoint?: string }
+): boolean {
   if (status !== 401) return false;
+  if (body?.errorCategory || body?.integrationPoint) return false;
   return (
     !url.startsWith("/api/auth/me") &&
     !url.startsWith("/api/auth/login") &&
@@ -52,7 +58,7 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiRe
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (shouldTriggerSessionExpired(url, res.status)) {
+      if (shouldTriggerSessionExpired(url, res.status, body)) {
         sessionExpiredHandler?.();
       }
       return {
@@ -60,6 +66,7 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<ApiRe
         status: res.status,
         data: body as T,
         error: body.error || body.message || `Request failed (${res.status})`,
+        errorCategory: body.errorCategory,
         integrationPoint: body.integrationPoint,
       };
     }

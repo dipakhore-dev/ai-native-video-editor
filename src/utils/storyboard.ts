@@ -378,7 +378,7 @@ export function validateStoryboardInvariants(
 export function buildValidatedStoryboardFromAi(
   rawJson: unknown,
   input: ValidatedStoryboardInput,
-  modelName = "gemini-4-hydrogen"
+  modelName = "gemini-3.5-flash"
 ): VideoStoryboard {
   const parsed = AiStoryboardOutputSchema.safeParse(rawJson);
   if (!parsed.success) {

@@ -70,8 +70,10 @@ JWT_SECRET="replace-with-your-own-random-32-char-secret"
 JWT_EXPIRES_IN="7d"
 AUTH_COOKIE_NAME="ai_studio_auth"
 
-# Optional Gemini key for the AI Timeline Assistant
+# Gemini key and configurable model for AI Assistant & Storyboard Generator
 GEMINI_API_KEY="your-gemini-api-key"
+GEMINI_MODEL="gemini-3.5-flash"
+GEMINI_FALLBACK_MODELS=""
 
 # Local Python FastAPI FFmpeg/FFprobe/faster-whisper service
 VIDEO_PROCESSOR_URL="http://127.0.0.1:8001"

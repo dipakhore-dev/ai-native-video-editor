@@ -1,4 +1,5 @@
 import mongoose, { Schema, type Document, type Model } from "mongoose";
+import { getEnvConfig } from "../config/env.ts";
 import type {
   AspectRatioOption,
   StoryboardLanguage,
@@ -68,7 +69,7 @@ const StoryboardDraftSchema = new Schema<IStoryboardDraft>(
     },
     modelName: {
       type: String,
-      default: "gemini-4-hydrogen",
+      default: () => getEnvConfig().geminiModel,
       maxlength: 80,
     },
     storyboard: {

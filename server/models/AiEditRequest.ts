@@ -1,4 +1,5 @@
 import mongoose, { Schema, type Document, type Model } from "mongoose";
+import { getEnvConfig } from "../config/env.ts";
 
 export interface IAiEditRequest extends Document {
   userId: mongoose.Types.ObjectId;
@@ -37,7 +38,7 @@ const AiEditRequestSchema = new Schema<IAiEditRequest>(
     modelName: {
       type: String,
       required: true,
-      default: "gemini-4-hydrogen",
+      default: () => getEnvConfig().geminiModel,
     },
     timelineMetadataSnapshot: {
       type: Schema.Types.Mixed,

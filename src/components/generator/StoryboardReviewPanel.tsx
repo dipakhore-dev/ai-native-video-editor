@@ -164,6 +164,12 @@ export function StoryboardReviewPanel({
               <span>
                 {storyboard.scenes.length} / {MAX_STORYBOARD_SCENES} Scenes
               </span>
+              {storyboard.model && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono text-zinc-500">{storyboard.model}</span>
+                </>
+              )}
             </div>
 
             <input

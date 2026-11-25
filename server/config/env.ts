@@ -9,6 +9,8 @@ export interface AppEnvConfig {
   clientOrigin: string;
   corsAllowedOrigins: string[];
   geminiApiKey: string;
+  geminiModel: string;
+  geminiFallbackModels: string[];
   videoProcessorUrl: string;
   videoProcessorApiKey: string;
   redisUrl: string;
@@ -40,6 +42,51 @@ function parseBoundedInt(
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+export const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
+export const MAX_GEMINI_MODEL_ATTEMPTS = 3;
+
+const VALID_GEMINI_MODEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{1,79}$/;
+
+export function parseGeminiModelName(raw?: string): string | null {
+  if (!raw) return null;
+  let cleaned = raw.trim();
+  if (cleaned.startsWith("models/")) {
+    cleaned = cleaned.slice("models/".length).trim();
+  }
+  if (!cleaned || !VALID_GEMINI_MODEL_RE.test(cleaned)) {
+    return null;
+  }
+  return cleaned;
+}
+
+export function parseGeminiFallbackModels(
+  raw: string | undefined,
+  primaryModel: string
+): string[] {
+  if (!raw || !raw.trim()) {
+    return [];
+  }
+  const seen = new Set<string>([primaryModel]);
+  const fallbacks: string[] = [];
+  for (const part of raw.split(",")) {
+    const parsed = parseGeminiModelName(part);
+    if (!parsed || seen.has(parsed)) {
+      continue;
+    }
+    seen.add(parsed);
+    fallbacks.push(parsed);
+    if (fallbacks.length >= MAX_GEMINI_MODEL_ATTEMPTS - 1) {
+      break;
+    }
+  }
+  return fallbacks;
+}
+
+export function resolveGeminiModelCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const cfg = getEnvConfig(env);
+  return [cfg.geminiModel, ...cfg.geminiFallbackModels].slice(0, MAX_GEMINI_MODEL_ATTEMPTS);
 }
 
 export function normalizeOrigin(raw: string): string | null {
@@ -82,6 +129,11 @@ function parseAllowedOriginsList(env: NodeJS.ProcessEnv): string[] {
 
 export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig {
   const nodeEnv = (env.NODE_ENV || "development").trim() || "development";
+  const geminiModel = parseGeminiModelName(env.GEMINI_MODEL) || DEFAULT_GEMINI_MODEL;
+  const geminiFallbackModels = parseGeminiFallbackModels(
+    env.GEMINI_FALLBACK_MODELS,
+    geminiModel
+  );
   return {
     port: parseBoundedInt(env.PORT, 3000, 1, 65535),
     nodeEnv,
@@ -93,6 +145,8 @@ export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig
     clientOrigin: env.CLIENT_ORIGIN || env.APP_URL || "http://localhost:3000",
     corsAllowedOrigins: parseAllowedOriginsList(env),
     geminiApiKey: (env.GEMINI_API_KEY || "").trim(),
+    geminiModel,
+    geminiFallbackModels,
     videoProcessorUrl: (env.VIDEO_PROCESSOR_URL || "")
       .trim()
       .replace(/\/+$/, ""),
@@ -224,6 +278,14 @@ export function validateStartupEnv(env: NodeJS.ProcessEnv = process.env): Startu
       }
     } catch {
       errors.push("VIDEO_GEN_PROVIDER_URL is not a valid URL.");
+    }
+  }
+
+  if (env.GEMINI_MODEL !== undefined && env.GEMINI_MODEL.trim() !== "") {
+    if (!parseGeminiModelName(env.GEMINI_MODEL)) {
+      warnings.push(
+        `GEMINI_MODEL value is invalid; falling back to default model "${DEFAULT_GEMINI_MODEL}".`
+      );
     }
   }
 

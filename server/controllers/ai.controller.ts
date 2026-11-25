@@ -12,36 +12,77 @@ import {
   listUserStoryboardDrafts,
   updateUserAiRequestStatus,
   updateUserStoryboardDraft,
+  type GeminiJsonInvoker,
   type StoryboardGeminiInvoker,
 } from "../services/ai.service.ts";
 import type { ValidatedStoryboardInput } from "../../src/utils/storyboard.ts";
 
-export async function aiAssistantController(
-  req: AuthenticatedRequest,
-  res: Response
-): Promise<void> {
-  try {
-    const result = await generateAiEditPlan({
-      prompt: req.body.prompt,
-      timelineMetadata: req.body.timelineMetadata,
-      userId: req.userId,
-    });
-    res.json({
-      status: "ok",
-      model: result.model,
-      plan: result.plan,
-      ...(result.requestId ? { requestId: result.requestId } : {}),
-    });
-  } catch (err) {
-    const status = (err as { statusCode?: number }).statusCode || 502;
-    const integrationPoint = (err as { integrationPoint?: string }).integrationPoint;
-    res.status(status).json({
-      status: status === 503 ? "integration_required" : "error",
-      ...(integrationPoint ? { integrationPoint } : {}),
-      error: err instanceof Error ? err.message : "AI editing request failed.",
-    });
-  }
+export function createAiAssistantController(options?: {
+  geminiInvoker?: GeminiJsonInvoker;
+  timeoutMs?: number;
+}) {
+  return async function aiAssistantController(
+    req: AuthenticatedRequest,
+    res: Response
+  ): Promise<void> {
+    const abortController = new AbortController();
+    const handleClientClose = () => {
+      if (!res.writableFinished && !res.writableEnded) {
+        abortController.abort();
+      }
+    };
+    res.on("close", handleClientClose);
+
+    try {
+      const result = await generateAiEditPlan({
+        prompt: req.body.prompt,
+        timelineMetadata: req.body.timelineMetadata,
+        userId: req.userId,
+        signal: abortController.signal,
+        timeoutMs: options?.timeoutMs,
+        geminiInvoker: options?.geminiInvoker,
+      });
+      if (res.writableEnded || abortController.signal.aborted) {
+        return;
+      }
+      res.json({
+        status: "ok",
+        model: result.model,
+        plan: result.plan,
+        ...(result.requestId ? { requestId: result.requestId } : {}),
+      });
+    } catch (err) {
+      if (res.writableEnded) {
+        return;
+      }
+      const status = (err as { statusCode?: number }).statusCode || 502;
+      const integrationPoint = (err as { integrationPoint?: string }).integrationPoint;
+      const errorCategory = (err as { errorCategory?: string }).errorCategory;
+      const requestId = (err as { requestId?: string }).requestId;
+      const cancelled = Boolean((err as { cancelled?: boolean }).cancelled) || status === 499;
+      res.status(status).json({
+        status:
+          status === 503 && integrationPoint
+            ? "integration_required"
+            : cancelled
+              ? "cancelled"
+              : "error",
+        ...(cancelled ? { cancelled: true } : {}),
+        ...(integrationPoint ? { integrationPoint } : {}),
+        ...(errorCategory ? { errorCategory } : {}),
+        ...(requestId ? { requestId } : {}),
+        error: sanitizeErrorMessage(
+          err instanceof Error ? err.message : "AI editing request failed.",
+          "AI editing request failed."
+        ),
+      });
+    } finally {
+      res.off("close", handleClientClose);
+    }
+  };
 }
+
+export const aiAssistantController = createAiAssistantController();
 
 export async function listAiRequestsController(
   req: AuthenticatedRequest,
@@ -125,6 +166,8 @@ export function createGenerateStoryboardController(options?: {
       }
       const status = (err as { statusCode?: number }).statusCode || 502;
       const integrationPoint = (err as { integrationPoint?: string }).integrationPoint;
+      const errorCategory = (err as { errorCategory?: string }).errorCategory;
+      const requestId = (err as { requestId?: string }).requestId;
       const cancelled = Boolean((err as { cancelled?: boolean }).cancelled) || status === 499;
       res.status(status).json({
         status:
@@ -135,6 +178,8 @@ export function createGenerateStoryboardController(options?: {
               : "error",
         ...(cancelled ? { cancelled: true } : {}),
         ...(integrationPoint ? { integrationPoint } : {}),
+        ...(errorCategory ? { errorCategory } : {}),
+        ...(requestId ? { requestId } : {}),
         error: sanitizeErrorMessage(
           err instanceof Error ? err.message : "Storyboard generation failed.",
           "Storyboard generation failed."

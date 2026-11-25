@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { getDatabaseStatus } from "../config/database.ts";
 import {
+  getEnvConfig,
   isGeminiConfigured,
   isJwtConfigured,
   isVideoGenProviderConfigured,
@@ -62,6 +63,7 @@ apiRouter.get("/health/ready", (_req, res) => {
 });
 
 apiRouter.get("/integrations/status", async (_req, res) => {
+  const cfg = getEnvConfig();
   const db = getDatabaseStatus();
   const geminiReady = isGeminiConfigured();
   const jwtReady = isJwtConfigured();
@@ -94,10 +96,12 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         id: "aiAssistant",
         label: "Editorial AI Assistant",
         connected: geminiReady,
-        provider: geminiReady ? "Gemini 4 Hydrogen (@google/genai)" : "Server LLM Endpoint (Set GEMINI_API_KEY)",
+        provider: geminiReady
+          ? `Gemini (${cfg.geminiModel}) via @google/genai`
+          : "Server LLM Endpoint (Set GEMINI_API_KEY)",
         endpoint: "POST /api/ai/assistant",
         summary: geminiReady
-          ? "Connected to Gemini API on the Node.js server with Zod-validated timeline editing operations."
+          ? `Connected to Gemini (${cfg.geminiModel}) on the Node.js server with Zod-validated timeline editing operations.`
           : "Requires GEMINI_API_KEY in server environment to translate natural-language editing instructions.",
       },
       aiStoryboard: {
@@ -105,12 +109,12 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         label: "AI Script & Storyboard Planner",
         connected: geminiReady && db.connected && jwtReady,
         provider: geminiReady
-          ? "Gemini 4 Hydrogen Structured JSON (@google/genai)"
+          ? `Gemini (${cfg.geminiModel}) Structured JSON (@google/genai)`
           : "Requires GEMINI_API_KEY",
         endpoint: "POST /api/ai/storyboard",
         summary:
           geminiReady && db.connected && jwtReady
-            ? "Connected to Gemini API and MongoDB for authenticated script and scene-by-scene storyboard planning."
+            ? `Connected to Gemini (${cfg.geminiModel}) and MongoDB for authenticated script and scene-by-scene storyboard planning.`
             : "Generates structured scripts and storyboards at ₹0 model cost once GEMINI_API_KEY, MONGODB_URI, and JWT_SECRET are active.",
       },
       videoGeneration: {
