@@ -95,7 +95,7 @@ export async function updateUserMediaMetadata(
   return MediaAssetModel.findOneAndUpdate(
     { _id: mediaId, userId },
     { $set: updates },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
 }
 

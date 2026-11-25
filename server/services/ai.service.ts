@@ -359,7 +359,10 @@ async function executeGeminiJsonWithFallback(params: {
     });
   }
 
-  const effectiveTimeoutMs = params.timeoutMs ?? getEnvConfig().aiRequestTimeoutMs;
+  const effectiveTimeoutMs = Math.max(
+    1,
+    Math.floor(params.timeoutMs ?? getEnvConfig().aiRequestTimeoutMs)
+  );
   const controller = new AbortController();
   let timedOut = false;
   let cancelledByClient = false;
@@ -388,6 +391,8 @@ async function executeGeminiJsonWithFallback(params: {
       );
     }, effectiveTimeoutMs);
   });
+  // Guard against UnhandledPromiseRejection if the timer expires outside Promise.race (e.g. during backoff).
+  timeoutPromise.catch(() => undefined);
 
   const ai = params.geminiInvoker ? null : createGeminiClient();
   const deadline = Date.now() + effectiveTimeoutMs;
@@ -762,6 +767,15 @@ Concrete examples:
   for (let semanticAttempt = 1; semanticAttempt <= 2; semanticAttempt += 1) {
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
+      logGeminiDiagnostic({
+        requestId: correlationId,
+        operation: "assistant",
+        model: modelUsed,
+        attempt: semanticAttempt,
+        maxAttempts: 2,
+        httpStatus: 504,
+        errorCategory: "TIMEOUT",
+      });
       throw createClassifiedServiceError({
         message: "AI assistant request timed out. Please try again with a shorter instruction.",
         statusCode: 504,
@@ -937,7 +951,7 @@ export async function updateUserAiRequestStatus(
         ...(status === "applied" ? { appliedAt: new Date() } : {}),
       },
     },
-    { new: true }
+    { returnDocument: "after" }
   );
 }
 
@@ -1345,7 +1359,7 @@ export async function updateUserStoryboardDraft(
         },
       },
     },
-    { new: true }
+    { returnDocument: "after" }
   );
 }
 

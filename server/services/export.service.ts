@@ -77,6 +77,6 @@ export async function updateUserExportJobStatus(
   return ExportJobModel.findOneAndUpdate(
     filter,
     { $set: updates },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
 }

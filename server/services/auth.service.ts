@@ -107,7 +107,7 @@ export async function updateUserProfile(
   const updated = await UserModel.findByIdAndUpdate(
     userId,
     { $set: updates },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
   return updated ? toPublicUser(updated) : null;
 }

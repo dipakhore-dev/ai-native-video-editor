@@ -47,7 +47,7 @@ export async function updateUserProject(
   return ProjectModel.findOneAndUpdate(
     { _id: projectId, userId },
     { $set: updates },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
 }
 
@@ -66,7 +66,7 @@ export async function saveUserProjectTimeline(
   return ProjectModel.findOneAndUpdate(
     { _id: projectId, userId },
     { $set: timeline },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
 }
 
@@ -82,7 +82,7 @@ export async function saveUserProjectSubtitles(
   return ProjectModel.findOneAndUpdate(
     { _id: projectId, userId },
     { $set: payload },
-    { new: true, runValidators: true }
+    { returnDocument: "after", runValidators: true }
   );
 }
 
