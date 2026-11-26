@@ -17,6 +17,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .config import ProcessorSettings, get_settings, validate_runtime_settings
+from .routes.tts import router as tts_router
 from .schemas import (
     HealthResponse,
     JobStatusResponse,
@@ -40,6 +41,8 @@ from .services.ffmpeg_service import (
 )
 from .services.ffprobe_service import VideoMetadataError, check_binary, extract_video_metadata
 from .services.job_store import job_store, sanitize_error_text
+from .services.tts_providers.base import TtsCancelledError, TtsError
+from .services.tts_service import get_tts_status
 from .services.whisper_service import (
     SubtitleGenerationError,
     is_faster_whisper_available,
@@ -171,19 +174,29 @@ app = FastAPI(
 )
 
 
+app.include_router(tts_router)
+
+
 @app.middleware("http")
 async def pre_register_export_job_middleware(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/api/v1/export-mp4":
+    if request.method == "POST" and request.url.path in ("/api/v1/export-mp4", "/api/v1/tts/generate"):
         settings = get_settings()
         provided_key = request.headers.get("x-processor-key")
         if assert_processor_key_matches(provided_key, settings):
-            raw_header_id = (request.headers.get("x-export-job-id") or "").strip()
+            if request.url.path == "/api/v1/tts/generate":
+                raw_header_id = (request.headers.get("x-tts-job-id") or "").strip()
+                op_name = "tts_generate"
+                stage_label = "Preparing voiceover synthesis"
+            else:
+                raw_header_id = (request.headers.get("x-export-job-id") or "").strip()
+                op_name = "export_mp4"
+                stage_label = "Receiving uploaded media"
             if _CLIENT_JOB_ID_RE.match(raw_header_id):
                 job_store.create(
                     raw_header_id,
-                    operation="export_mp4",
+                    operation=op_name,
                     stage="uploading",
-                    stage_label="Receiving uploaded media",
+                    stage_label=stage_label,
                     measurable=False,
                     if_missing=True,
                 )
@@ -231,11 +244,33 @@ async def handle_subtitle_error(_request, exc: SubtitleGenerationError) -> JSONR
     return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
 
 
+@app.exception_handler(TtsCancelledError)
+async def handle_tts_cancelled_error(_request, exc: TtsCancelledError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": sanitize_error_text(str(exc), "Voiceover synthesis cancelled."), "cancelled": True},
+    )
+
+
+@app.exception_handler(TtsError)
+async def handle_tts_error(_request, exc: TtsError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": sanitize_error_text(str(exc)), "code": exc.code},
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthResponse:
     ffmpeg_path = check_binary(settings.ffmpeg_bin)
     ffprobe_path = check_binary(settings.ffprobe_bin)
     whisper_ok = is_faster_whisper_available()
+    tts_status = get_tts_status(settings)
+    tts_providers = [
+        str(p["provider"])
+        for p in tts_status.get("providers", [])
+        if isinstance(p, dict) and p.get("available")
+    ]
     ready = bool(ffmpeg_path and ffprobe_path)
     hw_caps = (
         detect_hardware_h264_encoders(settings.ffmpeg_bin)
@@ -257,6 +292,8 @@ def health(settings: ProcessorSettings = Depends(get_settings)) -> HealthRespons
         recommended_encoder=str(hw_caps.get("recommended_encoder") or "libx264"),
         encoder_capabilities=dict(hw_caps.get("encoders") or {}),  # type: ignore[arg-type]
         export_profiles=EXPORT_PROFILES,
+        tts_available=bool(tts_status.get("available")),
+        tts_providers=tts_providers,
     )
 
 

@@ -158,7 +158,7 @@ export function StoryboardMediaPrepSection({
             <span>Assigned: {summary.assignedCount}</span>
             <span>Unassigned: {summary.unassignedCount}</span>
             <span>Missing/Invalid: {summary.missingOrInvalidCount}</span>
-            <span>Composition Ready: No (Phase 5.5.3+)</span>
+            <span>Composition Ready: No (Phase 5.5.4+)</span>
           </div>
 
           <label className="inline-flex items-center gap-1.5 text-zinc-400 cursor-pointer">

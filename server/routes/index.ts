@@ -18,7 +18,9 @@ import { aiRouter } from "./ai.routes.ts";
 import { exportRouter } from "./export.routes.ts";
 import { videoProcessingRouter } from "./videoProcessing.routes.ts";
 import { stockMediaRouter } from "./stockMedia.routes.ts";
+import { ttsRouter } from "./tts.routes.ts";
 import { getStockMediaStatus } from "../services/stockMedia.service.ts";
+import { fetchProcessorTtsStatus } from "../services/tts.service.ts";
 
 export const apiRouter = Router();
 
@@ -71,7 +73,10 @@ apiRouter.get("/integrations/status", async (_req, res) => {
   const jwtReady = isJwtConfigured();
   const videoGenReady = isVideoGenProviderConfigured();
   const queueStatus = getVideoQueueStatus();
-  const processorHealth = await checkVideoProcessorHealth();
+  const [processorHealth, ttsStatus] = await Promise.all([
+    checkVideoProcessorHealth(),
+    fetchProcessorTtsStatus(),
+  ]);
   const stockStatus = getStockMediaStatus();
 
   res.json({
@@ -203,6 +208,18 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         endpoint: "POST /api/stock-media/search",
         summary: stockStatus.message,
       },
+      tts: {
+        id: "tts",
+        label: "Local Text-to-Speech (Voiceover)",
+        connected: ttsStatus.enabled && ttsStatus.available,
+        provider: !ttsStatus.enabled
+          ? "Disabled (TTS_ENABLED=false)"
+          : ttsStatus.available
+            ? `Local Offline TTS (${ttsStatus.activeProvider || "active"})`
+            : "Optional (Install eSpeak NG or Piper TTS)",
+        endpoint: "POST /api/tts/generate",
+        summary: ttsStatus.message,
+      },
     },
     checkedAt: new Date().toISOString(),
   });
@@ -215,3 +232,4 @@ apiRouter.use("/ai", aiRouter);
 apiRouter.use("/exports", exportRouter);
 apiRouter.use("/video", videoProcessingRouter);
 apiRouter.use("/stock-media", stockMediaRouter);
+apiRouter.use("/tts", ttsRouter);

@@ -22,6 +22,7 @@ import {
   reconcileOrphanedVideoJobsOnStartup,
   shutdownVideoExports,
 } from "./server/services/videoProcessor.service.ts";
+import { shutdownActiveTtsJobs } from "./server/services/tts.service.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -96,6 +97,7 @@ async function startServer() {
     clearInterval(cleanupTimer);
 
     await shutdownVideoExports().catch(() => undefined);
+    await shutdownActiveTtsJobs().catch(() => undefined);
     await cleanupStaleExpressUploads(EXPRESS_UPLOAD_TEMP_DIR, 0).catch(() => undefined);
 
     await new Promise<void>((resolve) => {

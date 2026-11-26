@@ -289,14 +289,17 @@ export function scoreAssetForScene(
     alreadyUsedAssetIds?: Set<string>;
   }
 ): SceneMediaScoreBreakdown {
-  if (asset.kind !== "video" && asset.kind !== "image") {
+  if (
+    asset.sourceOrigin === "generated_voiceover" ||
+    (asset.kind !== "video" && asset.kind !== "image")
+  ) {
     return {
       score: 0,
       matchedKeywords: [],
       aspectCompatible: false,
       durationFits: false,
-      warnings: ["Audio-only media cannot be assigned as the primary scene visual."],
-      explanation: "Excluded: audio-only asset.",
+      warnings: ["Audio-only and generated voiceover files cannot be assigned as primary scene visuals."],
+      explanation: "Excluded: audio-only or generated voiceover asset cannot be assigned as primary scene visual.",
     };
   }
 
@@ -427,7 +430,10 @@ export function autoMatchStoryboardScenes(
   const avoidDuplicates = options?.avoidDuplicates !== false;
   const minScore = options?.minScore ?? 24;
 
-  const eligibleAssets = mediaAssets.filter((a) => a.kind === "video" || a.kind === "image");
+  const eligibleAssets = mediaAssets.filter(
+    (a) =>
+      a.sourceOrigin !== "generated_voiceover" && (a.kind === "video" || a.kind === "image")
+  );
   const assetsById = new Map(eligibleAssets.map((a) => [a.id, a]));
   const usedAssetIds = new Set<string>();
 
@@ -815,6 +821,10 @@ export function findStoryboardsUsingAsset(
   storyboards: VideoStoryboard[]
 ): VideoStoryboard[] {
   return storyboards.filter((sb) =>
-    sb.scenes.some((scene) => scene.mediaAssignment?.mediaAssetId === assetId)
+    sb.scenes.some(
+      (scene) =>
+        scene.mediaAssignment?.mediaAssetId === assetId ||
+        scene.voiceover?.mediaAssetId === assetId
+    )
   );
 }

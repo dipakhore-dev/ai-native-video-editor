@@ -5,3 +5,9 @@ python-multipart>=0.0.12,<1.0.0
 faster-whisper>=1.0.3,<2.0.0
 pytest>=8.3.0,<9.0.0
 httpx>=0.27.0,<1.0.0
+
+# Optional local TTS engines (external CLI binaries recommended on Windows):
+# - eSpeak NG (GPL-3.0-or-later): install eSpeak NG CLI and set ESPEAK_NG_PATH if not on PATH
+# - Piper TTS (GPL-3.0-or-later via piper1-gpl): install Piper CLI / models and set PIPER_EXECUTABLE_PATH + PIPER_MODELS_DIR
+# - Optional Windows SAPI5 Python wrapper (MPL-2.0, Windows-only): pip install pyttsx3>=2.90,<3.0
+

@@ -40,7 +40,7 @@ export async function createUserMediaMetadata(
     storageKey?: string;
     tags?: string[];
     description?: string;
-    sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide";
+    sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide" | "generated_voiceover";
     providerName?: string;
     providerAssetId?: string;
     sourceUrl?: string;

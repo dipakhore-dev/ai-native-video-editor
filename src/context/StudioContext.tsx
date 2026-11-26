@@ -155,6 +155,7 @@ interface StudioContextValue {
       attributionUrl?: string;
       licenseInfo?: string;
       generatedSlideConfig?: GeneratedSlideConfig;
+      durationOverride?: number;
     },
     options?: { reuseDuplicate?: boolean }
   ) => Promise<MediaAsset | null>;
@@ -878,6 +879,9 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           if (scene.mediaAssignment?.mediaAssetId) {
             storyboardAssetIds.add(scene.mediaAssignment.mediaAssetId);
           }
+          if (scene.voiceover?.mediaAssetId) {
+            storyboardAssetIds.add(scene.voiceover.mediaAssetId);
+          }
         }
       }
       const filteredCandidates = candidateAssetIds.filter((id) => !storyboardAssetIds.has(id));
@@ -1000,6 +1004,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         attributionUrl?: string;
         licenseInfo?: string;
         generatedSlideConfig?: GeneratedSlideConfig;
+        durationOverride?: number;
       },
       options?: { reuseDuplicate?: boolean }
     ): Promise<MediaAsset | null> => {
@@ -1035,8 +1040,16 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         }
 
         const extracted = await extractMediaAsset(file);
+        const finalDuration =
+          metadata?.durationOverride &&
+          Number.isFinite(metadata.durationOverride) &&
+          metadata.durationOverride > 0
+            ? Number(metadata.durationOverride.toFixed(3))
+            : extracted.duration;
+
         extractedAsset = {
           ...extracted,
+          duration: finalDuration,
           ...(metadata?.tags ? { tags: metadata.tags } : {}),
           ...(metadata?.description ? { description: metadata.description } : {}),
           ...(metadata?.sourceOrigin ? { sourceOrigin: metadata.sourceOrigin } : { sourceOrigin: "uploaded" }),

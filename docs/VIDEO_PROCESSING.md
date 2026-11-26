@@ -64,3 +64,13 @@ Point the service root directory to `video-processor/` and deploy using `video-p
   - Point readiness probes to Express `GET /api/health/ready` and FastAPI `GET /health` (system paths are redacted).
   - On `SIGTERM` / `SIGINT`, FastAPI stops new work, terminates active FFmpeg child processes, and cleans temp job directories.
 
+---
+
+## Offline Local TTS Subsystem (Phase 5.5.3)
+
+- **Endpoints (`video-processor/app/routes/tts.py`)**:
+  - `GET /api/v1/tts/status`, `GET /api/v1/tts/voices`, `POST /api/v1/tts/generate`, `GET /api/v1/tts/jobs/{job_id}`, `POST /api/v1/tts/jobs/{job_id}/cancel` (protected by `verify_processor_key`).
+- **Engines**: Piper ONNX (`piper`), eSpeak NG (`espeak-ng`), and optional isolated Windows SAPI5 (`pyttsx3`). All child processes launch with `shell=False` and UTF-8 stdin piping (`en`, `hi`, `bn`).
+- **Audio Normalization**: Output is standardized via FFmpeg (`-protocol_whitelist file,pipe`) to mono PCM 16-bit WAV (`22050 Hz` default) or optional MP3 (`libmp3lame`), and real durations are verified via FFprobe before streaming `FileResponse` with automatic temp directory cleanup.
+
+

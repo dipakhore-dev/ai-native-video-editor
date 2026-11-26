@@ -262,6 +262,72 @@ export const StoryboardMediaSummarySchema = z.object({
   isMediaReady: z.boolean(),
 });
 
+export const TtsLanguageCodeEnum = z.enum(["en", "hi", "bn"]);
+export const TtsEngineIdEnum = z.enum(["piper", "espeak_ng", "windows_sapi"]);
+export const TtsProviderIdEnum = z.enum(["auto", "piper", "espeak_ng", "windows_sapi", "none"]);
+export const TtsAudioFormatEnum = z.enum(["wav", "mp3"]);
+export const SceneVoiceoverStatusEnum = z.enum([
+  "none",
+  "generating",
+  "ready",
+  "stale",
+  "missing",
+  "failed",
+  "skipped_empty",
+]);
+
+export const StoryboardSceneVoiceoverSchema = z.object({
+  sceneId: z.string().trim().min(1).max(64),
+  mediaAssetId: z
+    .string()
+    .trim()
+    .max(160)
+    .refine((val) => !/^blob:/i.test(val), {
+      message: "Voiceover asset ID cannot be a blob URL.",
+    })
+    .optional(),
+  provider: TtsEngineIdEnum,
+  voiceId: z.string().trim().min(1).max(160),
+  voiceLabel: z.string().trim().min(1).max(200),
+  language: TtsLanguageCodeEnum,
+  speakingRate: z.number().finite().min(0.6).max(1.5).default(1.0),
+  pitch: z.number().finite().min(-20).max(20).default(0),
+  volume: z.number().finite().min(0).max(2).default(1),
+  format: TtsAudioFormatEnum.default("wav"),
+  mimeType: z.string().trim().min(1).max(80),
+  durationSeconds: z.number().finite().min(0).max(3600),
+  sizeBytes: z.number().int().min(0).max(100 * 1024 * 1024),
+  sampleRateHz: z.number().int().min(8000).max(96000),
+  channels: z.number().int().min(1).max(8),
+  narrationFingerprint: z.string().trim().min(1).max(128),
+  generatedAt: z.string().trim().min(1).max(64),
+  status: SceneVoiceoverStatusEnum,
+  errorMessage: z.string().trim().max(400).optional(),
+});
+
+export const StoryboardVoiceoverSettingsSchema = z.object({
+  provider: TtsProviderIdEnum.default("auto"),
+  voiceId: z.string().trim().max(160).optional(),
+  speakingRate: z.number().finite().min(0.6).max(1.5).default(1.0),
+  pitch: z.number().finite().min(-20).max(20).default(0),
+  format: TtsAudioFormatEnum.default("wav"),
+  volume: z.number().finite().min(0).max(2).default(1),
+});
+
+export const StoryboardVoiceoverSummarySchema = z.object({
+  totalScenes: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  spokenScenes: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  readyCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  staleCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  missingCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  failedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  unassignedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  overflowCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  totalAudioDurationSec: z.number().finite().min(0).max(86_400),
+  progressPercent: z.number().min(0).max(100),
+  isVoiceoverReady: z.boolean(),
+});
+
 export const StoryboardSceneSchema = z.object({
   id: z
     .string()
@@ -292,6 +358,7 @@ export const StoryboardSceneSchema = z.object({
   effect: EffectPresetEnum,
   cameraMotion: StoryboardCameraMotionEnum,
   mediaAssignment: StoryboardSceneMediaAssignmentSchema.optional(),
+  voiceover: StoryboardSceneVoiceoverSchema.optional(),
 });
 
 export const AiStoryboardOutputSchema = z.object({
@@ -343,6 +410,8 @@ export const VideoStoryboardSchema = z.object({
   model: z.string().trim().max(80).optional(),
   compositionReady: z.literal(false),
   mediaReadinessSummary: StoryboardMediaSummarySchema.optional(),
+  voiceoverSettings: StoryboardVoiceoverSettingsSchema.optional(),
+  voiceoverSummary: StoryboardVoiceoverSummarySchema.optional(),
   createdAt: z.string().trim().max(64),
   updatedAt: z.string().trim().max(64),
 });
@@ -650,23 +719,55 @@ export function sanitizeStoryboardForPersistence(storyboard: VideoStoryboard): V
   return {
     ...storyboard,
     scenes: storyboard.scenes.map((scene) => {
-      if (!scene.mediaAssignment) return scene;
-      const a = scene.mediaAssignment;
+      const nextAssignment = scene.mediaAssignment
+        ? {
+            ...scene.mediaAssignment,
+            sceneId: scene.id,
+            ...(scene.mediaAssignment.thumbnailRef &&
+            !/^blob:/i.test(scene.mediaAssignment.thumbnailRef)
+              ? { thumbnailRef: scene.mediaAssignment.thumbnailRef }
+              : { thumbnailRef: undefined }),
+            ...(scene.mediaAssignment.sourceUrl &&
+            !/^blob:/i.test(scene.mediaAssignment.sourceUrl)
+              ? { sourceUrl: scene.mediaAssignment.sourceUrl }
+              : { sourceUrl: undefined }),
+            ...(scene.mediaAssignment.attributionUrl &&
+            !/^blob:/i.test(scene.mediaAssignment.attributionUrl)
+              ? { attributionUrl: scene.mediaAssignment.attributionUrl }
+              : { attributionUrl: undefined }),
+          }
+        : undefined;
+
+      const cleanedVoiceoverMediaAssetId =
+        scene.voiceover?.mediaAssetId && !/^blob:/i.test(scene.voiceover.mediaAssetId)
+          ? scene.voiceover.mediaAssetId
+          : undefined;
+      const cleanedVoiceoverError =
+        scene.voiceover?.errorMessage && !/^blob:/i.test(scene.voiceover.errorMessage)
+          ? scene.voiceover.errorMessage
+          : undefined;
+
+      const nextVoiceover = scene.voiceover
+        ? {
+            ...scene.voiceover,
+            sceneId: scene.id,
+            mediaAssetId: cleanedVoiceoverMediaAssetId,
+            errorMessage: cleanedVoiceoverError,
+            status:
+              scene.voiceover.status === "generating"
+                ? cleanedVoiceoverMediaAssetId
+                  ? ("ready" as const)
+                  : ("failed" as const)
+                : scene.voiceover.status === "ready" && !cleanedVoiceoverMediaAssetId
+                  ? ("missing" as const)
+                  : scene.voiceover.status,
+          }
+        : undefined;
+
       return {
         ...scene,
-        mediaAssignment: {
-          ...a,
-          sceneId: scene.id,
-          ...(a.thumbnailRef && !/^blob:/i.test(a.thumbnailRef)
-            ? { thumbnailRef: a.thumbnailRef }
-            : { thumbnailRef: undefined }),
-          ...(a.sourceUrl && !/^blob:/i.test(a.sourceUrl)
-            ? { sourceUrl: a.sourceUrl }
-            : { sourceUrl: undefined }),
-          ...(a.attributionUrl && !/^blob:/i.test(a.attributionUrl)
-            ? { attributionUrl: a.attributionUrl }
-            : { attributionUrl: undefined }),
-        },
+        ...(nextAssignment ? { mediaAssignment: nextAssignment } : {}),
+        ...(nextVoiceover ? { voiceover: nextVoiceover } : {}),
       };
     }),
   };

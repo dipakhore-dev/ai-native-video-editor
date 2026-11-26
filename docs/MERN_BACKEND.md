@@ -51,11 +51,13 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 - `POST /api/stock-media/search` — Search Pexels photos or videos using authenticated server-side API key (`503` when disabled; rate-limited; SSRF-guarded).
 - `POST /api/stock-media/import` — Server-side proxy download of an allowlisted Pexels asset with HTTPS/DNS SSRF checks, bounded byte streaming (`STOCK_MEDIA_MAX_IMPORT_MB`), magic-byte signature validation, and `X-Stock-*` attribution headers for client IndexedDB persistence.
 
-### AI Editing & Export Job Tracking
+### AI Editing, Storyboard Voiceover & Export Job Tracking
 - `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using the configured Gemini model (default: `gemini-3.5-flash`); persists `AiEditRequest` when authenticated with MongoDB.
 - `POST /api/ai/storyboard` — Generate a Zod-validated `VideoStoryboard` from a prompt or script using the configured Gemini model (default: `gemini-3.5-flash`) with optional transient fallback (`GEMINI_FALLBACK_MODELS`), per-user concurrency guard, and cancellation support (`requireAuth`).
-- `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`).
+- `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`; stores lightweight `mediaAssignment` & `voiceover` metadata without binary audio or `blob:` URLs).
 - `GET /api/ai/storyboards/:id`, `PATCH /api/ai/storyboards/:id`, `DELETE /api/ai/storyboards/:id` — Fetch, update, or delete an owner-scoped `StoryboardDraft` (`requireAuth`).
+- `GET /api/tts/status` & `GET /api/tts/voices` — Inspect local Python TTS provider readiness (`piper`, `espeak_ng`, optional `windows_sapi`) and language-filtered voices (`en`/`hi`/`bn`) (`requireAuth`).
+- `POST /api/tts/generate`, `GET /api/tts/jobs/:id`, `POST /api/tts/jobs/:id/cancel` — Auth-, CSRF-, and rate-limit-guarded proxy returning FFmpeg-normalized WAV/MP3 audio + `X-TTS-*` headers and job cancellation (`requireAuth`).
 - `GET /api/ai/requests` — List user's saved AI editing requests (`requireAuth`).
 - `PATCH /api/ai/requests/:id` — Mark an AI edit proposal `applied` or `discarded` (`requireAuth`).
 - `GET /api/exports` — List user's export jobs (`requireAuth`).

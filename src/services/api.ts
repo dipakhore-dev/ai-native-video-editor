@@ -7,6 +7,12 @@ import type {
   SubtitleSegment,
   SubtitleStyle,
   TimelineClip,
+  TtsAudioFormat,
+  TtsEngineId,
+  TtsLanguageCode,
+  TtsProviderId,
+  TtsStatusInfo,
+  TtsVoiceOption,
   VideoGenerationRequest,
   VideoStoryboard,
 } from "../types/studio";
@@ -1217,6 +1223,253 @@ export async function deleteServerVideoJob(
 ): Promise<ApiResult<{ status: string; deleted: boolean }>> {
   return requestJson(`/api/video/jobs/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
+  });
+}
+
+export interface TtsVoicesResponseDto {
+  available: boolean;
+  provider: string | null;
+  language: TtsLanguageCode | null;
+  voices: TtsVoiceOption[];
+  supportedLanguages: TtsLanguageCode[];
+  message: string;
+}
+
+export interface TtsJobSnapshotDto {
+  jobId: string;
+  userId?: string;
+  status: "queued" | "processing" | "completed" | "failed" | "cancelled";
+  stage: string;
+  stageLabel: string;
+  cancelled: boolean;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  error?: string | null;
+}
+
+export interface TtsGenerateBinaryResult {
+  file: File;
+  jobId: string;
+  provider: TtsEngineId;
+  voiceId: string;
+  voiceLabel: string;
+  language: TtsLanguageCode;
+  durationSeconds: number;
+  sampleRateHz: number;
+  channels: number;
+  format: TtsAudioFormat;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+function decodeHeaderSafe(raw: string | null, fallback: string): string {
+  if (!raw) return fallback;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+export async function fetchTtsStatus(): Promise<ApiResult<TtsStatusInfo>> {
+  return requestJson("/api/tts/status");
+}
+
+export async function fetchTtsVoices(options?: {
+  language?: TtsLanguageCode | string;
+  provider?: TtsProviderId;
+}): Promise<ApiResult<TtsVoicesResponseDto>> {
+  const params = new URLSearchParams();
+  if (options?.language) {
+    params.set("language", String(options.language));
+  }
+  if (options?.provider && options.provider !== "auto" && options.provider !== "none") {
+    params.set("provider", options.provider);
+  }
+  const qs = params.toString() ? `?${params.toString()}` : "";
+  return requestJson(`/api/tts/voices${qs}`);
+}
+
+export async function generateTtsVoiceover(
+  payload: {
+    text: string;
+    language: TtsLanguageCode;
+    provider?: TtsProviderId;
+    voiceId?: string;
+    speakingRate: number;
+    pitch: number;
+    format: TtsAudioFormat;
+    clientJobId?: string;
+    sceneId?: string;
+    storyboardId?: string;
+  },
+  options?: { clientJobId?: string; signal?: AbortSignal }
+): Promise<ApiResult<TtsGenerateBinaryResult>> {
+  const effectiveClientJobId = options?.clientJobId || payload.clientJobId;
+  try {
+    const res = await fetch("/api/tts/generate", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Requested-With": "AIStudioClient",
+        ...(effectiveClientJobId ? { "X-TTS-Job-Id": effectiveClientJobId } : {}),
+      },
+      body: JSON.stringify({
+        text: payload.text,
+        language: payload.language,
+        ...(payload.provider && payload.provider !== "none"
+          ? { provider: payload.provider }
+          : {}),
+        ...(payload.voiceId ? { voiceId: payload.voiceId } : {}),
+        speakingRate: payload.speakingRate,
+        pitch: payload.pitch,
+        format: payload.format,
+        ...(effectiveClientJobId ? { clientJobId: effectiveClientJobId } : {}),
+        ...(payload.sceneId ? { sceneId: payload.sceneId } : {}),
+        ...(payload.storyboardId ? { storyboardId: payload.storyboardId } : {}),
+      }),
+      signal: options?.signal,
+    });
+
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+        cancelled?: boolean;
+        errorCategory?: string;
+        integrationPoint?: string;
+      };
+      const isCancelled = res.status === 499 || Boolean(errBody.cancelled);
+      if (res.status === 401 && !errBody.errorCategory && !errBody.integrationPoint) {
+        sessionExpiredHandler?.();
+      }
+      return {
+        ok: false,
+        status: isCancelled ? 499 : res.status,
+        cancelled: isCancelled,
+        jobId: res.headers.get("x-tts-job-id") || effectiveClientJobId,
+        error:
+          errBody.error ||
+          errBody.message ||
+          (isCancelled
+            ? "Voiceover generation cancelled."
+            : `Voiceover generation failed (${res.status}).`),
+        errorCategory: errBody.errorCategory,
+        integrationPoint: errBody.integrationPoint,
+      };
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      return {
+        ok: false,
+        status: 502,
+        error: "Server returned an empty voiceover audio file.",
+      };
+    }
+
+    const headerFmt = (res.headers.get("x-tts-format") || payload.format).toLowerCase();
+    const format: TtsAudioFormat = headerFmt === "mp3" ? "mp3" : "wav";
+    const mimeType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() ||
+      blob.type ||
+      (format === "mp3" ? "audio/mpeg" : "audio/wav");
+
+    const disposition = res.headers.get("content-disposition") || "";
+    const match = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename =
+      match?.[1] ||
+      `voiceover_${payload.sceneId || "scene"}_${Date.now()}.${format}`;
+
+    const rawProvider = (res.headers.get("x-tts-provider") || "espeak_ng").toLowerCase();
+    const provider: TtsEngineId =
+      rawProvider === "piper" || rawProvider === "windows_sapi" || rawProvider === "espeak_ng"
+        ? rawProvider
+        : "espeak_ng";
+
+    const rawLang = (res.headers.get("x-tts-language") || payload.language).toLowerCase();
+    const language: TtsLanguageCode =
+      rawLang === "hi" || rawLang === "bn" || rawLang === "en" ? rawLang : payload.language;
+
+    const rawDuration = Number(res.headers.get("x-tts-duration"));
+    const durationSeconds =
+      Number.isFinite(rawDuration) && rawDuration > 0 ? Number(rawDuration.toFixed(3)) : 0;
+
+    const rawSampleRate = Number(res.headers.get("x-tts-sample-rate"));
+    const sampleRateHz =
+      Number.isFinite(rawSampleRate) && rawSampleRate >= 8000 ? Math.round(rawSampleRate) : 22050;
+
+    const rawChannels = Number(res.headers.get("x-tts-channels"));
+    const channels =
+      Number.isFinite(rawChannels) && rawChannels >= 1 ? Math.round(rawChannels) : 1;
+
+    const voiceId = decodeHeaderSafe(
+      res.headers.get("x-tts-voice-id"),
+      payload.voiceId || "default"
+    );
+    const voiceLabel = decodeHeaderSafe(
+      res.headers.get("x-tts-voice-label"),
+      voiceId
+    );
+    const jobId = res.headers.get("x-tts-job-id") || effectiveClientJobId || "";
+    const file = new File([blob], filename, { type: mimeType });
+
+    return {
+      ok: true,
+      status: res.status,
+      data: {
+        file,
+        jobId,
+        provider,
+        voiceId,
+        voiceLabel,
+        language,
+        durationSeconds,
+        sampleRateHz,
+        channels,
+        format,
+        mimeType,
+        sizeBytes: blob.size,
+      },
+    };
+  } catch (err) {
+    const isAborted =
+      Boolean(options?.signal?.aborted) ||
+      (err instanceof Error && err.name === "AbortError");
+    if (isAborted) {
+      return {
+        ok: false,
+        status: 499,
+        cancelled: true,
+        jobId: effectiveClientJobId,
+        error: "Voiceover generation cancelled.",
+      };
+    }
+    return {
+      ok: false,
+      status: 0,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Network error reaching local voiceover service.",
+    };
+  }
+}
+
+export async function fetchTtsJobStatus(
+  jobId: string
+): Promise<ApiResult<{ job: TtsJobSnapshotDto }>> {
+  return requestJson(`/api/tts/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export async function cancelTtsJob(
+  jobId: string,
+  options?: { keepalive?: boolean }
+): Promise<ApiResult<{ status: string; cancelled: boolean; job: TtsJobSnapshotDto }>> {
+  return requestJson(`/api/tts/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    ...(options?.keepalive ? { keepalive: true } : {}),
   });
 }
 

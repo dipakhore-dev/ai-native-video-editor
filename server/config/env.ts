@@ -31,6 +31,15 @@ export interface AppEnvConfig {
   stockMediaRequestTimeoutMs: number;
   stockMediaMaxResults: number;
   stockMediaMaxImportBytes: number;
+  ttsEnabled: boolean;
+  ttsProvider: "auto" | "espeak_ng" | "piper" | "windows_sapi" | "none";
+  ttsDefaultLanguage: "en" | "hi" | "bn";
+  ttsMaxTextChars: number;
+  ttsMaxConcurrentJobs: number;
+  ttsRequestTimeoutMs: number;
+  ttsMaxBatchScenes: number;
+  ttsMaxAudioMb: number;
+  rateLimitTtsMax: number;
 }
 
 function parseBoundedInt(
@@ -183,6 +192,26 @@ export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig
     stockMediaMaxResults: parseBoundedInt(env.STOCK_MEDIA_MAX_RESULTS, 15, 1, 30),
     stockMediaMaxImportBytes:
       parseBoundedInt(env.STOCK_MEDIA_MAX_IMPORT_MB, 80, 5, 250) * 1024 * 1024,
+    ttsEnabled: !/^(0|false|no|off)$/i.test((env.TTS_ENABLED || "true").trim()),
+    ttsProvider: (() => {
+      const p = (env.TTS_PROVIDER || "auto").trim().toLowerCase();
+      if (p === "espeak_ng" || p === "piper" || p === "windows_sapi" || p === "none") {
+        return p;
+      }
+      return "auto";
+    })(),
+    ttsDefaultLanguage: (() => {
+      const l = (env.TTS_DEFAULT_LANGUAGE || "en").trim().toLowerCase();
+      if (l === "hi" || l === "hindi") return "hi";
+      if (l === "bn" || l === "bengali") return "bn";
+      return "en";
+    })(),
+    ttsMaxTextChars: parseBoundedInt(env.TTS_MAX_TEXT_CHARS, 1500, 100, 5000),
+    ttsMaxConcurrentJobs: parseBoundedInt(env.TTS_MAX_CONCURRENT_JOBS, 1, 1, 4),
+    ttsRequestTimeoutMs: parseBoundedInt(env.TTS_REQUEST_TIMEOUT_MS, 45_000, 5_000, 180_000),
+    ttsMaxBatchScenes: parseBoundedInt(env.TTS_MAX_BATCH_SCENES, 12, 1, 12),
+    ttsMaxAudioMb: parseBoundedInt(env.TTS_MAX_AUDIO_MB, 25, 1, 100),
+    rateLimitTtsMax: parseBoundedInt(env.RATE_LIMIT_TTS_MAX, 36, 1, 500),
   };
 }
 
@@ -317,6 +346,15 @@ export function validateStartupEnv(env: NodeJS.ProcessEnv = process.env): Startu
     warnings.push(
       "STOCK_MEDIA_PROVIDER=pexels is set without PEXELS_API_KEY; free stock search remains disabled until PEXELS_API_KEY is configured."
     );
+  }
+
+  if (env.TTS_PROVIDER !== undefined && env.TTS_PROVIDER.trim() !== "") {
+    const rawTtsProv = env.TTS_PROVIDER.trim().toLowerCase();
+    if (!["auto", "espeak_ng", "piper", "windows_sapi", "none"].includes(rawTtsProv)) {
+      warnings.push(
+        `TTS_PROVIDER value "${env.TTS_PROVIDER}" is invalid; falling back to "auto".`
+      );
+    }
   }
 
   if (cfg.isProd) {

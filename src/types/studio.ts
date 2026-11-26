@@ -15,7 +15,8 @@ export type MediaSourceOrigin =
   | "uploaded"
   | "existing_library"
   | "stock"
-  | "generated_slide";
+  | "generated_slide"
+  | "generated_voiceover";
 
 export type GeneratedSlideTemplate =
   | "title"
@@ -472,6 +473,102 @@ export interface StoryboardMediaSummary {
   isMediaReady: boolean;
 }
 
+export type TtsLanguageCode = "en" | "hi" | "bn";
+export type TtsEngineId = "piper" | "espeak_ng" | "windows_sapi";
+export type TtsProviderId = "auto" | TtsEngineId | "none";
+export type TtsAudioFormat = "wav" | "mp3";
+
+export interface TtsVoiceOption {
+  voiceId: string;
+  provider: TtsEngineId;
+  label: string;
+  language: TtsLanguageCode;
+  languageTag: string;
+  gender?: string | null;
+  quality: string;
+  sampleRateHz?: number | null;
+  description?: string | null;
+}
+
+export interface TtsProviderStatus {
+  provider: TtsEngineId;
+  label: string;
+  available: boolean;
+  installed: boolean;
+  license: string;
+  supportedLanguages: TtsLanguageCode[];
+  voiceCount: number;
+  message: string;
+}
+
+export interface TtsStatusInfo {
+  enabled: boolean;
+  available: boolean;
+  configuredProvider: string;
+  activeProvider: string | null;
+  defaultLanguage: TtsLanguageCode;
+  supportedLanguages: TtsLanguageCode[];
+  mp3Supported: boolean;
+  maxTextChars: number;
+  maxAudioMb: number;
+  providers: TtsProviderStatus[];
+  message: string;
+}
+
+export type SceneVoiceoverStatus =
+  | "none"
+  | "generating"
+  | "ready"
+  | "stale"
+  | "missing"
+  | "failed"
+  | "skipped_empty";
+
+export interface StoryboardSceneVoiceover {
+  sceneId: string;
+  mediaAssetId?: string;
+  provider: TtsEngineId;
+  voiceId: string;
+  voiceLabel: string;
+  language: TtsLanguageCode;
+  speakingRate: number;
+  pitch: number;
+  volume: number;
+  format: TtsAudioFormat;
+  mimeType: string;
+  durationSeconds: number;
+  sizeBytes: number;
+  sampleRateHz: number;
+  channels: number;
+  narrationFingerprint: string;
+  generatedAt: string;
+  status: SceneVoiceoverStatus;
+  errorMessage?: string;
+}
+
+export interface StoryboardVoiceoverSettings {
+  provider: TtsProviderId;
+  voiceId?: string;
+  speakingRate: number;
+  pitch: number;
+  format: TtsAudioFormat;
+  volume: number;
+}
+
+export interface StoryboardVoiceoverSummary {
+  totalScenes: number;
+  spokenScenes: number;
+  readyCount: number;
+  staleCount: number;
+  missingCount: number;
+  failedCount: number;
+  unassignedCount: number;
+  overflowCount: number;
+  totalAudioDurationSec: number;
+  progressPercent: number;
+  isVoiceoverReady: boolean;
+}
+
 export interface StoryboardScene {
   id: string;
   title: string;
@@ -486,6 +583,7 @@ export interface StoryboardScene {
   effect: EffectPreset;
   cameraMotion: StoryboardCameraMotion;
   mediaAssignment?: StoryboardSceneMediaAssignment;
+  voiceover?: StoryboardSceneVoiceover;
 }
 
 export interface VideoStoryboard {
@@ -506,6 +604,8 @@ export interface VideoStoryboard {
   model?: string;
   compositionReady: false;
   mediaReadinessSummary?: StoryboardMediaSummary;
+  voiceoverSettings?: StoryboardVoiceoverSettings;
+  voiceoverSummary?: StoryboardVoiceoverSummary;
   createdAt: string;
   updatedAt: string;
 }

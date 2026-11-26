@@ -29,7 +29,10 @@ import type {
   StoryboardCameraMotion,
   StoryboardMediaType,
   StoryboardScene,
+  StoryboardVoiceoverSettings,
   TransitionType,
+  TtsStatusInfo,
+  TtsVoiceOption,
   VideoStoryboard,
 } from "../../types/studio";
 import { EFFECT_PRESETS, TRANSITION_OPTIONS } from "../../utils/effects";
@@ -53,9 +56,16 @@ import {
   computeStoryboardMediaSummary,
   evaluateSceneMediaReadiness,
 } from "../../utils/storyboardMedia";
+import {
+  computeStoryboardVoiceoverSummary,
+  evaluateSceneVoiceoverReadiness,
+  normalizeTtsLanguage,
+} from "../../utils/storyboardVoiceover";
 import { MediaPickerModal } from "./MediaPickerModal";
+import { SceneVoiceoverCard } from "./SceneVoiceoverCard";
 import { SlideGeneratorModal } from "./SlideGeneratorModal";
 import { StoryboardMediaPrepSection } from "./StoryboardMediaPrepSection";
+import { StoryboardVoiceoverPrepSection } from "./StoryboardVoiceoverPrepSection";
 
 interface StoryboardReviewPanelProps {
   storyboard: VideoStoryboard;
@@ -91,6 +101,32 @@ interface StoryboardReviewPanelProps {
     sceneId: string
   ) => Promise<void> | void;
   onCancelMediaPrep?: () => void;
+  ttsStatus?: TtsStatusInfo | null;
+  ttsLoading?: boolean;
+  ttsError?: string | null;
+  ttsVoices?: TtsVoiceOption[];
+  generatingVoiceoverSceneIds?: Set<string>;
+  voiceoverBatchState?: {
+    active: boolean;
+    currentSceneId: string | null;
+    completedCount: number;
+    totalCount: number;
+    statusMessage: string | null;
+  };
+  activeAudioSceneId?: string | null;
+  onActivateSceneAudio?: (sceneId: string | null) => void;
+  onRefreshTts?: () => void;
+  onGenerateSceneVoiceover?: (
+    sceneId: string,
+    overrideParams?: Partial<StoryboardVoiceoverSettings>
+  ) => void;
+  onCancelSceneVoiceover?: (sceneId: string) => void;
+  onRemoveSceneVoiceover?: (sceneId: string) => void;
+  onUpdateSceneVoiceoverVolume?: (sceneId: string, volume: number) => void;
+  onGenerateMissingOrStaleVoiceovers?: () => void;
+  onRegenerateAllVoiceovers?: () => void;
+  onCancelVoiceoverBatch?: () => void;
+  onClearAllVoiceovers?: () => void;
 }
 
 function formatClockRange(start: number, duration: number): string {
@@ -139,6 +175,29 @@ export function StoryboardReviewPanel({
   onGenerateAndAssignSlide,
   onRelinkMissingSceneMedia,
   onCancelMediaPrep,
+  ttsStatus = null,
+  ttsLoading = false,
+  ttsError = null,
+  ttsVoices = [],
+  generatingVoiceoverSceneIds,
+  voiceoverBatchState = {
+    active: false,
+    currentSceneId: null,
+    completedCount: 0,
+    totalCount: 0,
+    statusMessage: null,
+  },
+  activeAudioSceneId = null,
+  onActivateSceneAudio,
+  onRefreshTts,
+  onGenerateSceneVoiceover,
+  onCancelSceneVoiceover,
+  onRemoveSceneVoiceover,
+  onUpdateSceneVoiceoverVolume,
+  onGenerateMissingOrStaleVoiceovers,
+  onRegenerateAllVoiceovers,
+  onCancelVoiceoverBatch,
+  onClearAllVoiceovers,
 }: StoryboardReviewPanelProps) {
   const [keywordsDraftById, setKeywordsDraftById] = useState<Record<string, string>>({});
   const [overwriteManual, setOverwriteManual] = useState(false);
@@ -156,6 +215,7 @@ export function StoryboardReviewPanel({
   } | null>(null);
 
   const sceneFileInputRef = useRef<HTMLInputElement | null>(null);
+  const narrationTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const pendingSceneUploadRef = useRef<{
     sceneId: string;
     mode: "upload" | "relink";
@@ -181,6 +241,22 @@ export function StoryboardReviewPanel({
     [storyboard, mediaAssets, idbHydrating]
   );
 
+  const voiceoverSummary = useMemo(
+    () =>
+      computeStoryboardVoiceoverSummary(
+        storyboard,
+        mediaAssets,
+        !idbHydrating,
+        generatingVoiceoverSceneIds
+      ),
+    [storyboard, mediaAssets, idbHydrating, generatingVoiceoverSceneIds]
+  );
+
+  const languageCode = normalizeTtsLanguage(storyboard.language);
+  const ttsReadyForLang = Boolean(
+    ttsStatus?.available && ttsVoices.some((v) => v.language === languageCode)
+  );
+
   const pickerScene = useMemo(
     () => storyboard.scenes.find((s) => s.id === pickerState.sceneId) ?? null,
     [storyboard.scenes, pickerState.sceneId]
@@ -200,13 +276,19 @@ export function StoryboardReviewPanel({
 
   const commitScenes = (nextScenes: StoryboardScene[]) => {
     const timed = recalculateStoryboardTiming(nextScenes);
+    const nextStoryboard = { ...storyboard, scenes: timed };
     onChange({
-      ...storyboard,
-      scenes: timed,
+      ...nextStoryboard,
       mediaReadinessSummary: computeStoryboardMediaSummary(
-        { ...storyboard, scenes: timed },
+        nextStoryboard,
         mediaAssets,
         !idbHydrating
+      ),
+      voiceoverSummary: computeStoryboardVoiceoverSummary(
+        nextStoryboard,
+        mediaAssets,
+        !idbHydrating,
+        generatingVoiceoverSceneIds
       ),
       updatedAt: new Date().toISOString(),
     });
@@ -449,6 +531,30 @@ export function StoryboardReviewPanel({
           statusMessage={mediaPrepStatusMessage}
         />
 
+        {/* Phase 5.5.3 Offline Voiceover Preparation Bar */}
+        <StoryboardVoiceoverPrepSection
+          storyboard={storyboard}
+          summary={voiceoverSummary}
+          ttsStatus={ttsStatus}
+          ttsLoading={ttsLoading}
+          ttsError={ttsError}
+          voices={ttsVoices}
+          isAuthenticated={isAuthenticated}
+          batchState={voiceoverBatchState}
+          onRefreshTts={() => onRefreshTts?.()}
+          onChangeGlobalSettings={(nextSettings) =>
+            onChange({
+              ...storyboard,
+              voiceoverSettings: nextSettings,
+              updatedAt: new Date().toISOString(),
+            })
+          }
+          onGenerateMissingOrStale={() => onGenerateMissingOrStaleVoiceovers?.()}
+          onRegenerateAll={() => onRegenerateAllVoiceovers?.()}
+          onCancelBatch={() => onCancelVoiceoverBatch?.()}
+          onClearAllVoiceovers={() => onClearAllVoiceovers?.()}
+        />
+
         {saveStatusMessage && (
           <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs text-emerald-300 flex items-center gap-2">
             <Check className="h-3.5 w-3.5 shrink-0" />
@@ -563,12 +669,12 @@ export function StoryboardReviewPanel({
           <div className="flex items-center gap-2">
             <Film className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
             <span>
-              Phase 5.5.2 matches and validates local visual media for scenes. Voiceover synthesis,
-              captions, and FFmpeg MP4 composition arrive in Phase 5.5.3.
+              Phase 5.5.2 prepares visual media and Phase 5.5.3 generates offline voiceover audio.
+              Automatic caption timing from audio and FFmpeg MP4 composition arrive in Phase 5.5.4+.
             </span>
           </div>
           <span className="font-mono text-[11px] text-zinc-500 whitespace-nowrap">
-            Composition locked until Phase 5.5.3
+            Composition locked until Phase 5.5.4+
           </span>
         </div>
       </div>
@@ -606,6 +712,13 @@ export function StoryboardReviewPanel({
               storyboard,
               assetsById,
               !idbHydrating
+            );
+            const voiceoverEval = evaluateSceneVoiceoverReadiness(
+              scene,
+              storyboard,
+              assetsById,
+              !idbHydrating,
+              generatingVoiceoverSceneIds
             );
             const assignment = scene.mediaAssignment;
             const assignedAsset = readiness.asset;
@@ -985,6 +1098,40 @@ export function StoryboardReviewPanel({
                   </div>
                 </div>
 
+                {/* Scene Offline Voiceover Card (Phase 5.5.3) */}
+                <SceneVoiceoverCard
+                  scene={scene}
+                  sceneIndex={index}
+                  storyboard={storyboard}
+                  evaluation={voiceoverEval}
+                  ttsStatus={ttsStatus}
+                  voices={ttsVoices}
+                  ttsReadyForLang={ttsReadyForLang}
+                  isAuthenticated={isAuthenticated}
+                  activeGenerating={Boolean(generatingVoiceoverSceneIds?.has(scene.id))}
+                  batchActive={voiceoverBatchState.active}
+                  activeAudioSceneId={activeAudioSceneId}
+                  onActivateSceneAudio={(targetId) => onActivateSceneAudio?.(targetId)}
+                  onGenerateScene={(targetId, overrideParams) =>
+                    onGenerateSceneVoiceover?.(targetId, overrideParams)
+                  }
+                  onCancelScene={(targetId) => onCancelSceneVoiceover?.(targetId)}
+                  onRemoveVoiceover={(targetId) => onRemoveSceneVoiceover?.(targetId)}
+                  onUpdateVoiceoverVolume={(targetId, vol) =>
+                    onUpdateSceneVoiceoverVolume?.(targetId, vol)
+                  }
+                  onAdjustSceneDuration={(targetId, nextDuration) =>
+                    handleScenePatch(targetId, { duration: nextDuration })
+                  }
+                  onFocusSceneNarration={(targetId) => {
+                    const el = narrationTextareaRefs.current[targetId];
+                    if (el) {
+                      el.focus();
+                      el.scrollIntoView({ behavior: "smooth", block: "center" });
+                    }
+                  }}
+                />
+
                 {/* Numeric & Dropdown Parameters */}
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
                   <div>
@@ -1101,6 +1248,9 @@ export function StoryboardReviewPanel({
                       Scene Narration
                     </label>
                     <textarea
+                      ref={(el) => {
+                        narrationTextareaRefs.current[scene.id] = el;
+                      }}
                       rows={2}
                       maxLength={1500}
                       aria-label={`Scene ${index + 1} narration`}

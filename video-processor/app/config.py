@@ -25,6 +25,29 @@ class ProcessorSettings:
     whisper_model_size: str
     whisper_device: str
     whisper_compute_type: str
+    tts_enabled: bool = True
+    tts_provider: str = "auto"
+    tts_default_language: str = "en"
+    tts_max_text_chars: int = 1500
+    tts_max_concurrent_jobs: int = 1
+    tts_request_timeout_sec: int = 45
+    tts_max_audio_mb: int = 25
+    espeak_ng_path: str = ""
+    piper_executable_path: str = ""
+    piper_models_dir: str = ""
+    tts_windows_sapi_enabled: bool = False
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    norm = raw.strip().lower()
+    if norm in ("1", "true", "yes", "on"):
+        return True
+    if norm in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def get_settings() -> ProcessorSettings:
@@ -38,6 +61,15 @@ def get_settings() -> ProcessorSettings:
     cleanup_age_sec = max(60, int(os.getenv("TEMP_CLEANUP_MAX_AGE_SEC", "3600")))
     port_raw = os.getenv("PORT") or os.getenv("VIDEO_PROCESSOR_PORT") or "8001"
     app_env = (os.getenv("APP_ENV") or os.getenv("NODE_ENV") or "development").strip().lower() or "development"
+    tts_enabled = _parse_bool_env("TTS_ENABLED", True)
+    tts_provider = (os.getenv("TTS_PROVIDER", "auto") or "auto").strip().lower() or "auto"
+    tts_default_language = (os.getenv("TTS_DEFAULT_LANGUAGE", "en") or "en").strip().lower() or "en"
+    tts_max_text_chars = max(100, min(5000, int(os.getenv("TTS_MAX_TEXT_CHARS", "1500"))))
+    tts_max_concurrent_jobs = max(1, min(4, int(os.getenv("TTS_MAX_CONCURRENT_JOBS", "1"))))
+    tts_request_timeout_sec = max(5, min(180, int(os.getenv("TTS_REQUEST_TIMEOUT_SEC", "45"))))
+    tts_max_audio_mb = max(1, min(100, int(os.getenv("TTS_MAX_AUDIO_MB", "25"))))
+    tts_windows_sapi_enabled = _parse_bool_env("TTS_WINDOWS_SAPI_ENABLED", os.name == "nt")
+
     return ProcessorSettings(
         app_env=app_env,
         host=os.getenv("VIDEO_PROCESSOR_HOST", "127.0.0.1"),
@@ -57,6 +89,17 @@ def get_settings() -> ProcessorSettings:
         whisper_model_size=os.getenv("WHISPER_MODEL_SIZE", "small").strip() or "small",
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu").strip() or "cpu",
         whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8",
+        tts_enabled=tts_enabled,
+        tts_provider=tts_provider,
+        tts_default_language=tts_default_language,
+        tts_max_text_chars=tts_max_text_chars,
+        tts_max_concurrent_jobs=tts_max_concurrent_jobs,
+        tts_request_timeout_sec=tts_request_timeout_sec,
+        tts_max_audio_mb=tts_max_audio_mb,
+        espeak_ng_path=os.getenv("ESPEAK_NG_PATH", "").strip(),
+        piper_executable_path=os.getenv("PIPER_EXECUTABLE_PATH", "").strip(),
+        piper_models_dir=os.getenv("PIPER_MODELS_DIR", "").strip(),
+        tts_windows_sapi_enabled=tts_windows_sapi_enabled,
     )
 
 
@@ -68,6 +111,14 @@ def validate_runtime_settings(settings: ProcessorSettings) -> list[str]:
         errors.append("MAX_UPLOAD_MB must be at least 1 MB.")
     if settings.max_concurrent_exports < 1:
         errors.append("MAX_CONCURRENT_EXPORTS must be at least 1.")
+    if settings.tts_provider not in ("auto", "espeak_ng", "piper", "windows_sapi", "none"):
+        errors.append(
+            "TTS_PROVIDER must be one of: auto, espeak_ng, piper, windows_sapi, none."
+        )
+    if settings.tts_max_text_chars < 50 or settings.tts_max_text_chars > 5000:
+        errors.append("TTS_MAX_TEXT_CHARS must be between 50 and 5000.")
+    if settings.tts_max_concurrent_jobs < 1 or settings.tts_max_concurrent_jobs > 4:
+        errors.append("TTS_MAX_CONCURRENT_JOBS must be between 1 and 4.")
     if settings.app_env == "production":
         if (
             not settings.api_key

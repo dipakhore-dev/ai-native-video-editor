@@ -17,10 +17,14 @@ import { IntegrationNotice } from "../components/common/IntegrationNotice";
 import { StoryboardReviewPanel } from "../components/generator/StoryboardReviewPanel";
 import { useStudio } from "../context/StudioContext";
 import {
+  cancelTtsJob,
   createServerStoryboardDraft,
   deleteServerStoryboardDraft,
   fetchServerStoryboardDrafts,
+  fetchTtsStatus,
+  fetchTtsVoices,
   generateAiStoryboard,
+  generateTtsVoiceover,
   importStockMediaApi,
   updateServerStoryboardDraft,
   type ServerStoryboardDraftDto,
@@ -34,9 +38,13 @@ import type {
   StoryboardDraftRecord,
   StoryboardGenerationStatus,
   StoryboardLanguage,
+  StoryboardSceneVoiceover,
   StoryboardStyle,
   StoryboardTargetDuration,
   StoryboardVoiceoverPreference,
+  StoryboardVoiceoverSettings,
+  TtsStatusInfo,
+  TtsVoiceOption,
   VideoGenerationRequest,
   VideoGeneratorMode,
   VideoStoryboard,
@@ -46,6 +54,7 @@ import {
   CAPTION_PREFERENCE_OPTIONS,
   clearLocalStoryboardDraft,
   loadLocalStoryboardDraft,
+  MAX_STORYBOARD_SCENES,
   saveLocalStoryboardDraft,
   STORYBOARD_ASPECT_RATIOS,
   STORYBOARD_LANGUAGES,
@@ -60,6 +69,13 @@ import {
   computeStoryboardMediaSummary,
   createAssignmentFromAsset,
 } from "../utils/storyboardMedia";
+import {
+  computeNarrationFingerprint,
+  computeStoryboardVoiceoverSummary,
+  evaluateSceneVoiceoverReadiness,
+  pickDefaultVoiceForLanguage,
+  resolveEffectiveSceneVoiceParams,
+} from "../utils/storyboardVoiceover";
 
 export function AiGeneratorPage() {
   const {
@@ -110,10 +126,38 @@ export function AiGeneratorPage() {
   const [mediaPrepActive, setMediaPrepActive] = useState(false);
   const [mediaPrepStatusMessage, setMediaPrepStatusMessage] = useState<string | null>(null);
 
+  const [ttsStatus, setTtsStatus] = useState<TtsStatusInfo | null>(null);
+  const [ttsVoices, setTtsVoices] = useState<TtsVoiceOption[]>([]);
+  const [ttsLoading, setTtsLoading] = useState(false);
+  const [ttsError, setTtsError] = useState<string | null>(null);
+  const [generatingVoiceoverSceneIds, setGeneratingVoiceoverSceneIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [voiceoverBatchState, setVoiceoverBatchState] = useState<{
+    active: boolean;
+    currentSceneId: string | null;
+    completedCount: number;
+    totalCount: number;
+    statusMessage: string | null;
+  }>({
+    active: false,
+    currentSceneId: null,
+    completedCount: 0,
+    totalCount: 0,
+    statusMessage: null,
+  });
+  const [activeAudioSceneId, setActiveAudioSceneId] = useState<string | null>(null);
+
   const abortControllerRef = useRef<AbortController | null>(null);
   const mediaPrepAbortRef = useRef<AbortController | null>(null);
+  const activeVoiceoverJobsRef = useRef<
+    Map<string, { controller: AbortController; clientJobId: string }>
+  >(new Map());
+  const batchVoiceoverCancelRef = useRef<{ cancelled: boolean } | null>(null);
   const storyboardRef = useRef<VideoStoryboard | null>(storyboard);
   storyboardRef.current = storyboard;
+  const generatingSceneIdsRef = useRef<Set<string>>(generatingVoiceoverSceneIds);
+  generatingSceneIdsRef.current = generatingVoiceoverSceneIds;
   const inFlightRef = useRef(false);
   const draftScopeKey = sessionUser.id || "local";
 
@@ -124,6 +168,14 @@ export function AiGeneratorPage() {
     return () => {
       abortControllerRef.current?.abort();
       mediaPrepAbortRef.current?.abort();
+      if (batchVoiceoverCancelRef.current) {
+        batchVoiceoverCancelRef.current.cancelled = true;
+      }
+      for (const entry of activeVoiceoverJobsRef.current.values()) {
+        entry.controller.abort();
+        void cancelTtsJob(entry.clientJobId, { keepalive: true });
+      }
+      activeVoiceoverJobsRef.current.clear();
     };
   }, []);
 
@@ -166,12 +218,48 @@ export function AiGeneratorPage() {
     void loadServerDrafts();
   }, [loadServerDrafts]);
 
+  const loadTtsCapabilities = useCallback(async () => {
+    if (!isAuthenticated) {
+      setTtsStatus(null);
+      setTtsVoices([]);
+      setTtsError(null);
+      return;
+    }
+    setTtsLoading(true);
+    setTtsError(null);
+    const [statusRes, voicesRes] = await Promise.all([fetchTtsStatus(), fetchTtsVoices()]);
+    setTtsLoading(false);
+
+    if (statusRes.ok && statusRes.data) {
+      setTtsStatus(statusRes.data);
+    } else {
+      setTtsStatus(null);
+      setTtsError(statusRes.error || "Unable to inspect local TTS engine status.");
+    }
+
+    if (voicesRes.ok && Array.isArray(voicesRes.data?.voices)) {
+      setTtsVoices(voicesRes.data.voices);
+    } else if (!voicesRes.ok) {
+      setTtsVoices([]);
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    void loadTtsCapabilities();
+  }, [loadTtsCapabilities]);
+
   // Keep isolated local draft synced whenever user edits an existing storyboard
   const handleStoryboardChange = useCallback(
     (next: VideoStoryboard) => {
       const withSummary: VideoStoryboard = {
         ...next,
         mediaReadinessSummary: computeStoryboardMediaSummary(next, mediaAssets, !idbHydrating),
+        voiceoverSummary: computeStoryboardVoiceoverSummary(
+          next,
+          mediaAssets,
+          !idbHydrating,
+          generatingSceneIdsRef.current
+        ),
       };
       storyboardRef.current = withSummary;
       setStoryboard(withSummary);
@@ -518,6 +606,416 @@ export function AiGeneratorPage() {
     [handleStoryboardChange, relinkMissingClipAsset]
   );
 
+  const synthesizeSceneVoiceover = useCallback(
+    async (
+      sceneId: string,
+      overrideParams?: Partial<StoryboardVoiceoverSettings>
+    ): Promise<"ready" | "cancelled" | "failed" | "skipped"> => {
+      const current = storyboardRef.current;
+      if (!current) return "failed";
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene) return "failed";
+
+      const narrationSnapshot = targetScene.narration;
+      const trimmedNarration = narrationSnapshot.trim();
+      if (!trimmedNarration) {
+        return "skipped";
+      }
+
+      if (activeVoiceoverJobsRef.current.has(sceneId)) {
+        return "skipped";
+      }
+
+      const resolved = resolveEffectiveSceneVoiceParams(targetScene, current);
+      const effectiveProvider = overrideParams?.provider ?? resolved.provider;
+      const effectiveRate = overrideParams?.speakingRate ?? resolved.speakingRate;
+      const effectivePitch = overrideParams?.pitch ?? resolved.pitch;
+      const effectiveFormat =
+        (overrideParams?.format ?? resolved.format) === "mp3" && ttsStatus?.mp3Supported
+          ? "mp3"
+          : "wav";
+      const effectiveVolume = overrideParams?.volume ?? resolved.volume;
+
+      let effectiveVoiceId =
+        overrideParams?.voiceId !== undefined ? overrideParams.voiceId : resolved.voiceId;
+      if (!effectiveVoiceId) {
+        const picked = pickDefaultVoiceForLanguage(ttsVoices, resolved.language, effectiveProvider);
+        effectiveVoiceId = picked?.voiceId || "";
+      }
+
+      const clientJobId = `vo_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const controller = new AbortController();
+      activeVoiceoverJobsRef.current.set(sceneId, { controller, clientJobId });
+      setGeneratingVoiceoverSceneIds((prev) => {
+        const next = new Set(prev);
+        next.add(sceneId);
+        return next;
+      });
+
+      if (activeAudioSceneId === sceneId) {
+        setActiveAudioSceneId(null);
+      }
+
+      try {
+        const res = await generateTtsVoiceover(
+          {
+            text: trimmedNarration,
+            language: resolved.language,
+            provider: effectiveProvider,
+            ...(effectiveVoiceId ? { voiceId: effectiveVoiceId } : {}),
+            speakingRate: effectiveRate,
+            pitch: effectivePitch,
+            format: effectiveFormat,
+            clientJobId,
+            sceneId,
+            storyboardId: current.id,
+          },
+          { clientJobId, signal: controller.signal }
+        );
+
+        if (res.cancelled || res.status === 499) {
+          return "cancelled";
+        }
+
+        if (!res.ok || !res.data) {
+          const latest = storyboardRef.current;
+          if (latest) {
+            const existingVo = latest.scenes.find((s) => s.id === sceneId)?.voiceover;
+            const failedRecord: StoryboardSceneVoiceover = {
+              sceneId,
+              ...(existingVo?.mediaAssetId ? { mediaAssetId: existingVo.mediaAssetId } : {}),
+              provider:
+                effectiveProvider === "piper" ||
+                effectiveProvider === "espeak_ng" ||
+                effectiveProvider === "windows_sapi"
+                  ? effectiveProvider
+                  : "espeak_ng",
+              voiceId: effectiveVoiceId || "default",
+              voiceLabel: effectiveVoiceId || "Unavailable",
+              language: resolved.language,
+              speakingRate: effectiveRate,
+              pitch: effectivePitch,
+              volume: effectiveVolume,
+              format: effectiveFormat,
+              mimeType: effectiveFormat === "mp3" ? "audio/mpeg" : "audio/wav",
+              durationSeconds: existingVo?.durationSeconds ?? 0,
+              sizeBytes: existingVo?.sizeBytes ?? 0,
+              sampleRateHz: existingVo?.sampleRateHz ?? 22050,
+              channels: 1,
+              narrationFingerprint: computeNarrationFingerprint({
+                text: narrationSnapshot,
+                language: resolved.language,
+                provider: effectiveProvider,
+                voiceId: effectiveVoiceId,
+                speakingRate: effectiveRate,
+                pitch: effectivePitch,
+              }),
+              generatedAt: new Date().toISOString(),
+              status: "failed",
+              errorMessage: res.error || "Local TTS synthesis failed.",
+            };
+            handleStoryboardChange({
+              ...latest,
+              scenes: latest.scenes.map((s) =>
+                s.id === sceneId ? { ...s, voiceover: failedRecord } : s
+              ),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          return "failed";
+        }
+
+        const data = res.data;
+        const asset = await importMediaFileWithMetadata(
+          data.file,
+          {
+            sourceOrigin: "generated_voiceover",
+            providerName: data.provider,
+            providerAssetId: data.jobId,
+            tags: ["voiceover", data.language, data.voiceId],
+            description: `Generated voiceover for scene "${targetScene.title}"`,
+            durationOverride: data.durationSeconds > 0 ? data.durationSeconds : undefined,
+          },
+          { reuseDuplicate: false }
+        );
+
+        if (!asset) {
+          const latest = storyboardRef.current;
+          if (latest) {
+            handleStoryboardChange({
+              ...latest,
+              scenes: latest.scenes.map((s) =>
+                s.id === sceneId
+                  ? {
+                      ...s,
+                      voiceover: {
+                        sceneId,
+                        provider: data.provider,
+                        voiceId: data.voiceId,
+                        voiceLabel: data.voiceLabel,
+                        language: data.language,
+                        speakingRate: effectiveRate,
+                        pitch: effectivePitch,
+                        volume: effectiveVolume,
+                        format: data.format,
+                        mimeType: data.mimeType,
+                        durationSeconds: data.durationSeconds,
+                        sizeBytes: data.sizeBytes,
+                        sampleRateHz: data.sampleRateHz,
+                        channels: data.channels,
+                        narrationFingerprint: computeNarrationFingerprint({
+                          text: narrationSnapshot,
+                          language: data.language,
+                          provider: data.provider,
+                          voiceId: data.voiceId,
+                          speakingRate: effectiveRate,
+                          pitch: effectivePitch,
+                        }),
+                        generatedAt: new Date().toISOString(),
+                        status: "failed",
+                        errorMessage:
+                          "Audio synthesized, but could not persist to IndexedDB storage.",
+                      },
+                    }
+                  : s
+              ),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          return "failed";
+        }
+
+        const latestAfterSave = storyboardRef.current;
+        if (!latestAfterSave) return "failed";
+        const latestScene = latestAfterSave.scenes.find((s) => s.id === sceneId);
+        if (!latestScene) return "failed";
+
+        // Compute fingerprint using the exact narrationSnapshot that was synthesized!
+        // If user edited narration mid-flight, stale check automatically flags it as stale.
+        const synthFingerprint = computeNarrationFingerprint({
+          text: narrationSnapshot,
+          language: data.language,
+          provider: data.provider,
+          voiceId: data.voiceId,
+          speakingRate: effectiveRate,
+          pitch: effectivePitch,
+        });
+
+        const nextVoiceover: StoryboardSceneVoiceover = {
+          sceneId,
+          mediaAssetId: asset.id,
+          provider: data.provider,
+          voiceId: data.voiceId,
+          voiceLabel: data.voiceLabel,
+          language: data.language,
+          speakingRate: Number(effectiveRate.toFixed(2)),
+          pitch: Number(effectivePitch.toFixed(2)),
+          volume: Number(effectiveVolume.toFixed(2)),
+          format: data.format,
+          mimeType: data.mimeType,
+          durationSeconds:
+            data.durationSeconds > 0 ? data.durationSeconds : Number(asset.duration.toFixed(3)),
+          sizeBytes: data.sizeBytes,
+          sampleRateHz: data.sampleRateHz,
+          channels: data.channels,
+          narrationFingerprint: synthFingerprint,
+          generatedAt: new Date().toISOString(),
+          status:
+            latestScene.narration.trim() === trimmedNarration ? "ready" : "stale",
+        };
+
+        handleStoryboardChange({
+          ...latestAfterSave,
+          scenes: latestAfterSave.scenes.map((s) =>
+            s.id === sceneId ? { ...s, voiceover: nextVoiceover } : s
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+        return "ready";
+      } finally {
+        activeVoiceoverJobsRef.current.delete(sceneId);
+        setGeneratingVoiceoverSceneIds((prev) => {
+          const next = new Set(prev);
+          next.delete(sceneId);
+          return next;
+        });
+      }
+    },
+    [
+      activeAudioSceneId,
+      handleStoryboardChange,
+      importMediaFileWithMetadata,
+      ttsStatus?.mp3Supported,
+      ttsVoices,
+    ]
+  );
+
+  const handleCancelSceneVoiceover = useCallback((sceneId: string) => {
+    const active = activeVoiceoverJobsRef.current.get(sceneId);
+    if (!active) return;
+    active.controller.abort();
+    void cancelTtsJob(active.clientJobId);
+  }, []);
+
+  const handleRemoveSceneVoiceover = useCallback(
+    (sceneId: string) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      if (activeAudioSceneId === sceneId) {
+        setActiveAudioSceneId(null);
+      }
+      handleStoryboardChange({
+        ...current,
+        scenes: current.scenes.map((s) =>
+          s.id === sceneId ? { ...s, voiceover: undefined } : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [activeAudioSceneId, handleStoryboardChange]
+  );
+
+  const handleClearAllVoiceovers = useCallback(() => {
+    const current = storyboardRef.current;
+    if (!current) return;
+    setActiveAudioSceneId(null);
+    handleStoryboardChange({
+      ...current,
+      scenes: current.scenes.map((s) => ({ ...s, voiceover: undefined })),
+      updatedAt: new Date().toISOString(),
+    });
+    setVoiceoverBatchState({
+      active: false,
+      currentSceneId: null,
+      completedCount: 0,
+      totalCount: 0,
+      statusMessage: "Cleared scene voiceover links (audio files kept safely in IndexedDB).",
+    });
+  }, [handleStoryboardChange]);
+
+  const handleUpdateSceneVoiceoverVolume = useCallback(
+    (sceneId: string, volume: number) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const clampedVol = Math.max(0, Math.min(2, Number(volume.toFixed(2))));
+      handleStoryboardChange({
+        ...current,
+        scenes: current.scenes.map((s) =>
+          s.id === sceneId && s.voiceover
+            ? { ...s, voiceover: { ...s.voiceover, volume: clampedVol } }
+            : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [handleStoryboardChange]
+  );
+
+  const handleCancelVoiceoverBatch = useCallback(() => {
+    if (batchVoiceoverCancelRef.current) {
+      batchVoiceoverCancelRef.current.cancelled = true;
+    }
+    for (const entry of activeVoiceoverJobsRef.current.values()) {
+      entry.controller.abort();
+      void cancelTtsJob(entry.clientJobId);
+    }
+    setVoiceoverBatchState((prev) => ({
+      ...prev,
+      active: false,
+      currentSceneId: null,
+      statusMessage: "Batch voiceover generation cancelled. Completed scenes were preserved.",
+    }));
+  }, []);
+
+  const handleGenerateBatchVoiceovers = useCallback(
+    async (mode: "missing_or_stale" | "all") => {
+      const current = storyboardRef.current;
+      if (!current || batchVoiceoverCancelRef.current?.cancelled === false) return;
+
+      const assetsById = new Map(mediaAssets.map((a) => [a.id, a]));
+      const targetSceneIds: string[] = [];
+      for (const scene of current.scenes.slice(0, MAX_STORYBOARD_SCENES)) {
+        const evalRes = evaluateSceneVoiceoverReadiness(
+          scene,
+          current,
+          assetsById,
+          !idbHydrating
+        );
+        if (!evalRes.hasNarration) continue;
+        if (
+          mode === "all" ||
+          evalRes.status === "none" ||
+          evalRes.status === "stale" ||
+          evalRes.status === "missing" ||
+          evalRes.status === "failed"
+        ) {
+          targetSceneIds.push(scene.id);
+        }
+      }
+
+      if (targetSceneIds.length === 0) {
+        setVoiceoverBatchState({
+          active: false,
+          currentSceneId: null,
+          completedCount: 0,
+          totalCount: 0,
+          statusMessage: "All spoken scenes already have ready voiceovers.",
+        });
+        return;
+      }
+
+      const batchToken = { cancelled: false };
+      batchVoiceoverCancelRef.current = batchToken;
+      setVoiceoverBatchState({
+        active: true,
+        currentSceneId: targetSceneIds[0],
+        completedCount: 0,
+        totalCount: targetSceneIds.length,
+        statusMessage: `Synthesizing voiceovers sequentially (0/${targetSceneIds.length})...`,
+      });
+
+      let readyCount = 0;
+      let failedCount = 0;
+
+      for (let i = 0; i < targetSceneIds.length; i += 1) {
+        if (batchToken.cancelled) break;
+        const sid = targetSceneIds[i];
+        setVoiceoverBatchState({
+          active: true,
+          currentSceneId: sid,
+          completedCount: i,
+          totalCount: targetSceneIds.length,
+          statusMessage: `Synthesizing scene ${i + 1} of ${targetSceneIds.length}...`,
+        });
+
+        const result = await synthesizeSceneVoiceover(sid);
+        if (result === "cancelled" || batchToken.cancelled) {
+          break;
+        }
+        if (result === "ready") {
+          readyCount += 1;
+        } else if (result === "failed") {
+          failedCount += 1;
+        }
+      }
+
+      const wasCancelled = batchToken.cancelled;
+      batchVoiceoverCancelRef.current = null;
+      setVoiceoverBatchState({
+        active: false,
+        currentSceneId: null,
+        completedCount: readyCount,
+        totalCount: targetSceneIds.length,
+        statusMessage: wasCancelled
+          ? `Batch cancelled (${readyCount} scene(s) completed and saved to IndexedDB).`
+          : failedCount > 0
+            ? `Completed ${readyCount}/${targetSceneIds.length} voiceover(s); ${failedCount} failed.`
+            : `Synthesized ${readyCount} voiceover audio file(s) cleanly into IndexedDB.`,
+      });
+    },
+    [idbHydrating, mediaAssets, synthesizeSceneVoiceover]
+  );
+
   const clientValidation = useMemo(() => {
     const payload: VideoGenerationRequest = {
       mode,
@@ -725,9 +1223,16 @@ export function AiGeneratorPage() {
     }
 
     const summary = computeStoryboardMediaSummary(storyboard, mediaAssets, !idbHydrating);
+    const voSummary = computeStoryboardVoiceoverSummary(
+      storyboard,
+      mediaAssets,
+      !idbHydrating,
+      generatingSceneIdsRef.current
+    );
     const updatedStoryboard: VideoStoryboard = {
       ...storyboard,
       mediaReadinessSummary: summary,
+      voiceoverSummary: voSummary,
       updatedAt: new Date().toISOString(),
     };
 
@@ -786,6 +1291,10 @@ export function AiGeneratorPage() {
   const handleLoadDraftFromServer = (draft: ServerStoryboardDraftDto) => {
     const serverId = String(draft._id || draft.id || "");
     const summary = computeStoryboardMediaSummary(draft.storyboard, mediaAssets, !idbHydrating);
+    setActiveAudioSceneId(null);
+    if (batchVoiceoverCancelRef.current) {
+      batchVoiceoverCancelRef.current.cancelled = true;
+    }
     setStoryboard(draft.storyboard);
     setActiveServerDraftId(serverId || null);
     setGenerationStatus("ready");
@@ -821,6 +1330,17 @@ export function AiGeneratorPage() {
   };
 
   const handleClearActiveDraft = () => {
+    setActiveAudioSceneId(null);
+    if (batchVoiceoverCancelRef.current) {
+      batchVoiceoverCancelRef.current.cancelled = true;
+    }
+    setVoiceoverBatchState({
+      active: false,
+      currentSceneId: null,
+      completedCount: 0,
+      totalCount: 0,
+      statusMessage: null,
+    });
     setStoryboard(null);
     setActiveServerDraftId(null);
     setGenerationStatus("idle");
@@ -839,8 +1359,8 @@ export function AiGeneratorPage() {
               AI Script &amp; Storyboard Generator
             </h1>
             <p className="mt-1 text-sm text-zinc-400 max-w-3xl">
-              Plan structured video scripts, match scene visual media, render local text slides, and
-              prepare drafts for Phase 5.5.3 FFmpeg composition.
+              Plan structured video scripts, match scene visual media, synthesize offline local
+              voiceovers, and prepare drafts for Phase 5.5.4+ FFmpeg composition.
             </p>
           </div>
 
@@ -1145,7 +1665,7 @@ export function AiGeneratorPage() {
                       ))}
                     </select>
                     <p className="text-[11px] text-zinc-500">
-                      Preference saved for later voice synthesis (not generated yet).
+                      Initial voiceover plan metadata; synthesize offline voices below.
                     </p>
                   </div>
 
@@ -1180,7 +1700,7 @@ export function AiGeneratorPage() {
                       ))}
                     </select>
                     <p className="text-[11px] text-zinc-500">
-                      Controls caption formatting metadata for Phase 5.5.3.
+                      Caption timing from synthesized voiceovers arrives in Phase 5.5.4+.
                     </p>
                   </div>
                 </div>
@@ -1335,6 +1855,27 @@ export function AiGeneratorPage() {
                 onGenerateAndAssignSlide={handleGenerateAndAssignSlide}
                 onRelinkMissingSceneMedia={handleRelinkMissingSceneMedia}
                 onCancelMediaPrep={handleCancelMediaPrep}
+                ttsStatus={ttsStatus}
+                ttsLoading={ttsLoading}
+                ttsError={ttsError}
+                ttsVoices={ttsVoices}
+                generatingVoiceoverSceneIds={generatingVoiceoverSceneIds}
+                voiceoverBatchState={voiceoverBatchState}
+                activeAudioSceneId={activeAudioSceneId}
+                onActivateSceneAudio={setActiveAudioSceneId}
+                onRefreshTts={() => void loadTtsCapabilities()}
+                onGenerateSceneVoiceover={(sceneId, overrideParams) =>
+                  void synthesizeSceneVoiceover(sceneId, overrideParams)
+                }
+                onCancelSceneVoiceover={handleCancelSceneVoiceover}
+                onRemoveSceneVoiceover={handleRemoveSceneVoiceover}
+                onUpdateSceneVoiceoverVolume={handleUpdateSceneVoiceoverVolume}
+                onGenerateMissingOrStaleVoiceovers={() =>
+                  void handleGenerateBatchVoiceovers("missing_or_stale")
+                }
+                onRegenerateAllVoiceovers={() => void handleGenerateBatchVoiceovers("all")}
+                onCancelVoiceoverBatch={handleCancelVoiceoverBatch}
+                onClearAllVoiceovers={handleClearAllVoiceovers}
               />
             ) : (
               generationStatus !== "generating" && (
@@ -1352,9 +1893,9 @@ export function AiGeneratorPage() {
                     </h2>
                     <p className="text-xs text-zinc-400 leading-relaxed">
                       Enter a prompt or existing narration script on the left and select target
-                      duration, aspect ratio, style, and language. Next you can auto-match local
-                      IndexedDB media, import free stock, or generate PNG text slides before Phase
-                      5.5.3 FFmpeg timeline composition.
+                      duration, aspect ratio, style, and language. Next you can match local media,
+                      synthesize offline scene voiceovers, and prepare drafts before Phase 5.5.4+
+                      FFmpeg timeline composition.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[11px] text-zinc-500">

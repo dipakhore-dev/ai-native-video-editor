@@ -189,6 +189,36 @@ python -m unittest discover -s video-processor/tests -t video-processor -v
 
 ---
 
+## Free Offline Storyboard Voiceover Setup (Phase 5.5.3: eSpeak NG & Piper)
+
+Phase 5.5.3 adds offline `en` / `hi` / `bn` voiceover synthesis inside `video-processor/` at `₹0` cost. Install **either or both** free engines in Windows PowerShell:
+
+1. **Install eSpeak NG (Fast multilingual CLI engine supporting `en`, `hi`, `bn`)**:
+   ```powershell
+   winget install eSpeak-NG.eSpeak-NG
+   espeak-ng --version
+   espeak-ng --voices
+   ```
+   *(If `espeak-ng.exe` is installed under `C:\Program Files\eSpeak NG\espeak-ng.exe` and not on `PATH`, set `ESPEAK_NG_PATH="C:\Program Files\eSpeak NG\espeak-ng.exe"` in `video-processor\.env`.)*
+
+2. **Optional — Install Piper Neural TTS (Recommended for natural English / Hindi neural voices on CPU)**:
+   - Install `piper-tts` inside `video-processor\.venv` or extract the official Windows Piper release binary, then download free `.onnx` + `.onnx.json` voice pairs into `video-processor\models\piper\` (e.g. `en_US-lessac-medium.onnx` + `.onnx.json`, `hi_IN-rohan-medium.onnx` + `.onnx.json`).
+   - Configure `video-processor\.env`:
+     ```env
+     TTS_ENABLED="true"
+     TTS_PROVIDER="auto"
+     PIPER_EXECUTABLE_PATH="piper"
+     PIPER_MODELS_DIR="./models/piper"
+     ESPEAK_NG_PATH="espeak-ng"
+     ```
+
+3. **Optional Windows SAPI5 Fallback**:
+   - Set `TTS_WINDOWS_SAPI_ENABLED="false"` to disable SAPI5, or install `pyttsx3` inside `video-processor\.venv` with `TTS_WINDOWS_SAPI_ENABLED="true"` to allow native Windows OneCore voices as fallback.
+   - See `docs/STORYBOARD_VOICEOVER_GENERATION.md` for engine licenses, duration overflow handling, and i3-1115G4 RAM guidelines.
+
+---
+
+
 ## Deploying to Production (Linux / Docker / Reverse Proxy)
 
 When promoting from local Windows development to production (`NODE_ENV=production` / `APP_ENV=production`):

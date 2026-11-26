@@ -23,7 +23,7 @@ export const CreateMediaMetadataSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
   description: z.string().trim().max(400).optional(),
   sourceOrigin: z
-    .enum(["uploaded", "existing_library", "stock", "generated_slide"])
+    .enum(["uploaded", "existing_library", "stock", "generated_slide", "generated_voiceover"])
     .optional()
     .default("uploaded"),
   providerName: z.string().trim().max(80).optional(),

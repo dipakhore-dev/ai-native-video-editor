@@ -97,3 +97,63 @@ class HealthResponse(BaseModel):
     recommended_encoder: str = "libx264"
     encoder_capabilities: dict[str, dict[str, object]] = Field(default_factory=dict)
     export_profiles: dict[str, dict[str, object]] = Field(default_factory=dict)
+    tts_available: bool = False
+    tts_providers: list[str] = Field(default_factory=list)
+
+
+class TtsVoiceItem(BaseModel):
+    voice_id: str
+    provider: str
+    label: str
+    language: Literal["en", "hi", "bn"]
+    language_tag: str
+    gender: Optional[str] = None
+    quality: str = "standard"
+    sample_rate_hz: Optional[int] = None
+    description: Optional[str] = None
+
+
+class TtsProviderStatusItem(BaseModel):
+    provider: Literal["piper", "espeak_ng", "windows_sapi"]
+    label: str
+    available: bool
+    installed: bool
+    license: str
+    supported_languages: list[Literal["en", "hi", "bn"]] = Field(default_factory=list)
+    voice_count: int = 0
+    message: str
+
+
+class TtsStatusResponse(BaseModel):
+    enabled: bool
+    available: bool
+    configured_provider: str
+    active_provider: Optional[str] = None
+    default_language: Literal["en", "hi", "bn"] = "en"
+    supported_languages: list[Literal["en", "hi", "bn"]] = Field(default_factory=list)
+    mp3_supported: bool = False
+    max_text_chars: int = 1500
+    max_audio_mb: int = 25
+    providers: list[TtsProviderStatusItem] = Field(default_factory=list)
+    message: str
+
+
+class TtsVoicesResponse(BaseModel):
+    available: bool
+    provider: Optional[str] = None
+    language: Optional[Literal["en", "hi", "bn"]] = None
+    voices: list[TtsVoiceItem] = Field(default_factory=list)
+    supported_languages: list[Literal["en", "hi", "bn"]] = Field(default_factory=list)
+    message: str
+
+
+class TtsGenerateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+    language: str = Field(default="en", min_length=2, max_length=32)
+    provider: Optional[str] = Field(default=None, max_length=32)
+    voice_id: Optional[str] = Field(default=None, max_length=160)
+    speaking_rate: float = Field(default=1.0, ge=0.6, le=1.5)
+    pitch: float = Field(default=0.0, ge=-20.0, le=20.0)
+    format: Literal["wav", "mp3"] = "wav"
+    client_job_id: Optional[str] = Field(default=None, max_length=64)
+

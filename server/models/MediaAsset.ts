@@ -14,7 +14,7 @@ export interface IMediaAsset extends Document {
   storageKey?: string;
   tags?: string[];
   description?: string;
-  sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide";
+  sourceOrigin?: "uploaded" | "existing_library" | "stock" | "generated_slide" | "generated_voiceover";
   providerName?: string;
   providerAssetId?: string;
   sourceUrl?: string;
@@ -90,7 +90,7 @@ const MediaAssetSchema = new Schema<IMediaAsset>(
     },
     sourceOrigin: {
       type: String,
-      enum: ["uploaded", "existing_library", "stock", "generated_slide"],
+      enum: ["uploaded", "existing_library", "stock", "generated_slide", "generated_voiceover"],
       default: "uploaded",
     },
     providerName: {

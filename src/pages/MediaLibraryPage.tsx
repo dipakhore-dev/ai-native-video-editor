@@ -20,6 +20,7 @@ import { IntegrationNotice } from "../components/common/IntegrationNotice";
 import { useStudio } from "../context/StudioContext";
 import type { MediaAsset, MediaKind } from "../types/studio";
 import { formatBytes, formatTimecode } from "../utils/media";
+import { loadAllLocalStoryboardDrafts } from "../utils/storyboard";
 
 export function MediaLibraryPage() {
   const {
@@ -94,6 +95,16 @@ export function MediaLibraryPage() {
 
   const unusedCount = useMemo(() => {
     const usedIds = new Set(projects.flatMap((p) => p.clips.map((c) => c.assetId)));
+    for (const draft of loadAllLocalStoryboardDrafts()) {
+      for (const scene of draft.storyboard.scenes) {
+        if (scene.mediaAssignment?.mediaAssetId) {
+          usedIds.add(scene.mediaAssignment.mediaAssetId);
+        }
+        if (scene.voiceover?.mediaAssetId) {
+          usedIds.add(scene.voiceover.mediaAssetId);
+        }
+      }
+    }
     return mediaAssets.filter((a) => !usedIds.has(a.id)).length;
   }, [mediaAssets, projects]);
 
@@ -394,9 +405,11 @@ export function MediaLibraryPage() {
                       {formatBytes(asset.sizeBytes)}
                       {asset.sourceOrigin === "generated_slide"
                         ? " · Generated Slide"
-                        : asset.sourceOrigin === "stock"
-                          ? ` · Stock (${asset.providerName || "Pexels"})`
-                          : ""}
+                        : asset.sourceOrigin === "generated_voiceover"
+                          ? " · Generated Voiceover"
+                          : asset.sourceOrigin === "stock"
+                            ? ` · Stock (${asset.providerName || "Pexels"})`
+                            : ""}
                     </p>
                     {(asset.tags?.length || asset.description) && (
                       <p
@@ -510,7 +523,16 @@ export function MediaLibraryPage() {
                         <span className="truncate">{asset.name}</span>
                       </button>
                     </td>
-                    <td className="py-3 px-4 text-zinc-400 capitalize">{asset.kind}</td>
+                    <td className="py-3 px-4 text-zinc-400 capitalize">
+                      {asset.kind}
+                      {asset.sourceOrigin === "generated_voiceover"
+                        ? " · Generated Voiceover"
+                        : asset.sourceOrigin === "generated_slide"
+                          ? " · Generated Slide"
+                          : asset.sourceOrigin === "stock"
+                            ? ` · Stock (${asset.providerName || "Pexels"})`
+                            : ""}
+                    </td>
                     <td className="py-3 px-4 font-mono text-zinc-400 tabular-nums">
                       {asset.width && asset.height ? `${asset.width}×${asset.height}` : "—"}
                     </td>
