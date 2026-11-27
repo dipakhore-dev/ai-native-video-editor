@@ -23,6 +23,7 @@ import {
   shutdownVideoExports,
 } from "./server/services/videoProcessor.service.ts";
 import { shutdownActiveTtsJobs } from "./server/services/tts.service.ts";
+import { shutdownActiveCaptionsJobs } from "./server/services/captions.service.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,6 +99,7 @@ async function startServer() {
 
     await shutdownVideoExports().catch(() => undefined);
     await shutdownActiveTtsJobs().catch(() => undefined);
+    await shutdownActiveCaptionsJobs().catch(() => undefined);
     await cleanupStaleExpressUploads(EXPRESS_UPLOAD_TEMP_DIR, 0).catch(() => undefined);
 
     await new Promise<void>((resolve) => {

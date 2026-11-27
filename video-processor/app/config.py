@@ -36,6 +36,12 @@ class ProcessorSettings:
     piper_executable_path: str = ""
     piper_models_dir: str = ""
     tts_windows_sapi_enabled: bool = False
+    whisper_local_files_only: bool = True
+    captions_max_audio_mb: int = 20
+    captions_max_duration_sec: float = 90.0
+    captions_max_concurrent_jobs: int = 1
+    captions_request_timeout_sec: int = 120
+    captions_max_segments_per_scene: int = 100
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
@@ -69,6 +75,12 @@ def get_settings() -> ProcessorSettings:
     tts_request_timeout_sec = max(5, min(180, int(os.getenv("TTS_REQUEST_TIMEOUT_SEC", "45"))))
     tts_max_audio_mb = max(1, min(100, int(os.getenv("TTS_MAX_AUDIO_MB", "25"))))
     tts_windows_sapi_enabled = _parse_bool_env("TTS_WINDOWS_SAPI_ENABLED", os.name == "nt")
+    whisper_local_files_only = _parse_bool_env("WHISPER_LOCAL_FILES_ONLY", True)
+    captions_max_audio_mb = max(1, min(100, int(os.getenv("CAPTIONS_MAX_AUDIO_MB", "20"))))
+    captions_max_duration_sec = max(5.0, min(300.0, float(os.getenv("CAPTIONS_MAX_DURATION_SEC", "90"))))
+    captions_max_concurrent_jobs = max(1, min(2, int(os.getenv("CAPTIONS_MAX_CONCURRENT_JOBS", "1"))))
+    captions_request_timeout_sec = max(10, min(300, int(os.getenv("CAPTIONS_REQUEST_TIMEOUT_SEC", "120"))))
+    captions_max_segments_per_scene = max(10, min(250, int(os.getenv("CAPTIONS_MAX_SEGMENTS_PER_SCENE", "100"))))
 
     return ProcessorSettings(
         app_env=app_env,
@@ -100,6 +112,12 @@ def get_settings() -> ProcessorSettings:
         piper_executable_path=os.getenv("PIPER_EXECUTABLE_PATH", "").strip(),
         piper_models_dir=os.getenv("PIPER_MODELS_DIR", "").strip(),
         tts_windows_sapi_enabled=tts_windows_sapi_enabled,
+        whisper_local_files_only=whisper_local_files_only,
+        captions_max_audio_mb=captions_max_audio_mb,
+        captions_max_duration_sec=captions_max_duration_sec,
+        captions_max_concurrent_jobs=captions_max_concurrent_jobs,
+        captions_request_timeout_sec=captions_request_timeout_sec,
+        captions_max_segments_per_scene=captions_max_segments_per_scene,
     )
 
 
@@ -119,6 +137,10 @@ def validate_runtime_settings(settings: ProcessorSettings) -> list[str]:
         errors.append("TTS_MAX_TEXT_CHARS must be between 50 and 5000.")
     if settings.tts_max_concurrent_jobs < 1 or settings.tts_max_concurrent_jobs > 4:
         errors.append("TTS_MAX_CONCURRENT_JOBS must be between 1 and 4.")
+    if settings.captions_max_concurrent_jobs < 1 or settings.captions_max_concurrent_jobs > 2:
+        errors.append("CAPTIONS_MAX_CONCURRENT_JOBS must be 1 or 2.")
+    if settings.captions_max_audio_mb < 1 or settings.captions_max_audio_mb > 100:
+        errors.append("CAPTIONS_MAX_AUDIO_MB must be between 1 and 100.")
     if settings.app_env == "production":
         if (
             not settings.api_key

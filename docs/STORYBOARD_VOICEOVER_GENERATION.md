@@ -2,7 +2,7 @@
 
 Phase 5.5.3 adds **free (`₹0`), offline-capable speech synthesis** for each scene in a `VideoStoryboard` using local engines running inside the Python FastAPI microservice (`video-processor/`), with synthesized audio normalized by **FFmpeg/FFprobe** and persisted directly inside browser **IndexedDB** (`sourceOrigin: "generated_voiceover"`).
 
-> **Honest Scope Boundary:** Phase 5.5.3 synthesizes, measures, previews, and persists scene voiceovers inside `StoryboardDraft` (`compositionReady: false` remains enforced). Automatic caption timing from synthesized voiceovers and automated multi-track FFmpeg storyboard MP4 composition are reserved for Phase 5.5.4+.
+> **Honest Scope Boundary:** Phase 5.5.3 synthesizes, measures, previews, and persists scene voiceovers inside `StoryboardDraft` (`compositionReady: false` remains enforced). Automatic caption generation and cue editing are implemented in Phase 5.5.4 (`docs/STORYBOARD_CAPTION_GENERATION.md`), while automated multi-track FFmpeg storyboard MP4 composition is reserved for Phase 5.5.5.
 
 ---
 
@@ -26,7 +26,7 @@ Phase 5.5.3 adds **free (`₹0`), offline-capable speech synthesis** for each sc
      - `POST /api/tts/generate`
      - `GET /api/tts/jobs/:id`
      - `POST /api/tts/jobs/:id/cancel`
-   - `GET /api/integrations/status` includes the `tts` entry alongside `aiAssistant`, `videoProcessor`, `stockMedia`, etc.
+   - `GET /api/integrations/status` includes the `tts` entry alongside `aiAssistant`, `videoProcessor`, `stockMedia`, `storyboardCaptions`, etc.
    - CORS exposes `X-TTS-Job-Id`, `X-TTS-Provider`, `X-TTS-Voice-Id`, `X-TTS-Voice-Label`, `X-TTS-Language`, `X-TTS-Duration`, `X-TTS-Sample-Rate`, `X-TTS-Channels`, and `X-TTS-Format`.
 
 3. **Frontend & IndexedDB Persistence (`src/`)**:
@@ -57,5 +57,7 @@ Phase 5.5.3 adds **free (`₹0`), offline-capable speech synthesis** for each sc
 ## 4. Open-Source Engine Licensing Notes
 
 - **eSpeak NG**: Licensed under **GPL-3.0-or-later**. Invoked as an isolated external CLI binary over standard pipes (`subprocess.Popen(..., shell=False)`), preserving clear binary separation.
-- **Piper TTS**: Piper runtime is **MIT-licensed**; individual ONNX voice models carry their respective open model licenses (typically MIT / CC0 / CC-BY depending on speaker dataset — verify each downloaded `.onnx.json` model card before commercial redistribution).
+- **Piper TTS (Original Rhasspy Piper vs. Active Distribution Forks)**:
+  - The original **rhasspy/piper** project was published under **MIT**, whereas newer maintained PyPI/CLI distributions such as **`piper1-gpl`** (OHF-Voice) are licensed under **GPL-3.0** because of upstream phonemizer dependencies. Because AI Studio invokes the configured `piper` CLI as an external subprocess (`subprocess.Popen(..., shell=False)`), verify the license of the specific Piper binary/wheel (`piper` vs `piper1-gpl`) installed in your environment.
+  - Individual `.onnx` voice models carry their own dataset/speaker licenses (commonly MIT, CC0, CC-BY, or non-commercial restrictions depending on the voice) — inspect each model's `.onnx.json` / `MODEL_CARD` before commercial redistribution.
 - **pyttsx3 (optional Windows SAPI5)**: Licensed under **MPL-2.0**; connects to native OS Windows Speech APIs when explicitly enabled via `TTS_WINDOWS_SAPI_ENABLED=true`.

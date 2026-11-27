@@ -1261,7 +1261,7 @@ async function runTests(): Promise<void> {
       })
     ).replace(/<!--\s*-->/g, "");
     assert.ok(panelHtml.includes("Storyboard Voiceover Generation"));
-    assert.ok(panelHtml.includes("Composition locked until Phase 5.5.4+"));
+    assert.ok(panelHtml.includes("Composition locked until Phase 5.5.5"));
 
     const aiPageHtml = renderToString(
       React.createElement(StudioProvider, null, React.createElement(AiGeneratorPage))

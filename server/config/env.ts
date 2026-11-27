@@ -40,6 +40,15 @@ export interface AppEnvConfig {
   ttsMaxBatchScenes: number;
   ttsMaxAudioMb: number;
   rateLimitTtsMax: number;
+  captionsEnabled: boolean;
+  captionsDefaultMode: "script" | "audio";
+  captionsMaxTextChars: number;
+  captionsMaxSegmentsPerScene: number;
+  captionsMaxBatchScenes: number;
+  captionsMaxConcurrentJobs: number;
+  captionsRequestTimeoutMs: number;
+  captionsMaxAudioMb: number;
+  rateLimitCaptionsMax: number;
 }
 
 function parseBoundedInt(
@@ -212,6 +221,23 @@ export function getEnvConfig(env: NodeJS.ProcessEnv = process.env): AppEnvConfig
     ttsMaxBatchScenes: parseBoundedInt(env.TTS_MAX_BATCH_SCENES, 12, 1, 12),
     ttsMaxAudioMb: parseBoundedInt(env.TTS_MAX_AUDIO_MB, 25, 1, 100),
     rateLimitTtsMax: parseBoundedInt(env.RATE_LIMIT_TTS_MAX, 36, 1, 500),
+    captionsEnabled: !/^(0|false|no|off)$/i.test((env.CAPTIONS_ENABLED || "true").trim()),
+    captionsDefaultMode:
+      (env.CAPTIONS_DEFAULT_MODE || "script").trim().toLowerCase() === "audio"
+        ? "audio"
+        : "script",
+    captionsMaxTextChars: parseBoundedInt(env.CAPTIONS_MAX_TEXT_CHARS, 4000, 100, 10000),
+    captionsMaxSegmentsPerScene: parseBoundedInt(env.CAPTIONS_MAX_SEGMENTS_PER_SCENE, 100, 10, 250),
+    captionsMaxBatchScenes: parseBoundedInt(env.CAPTIONS_MAX_BATCH_SCENES, 12, 1, 12),
+    captionsMaxConcurrentJobs: parseBoundedInt(env.CAPTIONS_MAX_CONCURRENT_JOBS, 1, 1, 2),
+    captionsRequestTimeoutMs: parseBoundedInt(
+      env.CAPTIONS_REQUEST_TIMEOUT_MS,
+      120_000,
+      10_000,
+      300_000
+    ),
+    captionsMaxAudioMb: parseBoundedInt(env.CAPTIONS_MAX_AUDIO_MB, 20, 1, 100),
+    rateLimitCaptionsMax: parseBoundedInt(env.RATE_LIMIT_CAPTIONS_MAX, 36, 1, 500),
   };
 }
 

@@ -19,8 +19,10 @@ import { exportRouter } from "./export.routes.ts";
 import { videoProcessingRouter } from "./videoProcessing.routes.ts";
 import { stockMediaRouter } from "./stockMedia.routes.ts";
 import { ttsRouter } from "./tts.routes.ts";
+import { captionsRouter } from "./captions.routes.ts";
 import { getStockMediaStatus } from "../services/stockMedia.service.ts";
 import { fetchProcessorTtsStatus } from "../services/tts.service.ts";
+import { fetchProcessorCaptionsStatus } from "../services/captions.service.ts";
 
 export const apiRouter = Router();
 
@@ -73,9 +75,10 @@ apiRouter.get("/integrations/status", async (_req, res) => {
   const jwtReady = isJwtConfigured();
   const videoGenReady = isVideoGenProviderConfigured();
   const queueStatus = getVideoQueueStatus();
-  const [processorHealth, ttsStatus] = await Promise.all([
+  const [processorHealth, ttsStatus, captionsStatus] = await Promise.all([
     checkVideoProcessorHealth(),
     fetchProcessorTtsStatus(),
+    fetchProcessorCaptionsStatus(),
   ]);
   const stockStatus = getStockMediaStatus();
 
@@ -220,6 +223,20 @@ apiRouter.get("/integrations/status", async (_req, res) => {
         endpoint: "POST /api/tts/generate",
         summary: ttsStatus.message,
       },
+      storyboardCaptions: {
+        id: "storyboardCaptions",
+        label: "Storyboard Captions (Script + faster-whisper)",
+        connected: captionsStatus.enabled && captionsStatus.scriptModeAvailable,
+        provider: !captionsStatus.enabled
+          ? "Disabled (CAPTIONS_ENABLED=false)"
+          : captionsStatus.audioTranscriptionAvailable
+            ? `Script Timing + faster-whisper (${captionsStatus.model || "cached"})`
+            : captionsStatus.localModelReady === false && captionsStatus.fasterWhisperInstalled
+              ? "Script Timing Ready (Whisper Model Not Cached Locally)"
+              : "Script Timing Ready (Audio Transcription Requires Local video-processor)",
+        endpoint: "POST /api/captions/from-audio",
+        summary: captionsStatus.message,
+      },
     },
     checkedAt: new Date().toISOString(),
   });
@@ -233,3 +250,4 @@ apiRouter.use("/exports", exportRouter);
 apiRouter.use("/video", videoProcessingRouter);
 apiRouter.use("/stock-media", stockMediaRouter);
 apiRouter.use("/tts", ttsRouter);
+apiRouter.use("/captions", captionsRouter);

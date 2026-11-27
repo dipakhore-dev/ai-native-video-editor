@@ -328,6 +328,129 @@ export const StoryboardVoiceoverSummarySchema = z.object({
   isVoiceoverReady: z.boolean(),
 });
 
+export const CaptionGenerationModeEnum = z.enum(["script", "audio"]);
+export const CaptionTimingSourceEnum = z.enum([
+  "estimated",
+  "audio_transcription",
+  "manual",
+]);
+export const SceneCaptionStatusEnum = z.enum([
+  "none",
+  "queued",
+  "generating",
+  "ready",
+  "stale",
+  "failed",
+  "skipped_empty",
+]);
+export const CaptionStylePresetIdEnum = z.enum([
+  "classic",
+  "cinematic",
+  "educational",
+  "social_media",
+  "minimal",
+  "yellow_highlight",
+]);
+
+const HexColorString = z
+  .string()
+  .trim()
+  .regex(/^#[0-9a-fA-F]{6}$/, "Color must be a 6-digit hex string.");
+
+export const CaptionStyleConfigSchema = z.object({
+  presetId: CaptionStylePresetIdEnum.default("classic"),
+  enabled: z.boolean().default(true),
+  fontFamily: z.string().trim().min(1).max(200),
+  fontSize: z.number().int().min(18).max(72).default(40),
+  fontWeight: z.union([
+    z.literal(400),
+    z.literal(500),
+    z.literal(600),
+    z.literal(700),
+    z.literal(800),
+  ]).default(600),
+  color: HexColorString.default("#FFFFFF"),
+  backgroundEnabled: z.boolean().default(true),
+  backgroundColor: HexColorString.default("#09090B"),
+  backgroundOpacity: z.number().finite().min(0).max(1).default(0.75),
+  outlineWidth: z.number().finite().min(0).max(6).default(2),
+  outlineColor: HexColorString.default("#000000"),
+  position: z.enum(["top", "middle", "bottom"]).default("bottom"),
+  alignment: z.enum(["left", "center", "right"]).default("center"),
+  safeMarginBottomPct: z.number().finite().min(4).max(30).default(10),
+  maxLines: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(2),
+});
+
+export const StoryboardCaptionWordTimestampSchema = z.object({
+  word: z.string().trim().min(1).max(120),
+  start: z.number().finite().min(0).max(3600),
+  end: z.number().finite().min(0).max(3600),
+});
+
+export const StoryboardCaptionSegmentSchema = z.object({
+  id: z.string().trim().min(1).max(96),
+  start: z.number().finite().min(0).max(3600),
+  end: z.number().finite().min(0).max(3600),
+  text: z.string().trim().max(400),
+  timingSource: CaptionTimingSourceEnum,
+  words: z.array(StoryboardCaptionWordTimestampSchema).max(80).optional(),
+  isManuallyEdited: z.boolean().optional(),
+  confidence: z.number().finite().min(0).max(1).optional(),
+});
+
+export const StoryboardSceneCaptionsSchema = z.object({
+  sceneId: z.string().trim().min(1).max(64),
+  mode: CaptionGenerationModeEnum,
+  timingSource: CaptionTimingSourceEnum,
+  language: TtsLanguageCodeEnum,
+  status: SceneCaptionStatusEnum,
+  segments: z.array(StoryboardCaptionSegmentSchema).max(100),
+  fingerprint: z.string().trim().min(1).max(128),
+  sourceNarrationSnapshot: z.string().max(1500),
+  sourceVoiceoverMediaAssetId: z
+    .string()
+    .trim()
+    .max(160)
+    .refine((val) => !/^blob:/i.test(val), {
+      message: "Caption source asset ID cannot be a blob URL.",
+    })
+    .optional(),
+  sourceVoiceoverDurationSec: z.number().finite().min(0).max(3600).optional(),
+  sourceSceneDurationSec: z.number().finite().min(0).max(3600).optional(),
+  model: z.string().trim().max(80).optional(),
+  detectedLanguage: z.string().trim().max(32).optional(),
+  languageProbability: z.number().finite().min(0).max(1).optional(),
+  generatedAt: z.string().trim().min(1).max(64),
+  hasManualEdits: z.boolean().optional(),
+  overflowsSceneDuration: z.boolean().optional(),
+  warnings: z.array(z.string().trim().max(300)).max(12).optional(),
+  errorMessage: z.string().trim().max(400).optional(),
+});
+
+export const StoryboardCaptionSettingsSchema = z.object({
+  enabled: z.boolean().default(true),
+  defaultMode: CaptionGenerationModeEnum.default("script"),
+  language: z.union([z.literal("match_storyboard"), TtsLanguageCodeEnum]).default("match_storyboard"),
+  wordTimestamps: z.boolean().default(false),
+  style: CaptionStyleConfigSchema,
+});
+
+export const StoryboardCaptionSummarySchema = z.object({
+  totalScenes: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  captionableScenes: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  readyCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  staleCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  failedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  unassignedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  manualCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  overflowCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  totalCueCount: z.number().int().min(0).max(1200),
+  estimatedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  transcribedCount: z.number().int().min(0).max(MAX_STORYBOARD_SCENES),
+  progressPercent: z.number().min(0).max(100),
+  isCaptionsReady: z.boolean(),
+});
+
 export const StoryboardSceneSchema = z.object({
   id: z
     .string()
@@ -359,6 +482,7 @@ export const StoryboardSceneSchema = z.object({
   cameraMotion: StoryboardCameraMotionEnum,
   mediaAssignment: StoryboardSceneMediaAssignmentSchema.optional(),
   voiceover: StoryboardSceneVoiceoverSchema.optional(),
+  captions: StoryboardSceneCaptionsSchema.optional(),
 });
 
 export const AiStoryboardOutputSchema = z.object({
@@ -412,6 +536,8 @@ export const VideoStoryboardSchema = z.object({
   mediaReadinessSummary: StoryboardMediaSummarySchema.optional(),
   voiceoverSettings: StoryboardVoiceoverSettingsSchema.optional(),
   voiceoverSummary: StoryboardVoiceoverSummarySchema.optional(),
+  captionSettings: StoryboardCaptionSettingsSchema.optional(),
+  captionSummary: StoryboardCaptionSummarySchema.optional(),
   createdAt: z.string().trim().max(64),
   updatedAt: z.string().trim().max(64),
 });
@@ -743,7 +869,7 @@ export function sanitizeStoryboardForPersistence(storyboard: VideoStoryboard): V
           ? scene.voiceover.mediaAssetId
           : undefined;
       const cleanedVoiceoverError =
-        scene.voiceover?.errorMessage && !/^blob:/i.test(scene.voiceover.errorMessage)
+        scene.voiceover?.errorMessage && !/\bblob:/i.test(scene.voiceover.errorMessage)
           ? scene.voiceover.errorMessage
           : undefined;
 
@@ -764,10 +890,36 @@ export function sanitizeStoryboardForPersistence(storyboard: VideoStoryboard): V
           }
         : undefined;
 
+      const cleanedCaptionAssetId =
+        scene.captions?.sourceVoiceoverMediaAssetId &&
+        !/^blob:/i.test(scene.captions.sourceVoiceoverMediaAssetId)
+          ? scene.captions.sourceVoiceoverMediaAssetId
+          : undefined;
+      const cleanedCaptionError =
+        scene.captions?.errorMessage && !/\bblob:/i.test(scene.captions.errorMessage)
+          ? scene.captions.errorMessage
+          : undefined;
+
+      const nextCaptions = scene.captions
+        ? {
+            ...scene.captions,
+            sceneId: scene.id,
+            sourceVoiceoverMediaAssetId: cleanedCaptionAssetId,
+            errorMessage: cleanedCaptionError,
+            status:
+              scene.captions.status === "generating" || scene.captions.status === "queued"
+                ? scene.captions.segments.length > 0
+                  ? ("ready" as const)
+                  : ("none" as const)
+                : scene.captions.status,
+          }
+        : undefined;
+
       return {
         ...scene,
         ...(nextAssignment ? { mediaAssignment: nextAssignment } : {}),
         ...(nextVoiceover ? { voiceover: nextVoiceover } : {}),
+        ...(nextCaptions ? { captions: nextCaptions } : {}),
       };
     }),
   };

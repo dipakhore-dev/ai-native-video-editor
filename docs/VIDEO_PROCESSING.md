@@ -73,4 +73,13 @@ Point the service root directory to `video-processor/` and deploy using `video-p
 - **Engines**: Piper ONNX (`piper`), eSpeak NG (`espeak-ng`), and optional isolated Windows SAPI5 (`pyttsx3`). All child processes launch with `shell=False` and UTF-8 stdin piping (`en`, `hi`, `bn`).
 - **Audio Normalization**: Output is standardized via FFmpeg (`-protocol_whitelist file,pipe`) to mono PCM 16-bit WAV (`22050 Hz` default) or optional MP3 (`libmp3lame`), and real durations are verified via FFprobe before streaming `FileResponse` with automatic temp directory cleanup.
 
+---
+
+## Local Audio Captions Subsystem (Phase 5.5.4)
+
+- **Endpoints (`video-processor/app/routes/captions.py`)**:
+  - `GET /api/v1/captions/status`, `POST /api/v1/captions/generate`, `GET /api/v1/captions/jobs/{job_id}`, `POST /api/v1/captions/jobs/{job_id}/cancel` (protected by `verify_captions_processor_key`).
+- **Audio-Only & Extraction Safety**: Rejects non-audio magic signatures (`detected_kind != "audio"`), verifies audio duration against `CAPTIONS_MAX_DURATION_SEC` (default `90s`), directly reuses 16 kHz mono PCM WAV inputs, and normalizes other audio formats via FFmpeg (`-protocol_whitelist file,pipe`).
+- **Multilingual CPU Transcription**: Uses shared cached `faster-whisper` (`small` default, `cpu` / `int8`, `WHISPER_LOCAL_FILES_ONLY=true`), maps any `*.en` model setting to multilingual equivalents for English/Hindi/Bengali, supports optional `word_timestamps`, enforces `CAPTIONS_MAX_CONCURRENT_JOBS=1`, honors cooperative cancellation (`499`), and cleans temp directories on completion or failure.
+
 

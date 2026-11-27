@@ -17,6 +17,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .config import ProcessorSettings, get_settings, validate_runtime_settings
+from .routes.captions import router as captions_router
 from .routes.tts import router as tts_router
 from .schemas import (
     HealthResponse,
@@ -44,6 +45,7 @@ from .services.job_store import job_store, sanitize_error_text
 from .services.tts_providers.base import TtsCancelledError, TtsError
 from .services.tts_service import get_tts_status
 from .services.whisper_service import (
+    CaptionsCancelledError,
     SubtitleGenerationError,
     is_faster_whisper_available,
     transcribe_video_subtitles,
@@ -175,11 +177,16 @@ app = FastAPI(
 
 
 app.include_router(tts_router)
+app.include_router(captions_router)
 
 
 @app.middleware("http")
 async def pre_register_export_job_middleware(request: Request, call_next):
-    if request.method == "POST" and request.url.path in ("/api/v1/export-mp4", "/api/v1/tts/generate"):
+    if request.method == "POST" and request.url.path in (
+        "/api/v1/export-mp4",
+        "/api/v1/tts/generate",
+        "/api/v1/captions/generate",
+    ):
         settings = get_settings()
         provided_key = request.headers.get("x-processor-key")
         if assert_processor_key_matches(provided_key, settings):
@@ -187,6 +194,10 @@ async def pre_register_export_job_middleware(request: Request, call_next):
                 raw_header_id = (request.headers.get("x-tts-job-id") or "").strip()
                 op_name = "tts_generate"
                 stage_label = "Preparing voiceover synthesis"
+            elif request.url.path == "/api/v1/captions/generate":
+                raw_header_id = (request.headers.get("x-captions-job-id") or "").strip()
+                op_name = "captions_generate"
+                stage_label = "Preparing voiceover transcription"
             else:
                 raw_header_id = (request.headers.get("x-export-job-id") or "").strip()
                 op_name = "export_mp4"
@@ -237,6 +248,14 @@ async def handle_cancelled_error(_request, exc: VideoProcessingCancelledError) -
 @app.exception_handler(VideoProcessingError)
 async def handle_processing_error(_request, exc: VideoProcessingError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": sanitize_error_text(str(exc))})
+
+
+@app.exception_handler(CaptionsCancelledError)
+async def handle_captions_cancelled_error(_request, exc: CaptionsCancelledError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": sanitize_error_text(str(exc), "Audio caption transcription cancelled."), "cancelled": True},
+    )
 
 
 @app.exception_handler(SubtitleGenerationError)

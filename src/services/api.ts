@@ -1,4 +1,5 @@
 import type {
+  CaptionsStatusInfo,
   IntegrationStatusMap,
   MediaSourceOrigin,
   Project,
@@ -1472,4 +1473,177 @@ export async function cancelTtsJob(
     ...(options?.keepalive ? { keepalive: true } : {}),
   });
 }
+
+export interface CaptionWordTimestampDto {
+  word: string;
+  start: number;
+  end: number;
+}
+
+export interface AudioCaptionSegmentDto {
+  id: number;
+  start: number;
+  end: number;
+  text: string;
+  words?: CaptionWordTimestampDto[];
+}
+
+export interface AudioCaptionsGenerateResult {
+  jobId: string;
+  model: string;
+  language: string;
+  languageProbability: number;
+  durationSeconds: number;
+  wordTimestampsIncluded: boolean;
+  segments: AudioCaptionSegmentDto[];
+  srt: string;
+  vtt: string;
+}
+
+export interface CaptionsJobSnapshotDto {
+  jobId: string;
+  userId?: string;
+  status: "queued" | "processing" | "completed" | "failed" | "cancelled";
+  stage: string;
+  stageLabel: string;
+  cancelled: boolean;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  error?: string | null;
+}
+
+export async function fetchCaptionsStatus(): Promise<ApiResult<CaptionsStatusInfo>> {
+  return requestJson("/api/captions/status");
+}
+
+export async function generateAudioCaptions(
+  audioBlobOrFile: Blob | File,
+  options?: {
+    filename?: string;
+    language?: TtsLanguageCode | "auto";
+    wordTimestamps?: boolean;
+    clientJobId?: string;
+    sceneId?: string;
+    storyboardId?: string;
+    signal?: AbortSignal;
+  }
+): Promise<ApiResult<AudioCaptionsGenerateResult>> {
+  const effectiveClientJobId = options?.clientJobId;
+  try {
+    const formData = new FormData();
+    const fname =
+      options?.filename ||
+      (audioBlobOrFile instanceof File && audioBlobOrFile.name
+        ? audioBlobOrFile.name
+        : "voiceover.wav");
+    formData.append("audio", audioBlobOrFile, fname);
+    if (options?.language) {
+      formData.append("language", options.language);
+    }
+    formData.append("wordTimestamps", options?.wordTimestamps ? "true" : "false");
+    if (effectiveClientJobId) {
+      formData.append("clientJobId", effectiveClientJobId);
+    }
+    if (options?.sceneId) {
+      formData.append("sceneId", options.sceneId);
+    }
+    if (options?.storyboardId) {
+      formData.append("storyboardId", options.storyboardId);
+    }
+
+    const res = await fetch("/api/captions/from-audio", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "X-Requested-With": "AIStudioClient",
+        ...(effectiveClientJobId ? { "X-Captions-Job-Id": effectiveClientJobId } : {}),
+      },
+      body: formData,
+      signal: options?.signal,
+    });
+
+    const body = (await res.json().catch(() => ({}))) as Partial<AudioCaptionsGenerateResult> & {
+      error?: string;
+      message?: string;
+      cancelled?: boolean;
+      errorCategory?: string;
+      integrationPoint?: string;
+    };
+
+    if (!res.ok || !Array.isArray(body.segments)) {
+      const isCancelled = res.status === 499 || Boolean(body.cancelled);
+      if (res.status === 401 && !body.errorCategory && !body.integrationPoint) {
+        sessionExpiredHandler?.();
+      }
+      return {
+        ok: false,
+        status: isCancelled ? 499 : res.status,
+        cancelled: isCancelled,
+        jobId: res.headers.get("x-captions-job-id") || effectiveClientJobId,
+        error:
+          body.error ||
+          body.message ||
+          (isCancelled
+            ? "Audio caption transcription cancelled."
+            : `Audio caption transcription failed (${res.status}).`),
+        errorCategory: body.errorCategory,
+        integrationPoint: body.integrationPoint,
+      };
+    }
+
+    return {
+      ok: true,
+      status: res.status,
+      data: {
+        jobId: body.jobId || res.headers.get("x-captions-job-id") || effectiveClientJobId || "",
+        model: body.model || "faster-whisper",
+        language: body.language || "unknown",
+        languageProbability: Number(body.languageProbability || 0),
+        durationSeconds: Number(body.durationSeconds || 0),
+        wordTimestampsIncluded: Boolean(body.wordTimestampsIncluded),
+        segments: body.segments,
+        srt: body.srt || "",
+        vtt: body.vtt || "",
+      },
+    };
+  } catch (err) {
+    const isAborted =
+      Boolean(options?.signal?.aborted) ||
+      (err instanceof Error && err.name === "AbortError");
+    if (isAborted) {
+      return {
+        ok: false,
+        status: 499,
+        cancelled: true,
+        jobId: effectiveClientJobId,
+        error: "Audio caption transcription cancelled.",
+      };
+    }
+    return {
+      ok: false,
+      status: 0,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Network error reaching local audio captions service.",
+    };
+  }
+}
+
+export async function fetchCaptionJobStatus(
+  jobId: string
+): Promise<ApiResult<{ job: CaptionsJobSnapshotDto }>> {
+  return requestJson(`/api/captions/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export async function cancelCaptionJob(
+  jobId: string,
+  options?: { keepalive?: boolean }
+): Promise<ApiResult<{ status: string; cancelled: boolean; job: CaptionsJobSnapshotDto }>> {
+  return requestJson(`/api/captions/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    ...(options?.keepalive ? { keepalive: true } : {}),
+  });
+}
+
 

@@ -13,9 +13,9 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
   - `Project.ts` — Owner-scoped (`userId`) video projects with embedded `tracks` and `clips` (including `textStyle` overlays).
   - `MediaAsset.ts` — Owner-scoped (`userId`) media metadata records (`name`, `kind`, `mimeType`, `sizeBytes`, `duration`, `width`, `height`, `storageProvider`, `storageKey`, plus `tags`, `description`, `sourceOrigin`, and optional stock attribution metadata `providerName`, `providerAssetId`, `sourceUrl`, `creatorName`, `attributionUrl`, `licenseInfo`).
   - `AiEditRequest.ts` — Audit trail of natural-language prompts, timeline snapshots, Zod-validated Gemini edit plans, and `proposed`/`applied`/`discarded` status.
-  - `StoryboardDraft.ts` — Lightweight, owner-scoped (`userId`) AI Script & Storyboard drafts storing editable scene breakdowns (including `mediaAssignment` & `mediaReadinessSummary` without binary payloads or `blob:` URLs), narration, captions, and settings JSON separately from timeline `Project` records.
+  - `StoryboardDraft.ts` — Lightweight, owner-scoped (`userId`) AI Script & Storyboard drafts storing editable scene breakdowns (including `mediaAssignment`, `mediaReadinessSummary`, `voiceover`, `voiceoverSettings`, `captionSettings`, `captionSummary`, and `scenes[].captions` without binary payloads or `blob:` URLs), narration, captions, and settings JSON separately from timeline `Project` records.
   - `ExportJob.ts` — Owner-scoped export job specifications and render status tracking.
-- `server/validators/` — Zod schemas validating request bodies for auth, projects/timelines, media metadata, AI edit requests, and export jobs.
+- `server/validators/` — Zod schemas validating request bodies for auth, projects/timelines, media metadata, AI edit requests, TTS, captions, and export jobs.
 - `server/middleware/`
   - `auth.middleware.ts` — Verifies JWT stored in secure `HttpOnly`, `SameSite=Lax` cookie (`requireAuth`, `optionalAuth`).
   - `validate.middleware.ts` — `validateBody(schema)` and `validateObjectId(paramName)`.
@@ -51,13 +51,16 @@ When `MONGODB_URI` is not configured (such as in the AI Studio preview sandbox),
 - `POST /api/stock-media/search` — Search Pexels photos or videos using authenticated server-side API key (`503` when disabled; rate-limited; SSRF-guarded).
 - `POST /api/stock-media/import` — Server-side proxy download of an allowlisted Pexels asset with HTTPS/DNS SSRF checks, bounded byte streaming (`STOCK_MEDIA_MAX_IMPORT_MB`), magic-byte signature validation, and `X-Stock-*` attribution headers for client IndexedDB persistence.
 
-### AI Editing, Storyboard Voiceover & Export Job Tracking
+### AI Editing, Storyboard Voiceover, Captions & Export Job Tracking
 - `POST /api/ai/assistant` — Translate natural-language instructions into Zod-validated JSON timeline operations using the configured Gemini model (default: `gemini-3.5-flash`); persists `AiEditRequest` when authenticated with MongoDB.
 - `POST /api/ai/storyboard` — Generate a Zod-validated `VideoStoryboard` from a prompt or script using the configured Gemini model (default: `gemini-3.5-flash`) with optional transient fallback (`GEMINI_FALLBACK_MODELS`), per-user concurrency guard, and cancellation support (`requireAuth`).
-- `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`; stores lightweight `mediaAssignment` & `voiceover` metadata without binary audio or `blob:` URLs).
+- `GET /api/ai/storyboards` & `POST /api/ai/storyboards` — List or save editable `StoryboardDraft` records for the authenticated user (`requireAuth`; stores lightweight `mediaAssignment`, `voiceover`, and `captions` metadata without binary audio or `blob:` URLs).
 - `GET /api/ai/storyboards/:id`, `PATCH /api/ai/storyboards/:id`, `DELETE /api/ai/storyboards/:id` — Fetch, update, or delete an owner-scoped `StoryboardDraft` (`requireAuth`).
 - `GET /api/tts/status` & `GET /api/tts/voices` — Inspect local Python TTS provider readiness (`piper`, `espeak_ng`, optional `windows_sapi`) and language-filtered voices (`en`/`hi`/`bn`) (`requireAuth`).
 - `POST /api/tts/generate`, `GET /api/tts/jobs/:id`, `POST /api/tts/jobs/:id/cancel` — Auth-, CSRF-, and rate-limit-guarded proxy returning FFmpeg-normalized WAV/MP3 audio + `X-TTS-*` headers and job cancellation (`requireAuth`).
+- `GET /api/captions/status` — Inspect local script-caption readiness (`scriptModeAvailable`) and offline `faster-whisper` cache/CPU state (`audioTranscriptionAvailable`, `localFilesOnly`, `model`) (`requireAuth`).
+- `POST /api/captions/from-audio`, `GET /api/captions/jobs/:id`, `POST /api/captions/jobs/:id/cancel` — Auth-, CSRF-, audio-only magic-byte-, and rate-limit-guarded proxy (`X-Captions-Job-Id`) streaming uploaded audio to FastAPI `faster-whisper` with bounded concurrency (`1`) and cooperative cancellation (`requireAuth`).
+- `GET /api/integrations/status` — Includes `storyboardCaptions` alongside `tts`, `videoProcessor`, `aiAssistant`, and `stockMedia`.
 - `GET /api/ai/requests` — List user's saved AI editing requests (`requireAuth`).
 - `PATCH /api/ai/requests/:id` — Mark an AI edit proposal `applied` or `discarded` (`requireAuth`).
 - `GET /api/exports` — List user's export jobs (`requireAuth`).

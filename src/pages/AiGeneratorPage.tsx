@@ -17,13 +17,16 @@ import { IntegrationNotice } from "../components/common/IntegrationNotice";
 import { StoryboardReviewPanel } from "../components/generator/StoryboardReviewPanel";
 import { useStudio } from "../context/StudioContext";
 import {
+  cancelCaptionJob,
   cancelTtsJob,
   createServerStoryboardDraft,
   deleteServerStoryboardDraft,
+  fetchCaptionsStatus,
   fetchServerStoryboardDrafts,
   fetchTtsStatus,
   fetchTtsVoices,
   generateAiStoryboard,
+  generateAudioCaptions,
   generateTtsVoiceover,
   importStockMediaApi,
   updateServerStoryboardDraft,
@@ -32,12 +35,16 @@ import {
 } from "../services/api";
 import type {
   AspectRatioOption,
+  CaptionGenerationMode,
+  CaptionsStatusInfo,
   GeneratedSlideConfig,
   MediaAsset,
   StoryboardCaptionPreference,
+  StoryboardCaptionSegment,
   StoryboardDraftRecord,
   StoryboardGenerationStatus,
   StoryboardLanguage,
+  StoryboardSceneCaptions,
   StoryboardSceneVoiceover,
   StoryboardStyle,
   StoryboardTargetDuration,
@@ -64,6 +71,16 @@ import {
   validateStoryboardInvariants,
   VOICEOVER_PREFERENCE_OPTIONS,
 } from "../utils/storyboard";
+import {
+  buildAudioTranscriptionCaptionsRecord,
+  computeCaptionFingerprint,
+  computeStoryboardCaptionsSummary,
+  evaluateSceneCaptionsReadiness,
+  generateScriptCaptionsForScene,
+  getDefaultCaptionSettings,
+  resolveEffectiveCaptionLanguage,
+  roundTo3,
+} from "../utils/storyboardCaptions";
 import {
   autoMatchStoryboardScenes,
   computeStoryboardMediaSummary,
@@ -148,16 +165,44 @@ export function AiGeneratorPage() {
   });
   const [activeAudioSceneId, setActiveAudioSceneId] = useState<string | null>(null);
 
+  const [captionsStatus, setCaptionsStatus] = useState<CaptionsStatusInfo | null>(null);
+  const [captionsLoading, setCaptionsLoading] = useState(false);
+  const [captionsError, setCaptionsError] = useState<string | null>(null);
+  const [generatingCaptionSceneIds, setGeneratingCaptionSceneIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [captionBatchState, setCaptionBatchState] = useState<{
+    active: boolean;
+    mode: CaptionGenerationMode;
+    currentSceneId: string | null;
+    completedCount: number;
+    totalCount: number;
+    statusMessage: string | null;
+  }>({
+    active: false,
+    mode: "script",
+    currentSceneId: null,
+    completedCount: 0,
+    totalCount: 0,
+    statusMessage: null,
+  });
+
   const abortControllerRef = useRef<AbortController | null>(null);
   const mediaPrepAbortRef = useRef<AbortController | null>(null);
   const activeVoiceoverJobsRef = useRef<
     Map<string, { controller: AbortController; clientJobId: string }>
   >(new Map());
   const batchVoiceoverCancelRef = useRef<{ cancelled: boolean } | null>(null);
+  const activeCaptionJobsRef = useRef<
+    Map<string, { controller: AbortController; clientJobId: string }>
+  >(new Map());
+  const batchCaptionCancelRef = useRef<{ cancelled: boolean } | null>(null);
   const storyboardRef = useRef<VideoStoryboard | null>(storyboard);
   storyboardRef.current = storyboard;
   const generatingSceneIdsRef = useRef<Set<string>>(generatingVoiceoverSceneIds);
   generatingSceneIdsRef.current = generatingVoiceoverSceneIds;
+  const generatingCaptionSceneIdsRef = useRef<Set<string>>(generatingCaptionSceneIds);
+  generatingCaptionSceneIdsRef.current = generatingCaptionSceneIds;
   const inFlightRef = useRef(false);
   const draftScopeKey = sessionUser.id || "local";
 
@@ -176,6 +221,15 @@ export function AiGeneratorPage() {
         void cancelTtsJob(entry.clientJobId, { keepalive: true });
       }
       activeVoiceoverJobsRef.current.clear();
+
+      if (batchCaptionCancelRef.current) {
+        batchCaptionCancelRef.current.cancelled = true;
+      }
+      for (const entry of activeCaptionJobsRef.current.values()) {
+        entry.controller.abort();
+        void cancelCaptionJob(entry.clientJobId, { keepalive: true });
+      }
+      activeCaptionJobsRef.current.clear();
     };
   }, []);
 
@@ -248,6 +302,28 @@ export function AiGeneratorPage() {
     void loadTtsCapabilities();
   }, [loadTtsCapabilities]);
 
+  const loadCaptionsCapabilities = useCallback(async () => {
+    if (!isAuthenticated) {
+      setCaptionsStatus(null);
+      setCaptionsError(null);
+      return;
+    }
+    setCaptionsLoading(true);
+    setCaptionsError(null);
+    const res = await fetchCaptionsStatus();
+    setCaptionsLoading(false);
+    if (res.ok && res.data) {
+      setCaptionsStatus(res.data);
+    } else {
+      setCaptionsStatus(null);
+      setCaptionsError(res.error || "Unable to inspect local faster-whisper caption status.");
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    void loadCaptionsCapabilities();
+  }, [loadCaptionsCapabilities]);
+
   // Keep isolated local draft synced whenever user edits an existing storyboard
   const handleStoryboardChange = useCallback(
     (next: VideoStoryboard) => {
@@ -259,6 +335,11 @@ export function AiGeneratorPage() {
           mediaAssets,
           !idbHydrating,
           generatingSceneIdsRef.current
+        ),
+        captionSummary: computeStoryboardCaptionsSummary(
+          next,
+          mediaAssets,
+          generatingCaptionSceneIdsRef.current
         ),
       };
       storyboardRef.current = withSummary;
@@ -1016,6 +1097,454 @@ export function AiGeneratorPage() {
     [idbHydrating, mediaAssets, synthesizeSceneVoiceover]
   );
 
+  const handleGenerateSceneScriptCaptions = useCallback(
+    (sceneId: string) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene) return;
+      const assetsById = new Map(mediaAssets.map((a) => [a.id, a]));
+      const voiceoverAsset = targetScene.voiceover?.mediaAssetId
+        ? assetsById.get(targetScene.voiceover.mediaAssetId) ?? null
+        : null;
+      const effectiveSettings = current.captionSettings ?? getDefaultCaptionSettings(current);
+      const record = generateScriptCaptionsForScene({
+        scene: targetScene,
+        storyboard: current,
+        voiceoverAsset,
+        maxLines: effectiveSettings.style.maxLines,
+      });
+
+      handleStoryboardChange({
+        ...current,
+        captionSettings: current.captionSettings ?? effectiveSettings,
+        scenes: current.scenes.map((s) =>
+          s.id === sceneId ? { ...s, captions: record } : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [handleStoryboardChange, mediaAssets]
+  );
+
+  const transcribeSceneAudioCaptions = useCallback(
+    async (sceneId: string): Promise<"ready" | "cancelled" | "failed" | "skipped"> => {
+      const current = storyboardRef.current;
+      if (!current) return "failed";
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene) return "failed";
+
+      const storyboardIdSnapshot = current.id;
+      const narrationSnapshot = targetScene.narration;
+      const vo = targetScene.voiceover;
+      const assetsById = new Map(mediaAssets.map((a) => [a.id, a]));
+      const voiceoverAsset = vo?.mediaAssetId ? assetsById.get(vo.mediaAssetId) ?? null : null;
+
+      if (!vo?.mediaAssetId || !voiceoverAsset || !voiceoverAsset.sourceFile) {
+        return "skipped";
+      }
+
+      if (activeCaptionJobsRef.current.has(sceneId)) {
+        return "skipped";
+      }
+
+      const effectiveSettings = current.captionSettings ?? getDefaultCaptionSettings(current);
+      const effectiveLang = resolveEffectiveCaptionLanguage(current);
+      const clientJobId = `cap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const controller = new AbortController();
+      activeCaptionJobsRef.current.set(sceneId, { controller, clientJobId });
+
+      setGeneratingCaptionSceneIds((prev) => {
+        const next = new Set(prev);
+        next.add(sceneId);
+        return next;
+      });
+
+      try {
+        const res = await generateAudioCaptions(voiceoverAsset.sourceFile, {
+          filename: voiceoverAsset.name || `voiceover_${sceneId}.wav`,
+          language: effectiveLang,
+          wordTimestamps: effectiveSettings.wordTimestamps,
+          clientJobId,
+          sceneId,
+          storyboardId: storyboardIdSnapshot,
+          signal: controller.signal,
+        });
+
+        const latest = storyboardRef.current;
+        if (!latest || latest.id !== storyboardIdSnapshot) {
+          return "cancelled";
+        }
+
+        if (res.cancelled || res.status === 499) {
+          return "cancelled";
+        }
+
+        const latestScene = latest.scenes.find((s) => s.id === sceneId);
+        if (!latestScene) {
+          return "cancelled";
+        }
+
+        if (!res.ok || !res.data) {
+          const failedRecord: StoryboardSceneCaptions = {
+            sceneId,
+            mode: "audio",
+            timingSource: "audio_transcription",
+            language: effectiveLang,
+            status: "failed",
+            segments: latestScene.captions?.segments ?? [],
+            fingerprint: computeCaptionFingerprint({
+              narration: narrationSnapshot,
+              mode: "audio",
+              language: effectiveLang,
+              voiceoverMediaAssetId: vo.mediaAssetId,
+              voiceoverNarrationFingerprint: vo.narrationFingerprint,
+              sceneDurationSec: latestScene.duration,
+              usedVoiceoverDuration: true,
+            }),
+            sourceNarrationSnapshot: narrationSnapshot,
+            sourceVoiceoverMediaAssetId: vo.mediaAssetId,
+            generatedAt: new Date().toISOString(),
+            hasManualEdits: latestScene.captions?.hasManualEdits ?? false,
+            errorMessage: res.error || "Audio caption transcription failed.",
+          };
+          handleStoryboardChange({
+            ...latest,
+            scenes: latest.scenes.map((s) =>
+              s.id === sceneId ? { ...s, captions: failedRecord } : s
+            ),
+            updatedAt: new Date().toISOString(),
+          });
+          return "failed";
+        }
+
+        const nextRecord = buildAudioTranscriptionCaptionsRecord({
+          scene: latestScene,
+          storyboard: latest,
+          narrationSnapshot,
+          effectiveLang,
+          voiceoverAssetId: vo.mediaAssetId,
+          voiceoverFingerprint: vo.narrationFingerprint,
+          transcription: res.data,
+        });
+
+        handleStoryboardChange({
+          ...latest,
+          captionSettings: latest.captionSettings ?? effectiveSettings,
+          scenes: latest.scenes.map((s) =>
+            s.id === sceneId ? { ...s, captions: nextRecord } : s
+          ),
+          updatedAt: new Date().toISOString(),
+        });
+        return "ready";
+      } finally {
+        activeCaptionJobsRef.current.delete(sceneId);
+        setGeneratingCaptionSceneIds((prev) => {
+          const next = new Set(prev);
+          next.delete(sceneId);
+          return next;
+        });
+      }
+    },
+    [handleStoryboardChange, mediaAssets]
+  );
+
+  const handleCancelSceneCaptions = useCallback((sceneId: string) => {
+    const active = activeCaptionJobsRef.current.get(sceneId);
+    if (!active) return;
+    active.controller.abort();
+    void cancelCaptionJob(active.clientJobId);
+  }, []);
+
+  const handleUpdateSceneCaptionSegments = useCallback(
+    (sceneId: string, nextSegments: StoryboardCaptionSegment[]) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene) return;
+
+      const effectiveSettings = current.captionSettings ?? getDefaultCaptionSettings(current);
+      const effectiveLang = resolveEffectiveCaptionLanguage(current);
+      const existing = targetScene.captions;
+      const assetsById = new Map(mediaAssets.map((a) => [a.id, a]));
+      const voiceoverAsset = targetScene.voiceover?.mediaAssetId
+        ? assetsById.get(targetScene.voiceover.mediaAssetId) ?? null
+        : null;
+      const usedVoDuration = Boolean(
+        targetScene.voiceover?.status === "ready" && targetScene.voiceover?.mediaAssetId
+      );
+
+      const baseFingerprint =
+        existing?.fingerprint ||
+        computeCaptionFingerprint({
+          narration: targetScene.narration,
+          mode: existing?.mode ?? "script",
+          language: effectiveLang,
+          voiceoverMediaAssetId: voiceoverAsset?.id ?? targetScene.voiceover?.mediaAssetId,
+          voiceoverNarrationFingerprint: targetScene.voiceover?.narrationFingerprint,
+          sceneDurationSec: targetScene.duration,
+          usedVoiceoverDuration: usedVoDuration,
+        });
+
+      const nextCaptions: StoryboardSceneCaptions = {
+        sceneId,
+        mode: existing?.mode ?? "script",
+        timingSource:
+          existing?.timingSource === "audio_transcription"
+            ? "audio_transcription"
+            : nextSegments.length > 0
+              ? "manual"
+              : "estimated",
+        language: existing?.language ?? effectiveLang,
+        status: nextSegments.length > 0 ? "ready" : "none",
+        segments: nextSegments,
+        fingerprint: baseFingerprint,
+        sourceNarrationSnapshot: existing?.sourceNarrationSnapshot ?? targetScene.narration,
+        ...(existing?.sourceVoiceoverMediaAssetId
+          ? { sourceVoiceoverMediaAssetId: existing.sourceVoiceoverMediaAssetId }
+          : {}),
+        ...(existing?.model ? { model: existing.model } : {}),
+        ...(existing?.detectedLanguage ? { detectedLanguage: existing.detectedLanguage } : {}),
+        generatedAt: existing?.generatedAt ?? new Date().toISOString(),
+        hasManualEdits: true,
+        overflowsSceneDuration:
+          nextSegments.length > 0
+            ? Math.max(...nextSegments.map((s) => s.end)) > targetScene.duration + 0.15
+            : false,
+      };
+
+      handleStoryboardChange({
+        ...current,
+        captionSettings: current.captionSettings ?? effectiveSettings,
+        scenes: current.scenes.map((s) =>
+          s.id === sceneId ? { ...s, captions: nextCaptions } : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [handleStoryboardChange, mediaAssets]
+  );
+
+  const handleRemoveSceneCaptions = useCallback(
+    (sceneId: string) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      if (activeAudioSceneId === `cap:${sceneId}`) {
+        setActiveAudioSceneId(null);
+      }
+      handleStoryboardChange({
+        ...current,
+        scenes: current.scenes.map((s) =>
+          s.id === sceneId ? { ...s, captions: undefined } : s
+        ),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [activeAudioSceneId, handleStoryboardChange]
+  );
+
+  const handleTrimSceneCaptionsToDuration = useCallback(
+    (sceneId: string) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const targetScene = current.scenes.find((s) => s.id === sceneId);
+      if (!targetScene?.captions) return;
+
+      const maxEnd = roundTo3(targetScene.duration);
+      const clampedSegments = targetScene.captions.segments
+        .filter((seg) => seg.start < maxEnd - 0.05)
+        .map((seg) => ({
+          ...seg,
+          end: Math.min(maxEnd, seg.end),
+          isManuallyEdited: true,
+        }))
+        .filter((seg) => seg.end > seg.start);
+
+      handleUpdateSceneCaptionSegments(sceneId, clampedSegments);
+    },
+    [handleUpdateSceneCaptionSegments]
+  );
+
+  const handleCancelCaptionBatch = useCallback(() => {
+    if (batchCaptionCancelRef.current) {
+      batchCaptionCancelRef.current.cancelled = true;
+    }
+    for (const entry of activeCaptionJobsRef.current.values()) {
+      entry.controller.abort();
+      void cancelCaptionJob(entry.clientJobId);
+    }
+    setCaptionBatchState((prev) => ({
+      ...prev,
+      active: false,
+      currentSceneId: null,
+      statusMessage: "Batch caption generation cancelled. Completed scenes were preserved.",
+    }));
+  }, []);
+
+  const handleClearAllCaptions = useCallback(() => {
+    const current = storyboardRef.current;
+    if (!current) return;
+    if (activeAudioSceneId?.startsWith("cap:")) {
+      setActiveAudioSceneId(null);
+    }
+    handleStoryboardChange({
+      ...current,
+      scenes: current.scenes.map((s) => ({ ...s, captions: undefined })),
+      updatedAt: new Date().toISOString(),
+    });
+    setCaptionBatchState({
+      active: false,
+      mode: current.captionSettings?.defaultMode ?? "script",
+      currentSceneId: null,
+      completedCount: 0,
+      totalCount: 0,
+      statusMessage: "Cleared caption cues across all scenes.",
+    });
+  }, [activeAudioSceneId, handleStoryboardChange]);
+
+  const handleGenerateBatchCaptions = useCallback(
+    async (filterMode: "missing_or_stale" | "all", mode: CaptionGenerationMode) => {
+      const current = storyboardRef.current;
+      if (!current) return;
+      const assetsById = new Map(mediaAssets.map((a) => [a.id, a]));
+      const effectiveSettings = current.captionSettings ?? getDefaultCaptionSettings(current);
+
+      const targetScenes = current.scenes.slice(0, MAX_STORYBOARD_SCENES).filter((scene) => {
+        const evalRes = evaluateSceneCaptionsReadiness(scene, current, assetsById);
+        if (!evalRes.hasNarration) return false;
+        if (filterMode === "all") return true;
+        return evalRes.status === "none" || evalRes.status === "stale" || evalRes.status === "failed";
+      });
+
+      if (targetScenes.length === 0) {
+        setCaptionBatchState({
+          active: false,
+          mode,
+          currentSceneId: null,
+          completedCount: 0,
+          totalCount: 0,
+          statusMessage: "All spoken scenes already have up-to-date captions.",
+        });
+        return;
+      }
+
+      if (mode === "script") {
+        let nextScenes = [...current.scenes];
+        let generatedCount = 0;
+        const targetIdSet = new Set(targetScenes.map((s) => s.id));
+        nextScenes = nextScenes.map((scene) => {
+          if (!targetIdSet.has(scene.id)) return scene;
+          const voAsset = scene.voiceover?.mediaAssetId
+            ? assetsById.get(scene.voiceover.mediaAssetId) ?? null
+            : null;
+          generatedCount += 1;
+          return {
+            ...scene,
+            captions: generateScriptCaptionsForScene({
+              scene,
+              storyboard: current,
+              voiceoverAsset: voAsset,
+              maxLines: effectiveSettings.style.maxLines,
+            }),
+          };
+        });
+
+        handleStoryboardChange({
+          ...current,
+          captionSettings: current.captionSettings ?? effectiveSettings,
+          scenes: nextScenes,
+          updatedAt: new Date().toISOString(),
+        });
+        setCaptionBatchState({
+          active: false,
+          mode: "script",
+          currentSceneId: null,
+          completedCount: generatedCount,
+          totalCount: generatedCount,
+          statusMessage: `Generated script-estimated captions for ${generatedCount} scene(s) locally.`,
+        });
+        return;
+      }
+
+      // Sequential local Whisper transcription (bounded concurrency = 1)
+      if (batchCaptionCancelRef.current?.cancelled === false) return;
+      const eligibleIds = targetScenes
+        .filter((s) => {
+          const asset = s.voiceover?.mediaAssetId
+            ? assetsById.get(s.voiceover.mediaAssetId)
+            : undefined;
+          return Boolean(asset && asset.kind === "audio" && asset.sourceFile);
+        })
+        .map((s) => s.id);
+
+      if (eligibleIds.length === 0) {
+        setCaptionBatchState({
+          active: false,
+          mode: "audio",
+          currentSceneId: null,
+          completedCount: 0,
+          totalCount: 0,
+          statusMessage:
+            "None of the target scenes have ready voiceover audio in IndexedDB yet. Synthesize voiceovers or switch to Script Timing.",
+        });
+        return;
+      }
+
+      const batchToken = { cancelled: false };
+      batchCaptionCancelRef.current = batchToken;
+      setCaptionBatchState({
+        active: true,
+        mode: "audio",
+        currentSceneId: eligibleIds[0],
+        completedCount: 0,
+        totalCount: eligibleIds.length,
+        statusMessage: `Transcribing scene voiceover audio with faster-whisper (0/${eligibleIds.length})...`,
+      });
+
+      let readyCount = 0;
+      let failedCount = 0;
+
+      for (let i = 0; i < eligibleIds.length; i += 1) {
+        if (batchToken.cancelled) break;
+        const sid = eligibleIds[i];
+        setCaptionBatchState({
+          active: true,
+          mode: "audio",
+          currentSceneId: sid,
+          completedCount: i,
+          totalCount: eligibleIds.length,
+          statusMessage: `Transcribing scene ${i + 1} of ${eligibleIds.length}...`,
+        });
+
+        const resStatus = await transcribeSceneAudioCaptions(sid);
+        if (resStatus === "cancelled" || batchToken.cancelled) {
+          break;
+        }
+        if (resStatus === "ready") {
+          readyCount += 1;
+        } else if (resStatus === "failed") {
+          failedCount += 1;
+        }
+      }
+
+      const wasCancelled = batchToken.cancelled;
+      batchCaptionCancelRef.current = null;
+      setCaptionBatchState({
+        active: false,
+        mode: "audio",
+        currentSceneId: null,
+        completedCount: readyCount,
+        totalCount: eligibleIds.length,
+        statusMessage: wasCancelled
+          ? `Audio caption batch cancelled (${readyCount} scene(s) preserved).`
+          : failedCount > 0
+            ? `Transcribed ${readyCount}/${eligibleIds.length} scene(s); ${failedCount} failed.`
+            : `Transcribed ${readyCount} scene(s) from local voiceover audio via faster-whisper.`,
+      });
+    },
+    [handleStoryboardChange, mediaAssets, transcribeSceneAudioCaptions]
+  );
+
   const clientValidation = useMemo(() => {
     const payload: VideoGenerationRequest = {
       mode,
@@ -1229,10 +1758,16 @@ export function AiGeneratorPage() {
       !idbHydrating,
       generatingSceneIdsRef.current
     );
+    const capSummary = computeStoryboardCaptionsSummary(
+      storyboard,
+      mediaAssets,
+      generatingCaptionSceneIdsRef.current
+    );
     const updatedStoryboard: VideoStoryboard = {
       ...storyboard,
       mediaReadinessSummary: summary,
       voiceoverSummary: voSummary,
+      captionSummary: capSummary,
       updatedAt: new Date().toISOString(),
     };
 
@@ -1295,6 +1830,13 @@ export function AiGeneratorPage() {
     if (batchVoiceoverCancelRef.current) {
       batchVoiceoverCancelRef.current.cancelled = true;
     }
+    if (batchCaptionCancelRef.current) {
+      batchCaptionCancelRef.current.cancelled = true;
+    }
+    for (const entry of activeCaptionJobsRef.current.values()) {
+      entry.controller.abort();
+      void cancelCaptionJob(entry.clientJobId);
+    }
     setStoryboard(draft.storyboard);
     setActiveServerDraftId(serverId || null);
     setGenerationStatus("ready");
@@ -1334,8 +1876,23 @@ export function AiGeneratorPage() {
     if (batchVoiceoverCancelRef.current) {
       batchVoiceoverCancelRef.current.cancelled = true;
     }
+    if (batchCaptionCancelRef.current) {
+      batchCaptionCancelRef.current.cancelled = true;
+    }
+    for (const entry of activeCaptionJobsRef.current.values()) {
+      entry.controller.abort();
+      void cancelCaptionJob(entry.clientJobId);
+    }
     setVoiceoverBatchState({
       active: false,
+      currentSceneId: null,
+      completedCount: 0,
+      totalCount: 0,
+      statusMessage: null,
+    });
+    setCaptionBatchState({
+      active: false,
+      mode: "script",
       currentSceneId: null,
       completedCount: 0,
       totalCount: 0,
@@ -1360,7 +1917,8 @@ export function AiGeneratorPage() {
             </h1>
             <p className="mt-1 text-sm text-zinc-400 max-w-3xl">
               Plan structured video scripts, match scene visual media, synthesize offline local
-              voiceovers, and prepare drafts for Phase 5.5.4+ FFmpeg composition.
+              voiceovers, edit styled captions / SRT / WebVTT subtitles, and prepare drafts for
+              Phase 5.5.5 FFmpeg composition.
             </p>
           </div>
 
@@ -1700,7 +2258,7 @@ export function AiGeneratorPage() {
                       ))}
                     </select>
                     <p className="text-[11px] text-zinc-500">
-                      Caption timing from synthesized voiceovers arrives in Phase 5.5.4+.
+                      Initial caption preset hint; edit timed cues &amp; export SRT/VTT below.
                     </p>
                   </div>
                 </div>
@@ -1876,6 +2434,28 @@ export function AiGeneratorPage() {
                 onRegenerateAllVoiceovers={() => void handleGenerateBatchVoiceovers("all")}
                 onCancelVoiceoverBatch={handleCancelVoiceoverBatch}
                 onClearAllVoiceovers={handleClearAllVoiceovers}
+                captionsStatus={captionsStatus}
+                captionsLoading={captionsLoading}
+                captionsError={captionsError}
+                generatingCaptionSceneIds={generatingCaptionSceneIds}
+                captionBatchState={captionBatchState}
+                onRefreshCaptionsStatus={() => void loadCaptionsCapabilities()}
+                onGenerateSceneScriptCaptions={handleGenerateSceneScriptCaptions}
+                onTranscribeSceneAudioCaptions={(sceneId) =>
+                  void transcribeSceneAudioCaptions(sceneId)
+                }
+                onCancelSceneCaptions={handleCancelSceneCaptions}
+                onUpdateSceneCaptionSegments={handleUpdateSceneCaptionSegments}
+                onRemoveSceneCaptions={handleRemoveSceneCaptions}
+                onTrimSceneCaptionsToDuration={handleTrimSceneCaptionsToDuration}
+                onGenerateMissingOrStaleCaptions={(targetMode) =>
+                  void handleGenerateBatchCaptions("missing_or_stale", targetMode)
+                }
+                onRegenerateAllCaptions={(targetMode) =>
+                  void handleGenerateBatchCaptions("all", targetMode)
+                }
+                onCancelCaptionBatch={handleCancelCaptionBatch}
+                onClearAllCaptions={handleClearAllCaptions}
               />
             ) : (
               generationStatus !== "generating" && (

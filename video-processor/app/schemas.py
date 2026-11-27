@@ -157,3 +157,48 @@ class TtsGenerateRequest(BaseModel):
     format: Literal["wav", "mp3"] = "wav"
     client_job_id: Optional[str] = Field(default=None, max_length=64)
 
+
+class CaptionWordTimestamp(BaseModel):
+    word: str
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+
+
+class CaptionSegmentItem(BaseModel):
+    id: int = Field(ge=1)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    text: str
+    words: Optional[list[CaptionWordTimestamp]] = None
+
+
+class AudioCaptionsStatusResponse(BaseModel):
+    enabled: bool = True
+    script_mode_available: bool = True
+    audio_transcription_available: bool
+    faster_whisper_installed: bool
+    local_model_ready: bool
+    local_files_only: bool
+    model: str
+    device: str
+    compute_type: str
+    max_audio_mb: int
+    max_duration_sec: float
+    max_concurrent_jobs: int
+    supported_languages: list[str]
+    message: str
+
+
+class AudioCaptionsGenerateResponse(BaseModel):
+    status: Literal["completed"] = "completed"
+    job_id: str
+    model: str
+    language: str
+    language_probability: float = Field(ge=0, le=1)
+    duration_seconds: float = Field(ge=0)
+    word_timestamps_included: bool = False
+    segments: list[CaptionSegmentItem]
+    srt: str
+    vtt: str
+
+

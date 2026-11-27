@@ -569,6 +569,125 @@ export interface StoryboardVoiceoverSummary {
   isVoiceoverReady: boolean;
 }
 
+export type CaptionGenerationMode = "script" | "audio";
+export type CaptionTimingSource = "estimated" | "audio_transcription" | "manual";
+export type SceneCaptionStatus =
+  | "none"
+  | "queued"
+  | "generating"
+  | "ready"
+  | "stale"
+  | "failed"
+  | "skipped_empty";
+export type CaptionStylePresetId =
+  | "classic"
+  | "cinematic"
+  | "educational"
+  | "social_media"
+  | "minimal"
+  | "yellow_highlight";
+
+export interface CaptionStyleConfig {
+  presetId: CaptionStylePresetId;
+  enabled: boolean;
+  fontFamily: string;
+  fontSize: number;
+  fontWeight: 400 | 500 | 600 | 700 | 800;
+  color: string;
+  backgroundEnabled: boolean;
+  backgroundColor: string;
+  backgroundOpacity: number;
+  outlineWidth: number;
+  outlineColor: string;
+  position: "top" | "middle" | "bottom";
+  alignment: "left" | "center" | "right";
+  safeMarginBottomPct: number;
+  maxLines: 1 | 2 | 3;
+}
+
+export interface StoryboardCaptionWordTimestamp {
+  word: string;
+  start: number;
+  end: number;
+}
+
+export interface StoryboardCaptionSegment {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  timingSource: CaptionTimingSource;
+  words?: StoryboardCaptionWordTimestamp[];
+  isManuallyEdited?: boolean;
+  confidence?: number;
+}
+
+export interface StoryboardSceneCaptions {
+  sceneId: string;
+  mode: CaptionGenerationMode;
+  timingSource: CaptionTimingSource;
+  language: TtsLanguageCode;
+  status: SceneCaptionStatus;
+  segments: StoryboardCaptionSegment[];
+  fingerprint: string;
+  sourceNarrationSnapshot: string;
+  sourceVoiceoverMediaAssetId?: string;
+  sourceVoiceoverDurationSec?: number;
+  sourceSceneDurationSec?: number;
+  model?: string;
+  detectedLanguage?: string;
+  languageProbability?: number;
+  generatedAt: string;
+  hasManualEdits?: boolean;
+  overflowsSceneDuration?: boolean;
+  warnings?: string[];
+  errorMessage?: string;
+}
+
+export interface StoryboardCaptionSettings {
+  enabled: boolean;
+  defaultMode: CaptionGenerationMode;
+  language: "match_storyboard" | TtsLanguageCode;
+  wordTimestamps: boolean;
+  style: CaptionStyleConfig;
+}
+
+export interface StoryboardCaptionSummary {
+  totalScenes: number;
+  captionableScenes: number;
+  readyCount: number;
+  staleCount: number;
+  failedCount: number;
+  unassignedCount: number;
+  manualCount: number;
+  overflowCount: number;
+  totalCueCount: number;
+  estimatedCount: number;
+  transcribedCount: number;
+  progressPercent: number;
+  isCaptionsReady: boolean;
+}
+
+export interface CaptionsStatusInfo {
+  enabled: boolean;
+  defaultMode: CaptionGenerationMode;
+  scriptModeAvailable: boolean;
+  audioTranscriptionAvailable: boolean;
+  fasterWhisperInstalled: boolean;
+  localModelReady: boolean;
+  localFilesOnly: boolean;
+  model: string | null;
+  device: string;
+  computeType: string;
+  maxAudioMb: number;
+  maxDurationSec: number;
+  maxConcurrentJobs: number;
+  maxSegmentsPerScene: number;
+  maxBatchScenes: number;
+  supportedLanguages: TtsLanguageCode[];
+  message: string;
+}
+
 export interface StoryboardScene {
   id: string;
   title: string;
@@ -584,6 +703,7 @@ export interface StoryboardScene {
   cameraMotion: StoryboardCameraMotion;
   mediaAssignment?: StoryboardSceneMediaAssignment;
   voiceover?: StoryboardSceneVoiceover;
+  captions?: StoryboardSceneCaptions;
 }
 
 export interface VideoStoryboard {
@@ -606,6 +726,8 @@ export interface VideoStoryboard {
   mediaReadinessSummary?: StoryboardMediaSummary;
   voiceoverSettings?: StoryboardVoiceoverSettings;
   voiceoverSummary?: StoryboardVoiceoverSummary;
+  captionSettings?: StoryboardCaptionSettings;
+  captionSummary?: StoryboardCaptionSummary;
   createdAt: string;
   updatedAt: string;
 }

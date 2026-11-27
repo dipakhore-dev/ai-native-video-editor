@@ -23,10 +23,13 @@ import {
 import type { StockSearchItemDto } from "../../services/api";
 import type {
   AspectRatioHandlingMode,
+  CaptionGenerationMode,
+  CaptionsStatusInfo,
   EffectPreset,
   GeneratedSlideConfig,
   MediaAsset,
   StoryboardCameraMotion,
+  StoryboardCaptionSegment,
   StoryboardMediaType,
   StoryboardScene,
   StoryboardVoiceoverSettings,
@@ -52,6 +55,11 @@ import {
   VOICEOVER_PREFERENCE_OPTIONS,
 } from "../../utils/storyboard";
 import {
+  computeStoryboardCaptionsSummary,
+  evaluateSceneCaptionsReadiness,
+  getDefaultCaptionSettings,
+} from "../../utils/storyboardCaptions";
+import {
   clampVideoSourceStartTime,
   computeStoryboardMediaSummary,
   evaluateSceneMediaReadiness,
@@ -62,8 +70,10 @@ import {
   normalizeTtsLanguage,
 } from "../../utils/storyboardVoiceover";
 import { MediaPickerModal } from "./MediaPickerModal";
+import { SceneCaptionCard } from "./SceneCaptionCard";
 import { SceneVoiceoverCard } from "./SceneVoiceoverCard";
 import { SlideGeneratorModal } from "./SlideGeneratorModal";
+import { StoryboardCaptionPrepSection } from "./StoryboardCaptionPrepSection";
 import { StoryboardMediaPrepSection } from "./StoryboardMediaPrepSection";
 import { StoryboardVoiceoverPrepSection } from "./StoryboardVoiceoverPrepSection";
 
@@ -127,6 +137,29 @@ interface StoryboardReviewPanelProps {
   onRegenerateAllVoiceovers?: () => void;
   onCancelVoiceoverBatch?: () => void;
   onClearAllVoiceovers?: () => void;
+  captionsStatus?: CaptionsStatusInfo | null;
+  captionsLoading?: boolean;
+  captionsError?: string | null;
+  generatingCaptionSceneIds?: Set<string>;
+  captionBatchState?: {
+    active: boolean;
+    mode: CaptionGenerationMode;
+    currentSceneId: string | null;
+    completedCount: number;
+    totalCount: number;
+    statusMessage: string | null;
+  };
+  onRefreshCaptionsStatus?: () => void;
+  onGenerateSceneScriptCaptions?: (sceneId: string) => void;
+  onTranscribeSceneAudioCaptions?: (sceneId: string) => void;
+  onCancelSceneCaptions?: (sceneId: string) => void;
+  onUpdateSceneCaptionSegments?: (sceneId: string, nextSegments: StoryboardCaptionSegment[]) => void;
+  onRemoveSceneCaptions?: (sceneId: string) => void;
+  onTrimSceneCaptionsToDuration?: (sceneId: string) => void;
+  onGenerateMissingOrStaleCaptions?: (mode: CaptionGenerationMode) => void;
+  onRegenerateAllCaptions?: (mode: CaptionGenerationMode) => void;
+  onCancelCaptionBatch?: () => void;
+  onClearAllCaptions?: () => void;
 }
 
 function formatClockRange(start: number, duration: number): string {
@@ -198,6 +231,29 @@ export function StoryboardReviewPanel({
   onRegenerateAllVoiceovers,
   onCancelVoiceoverBatch,
   onClearAllVoiceovers,
+  captionsStatus = null,
+  captionsLoading = false,
+  captionsError = null,
+  generatingCaptionSceneIds,
+  captionBatchState = {
+    active: false,
+    mode: "script",
+    currentSceneId: null,
+    completedCount: 0,
+    totalCount: 0,
+    statusMessage: null,
+  },
+  onRefreshCaptionsStatus,
+  onGenerateSceneScriptCaptions,
+  onTranscribeSceneAudioCaptions,
+  onCancelSceneCaptions,
+  onUpdateSceneCaptionSegments,
+  onRemoveSceneCaptions,
+  onTrimSceneCaptionsToDuration,
+  onGenerateMissingOrStaleCaptions,
+  onRegenerateAllCaptions,
+  onCancelCaptionBatch,
+  onClearAllCaptions,
 }: StoryboardReviewPanelProps) {
   const [keywordsDraftById, setKeywordsDraftById] = useState<Record<string, string>>({});
   const [overwriteManual, setOverwriteManual] = useState(false);
@@ -252,6 +308,21 @@ export function StoryboardReviewPanel({
     [storyboard, mediaAssets, idbHydrating, generatingVoiceoverSceneIds]
   );
 
+  const captionSummary = useMemo(
+    () =>
+      computeStoryboardCaptionsSummary(
+        storyboard,
+        mediaAssets,
+        generatingCaptionSceneIds
+      ),
+    [storyboard, mediaAssets, generatingCaptionSceneIds]
+  );
+
+  const effectiveCaptionSettings = useMemo(
+    () => storyboard.captionSettings ?? getDefaultCaptionSettings(storyboard),
+    [storyboard]
+  );
+
   const languageCode = normalizeTtsLanguage(storyboard.language);
   const ttsReadyForLang = Boolean(
     ttsStatus?.available && ttsVoices.some((v) => v.language === languageCode)
@@ -289,6 +360,11 @@ export function StoryboardReviewPanel({
         mediaAssets,
         !idbHydrating,
         generatingVoiceoverSceneIds
+      ),
+      captionSummary: computeStoryboardCaptionsSummary(
+        nextStoryboard,
+        mediaAssets,
+        generatingCaptionSceneIds
       ),
       updatedAt: new Date().toISOString(),
     });
@@ -555,6 +631,30 @@ export function StoryboardReviewPanel({
           onClearAllVoiceovers={() => onClearAllVoiceovers?.()}
         />
 
+        {/* Phase 5.5.4 Storyboard Captions & Subtitle Preparation Bar */}
+        <StoryboardCaptionPrepSection
+          storyboard={storyboard}
+          summary={captionSummary}
+          captionsStatus={captionsStatus}
+          captionsLoading={captionsLoading}
+          captionsError={captionsError}
+          isAuthenticated={isAuthenticated}
+          readyVoiceoverCount={voiceoverSummary.readyCount}
+          batchState={captionBatchState}
+          onRefreshCaptionsStatus={() => onRefreshCaptionsStatus?.()}
+          onChangeCaptionSettings={(nextCaptionSettings) =>
+            onChange({
+              ...storyboard,
+              captionSettings: nextCaptionSettings,
+              updatedAt: new Date().toISOString(),
+            })
+          }
+          onGenerateMissingOrStale={(mode) => onGenerateMissingOrStaleCaptions?.(mode)}
+          onRegenerateAll={(mode) => onRegenerateAllCaptions?.(mode)}
+          onCancelBatch={() => onCancelCaptionBatch?.()}
+          onClearAllCaptions={() => onClearAllCaptions?.()}
+        />
+
         {saveStatusMessage && (
           <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs text-emerald-300 flex items-center gap-2">
             <Check className="h-3.5 w-3.5 shrink-0" />
@@ -669,12 +769,13 @@ export function StoryboardReviewPanel({
           <div className="flex items-center gap-2">
             <Film className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
             <span>
-              Phase 5.5.2 prepares visual media and Phase 5.5.3 generates offline voiceover audio.
-              Automatic caption timing from audio and FFmpeg MP4 composition arrive in Phase 5.5.4+.
+              Phase 5.5.2 prepares visual media, Phase 5.5.3 generates offline voiceover audio, and
+              Phase 5.5.4 generates script-estimated or Whisper audio-transcribed captions &amp;
+              SRT/VTT exports. FFmpeg timeline assembly &amp; MP4 rendering arrive in Phase 5.5.5.
             </span>
           </div>
           <span className="font-mono text-[11px] text-zinc-500 whitespace-nowrap">
-            Composition locked until Phase 5.5.4+
+            Composition locked until Phase 5.5.5
           </span>
         </div>
       </div>
@@ -719,6 +820,12 @@ export function StoryboardReviewPanel({
               assetsById,
               !idbHydrating,
               generatingVoiceoverSceneIds
+            );
+            const captionEval = evaluateSceneCaptionsReadiness(
+              scene,
+              storyboard,
+              assetsById,
+              generatingCaptionSceneIds
             );
             const assignment = scene.mediaAssignment;
             const assignedAsset = readiness.asset;
@@ -1130,6 +1237,36 @@ export function StoryboardReviewPanel({
                       el.scrollIntoView({ behavior: "smooth", block: "center" });
                     }
                   }}
+                />
+
+                {/* Scene Caption Editor & Live Preview Card (Phase 5.5.4) */}
+                <SceneCaptionCard
+                  scene={scene}
+                  sceneIndex={index}
+                  storyboard={storyboard}
+                  evaluation={captionEval}
+                  captionStyle={effectiveCaptionSettings.style}
+                  captionsStatus={captionsStatus}
+                  voiceoverAsset={voiceoverEval.asset}
+                  visualThumbSrc={thumbSrc}
+                  isAuthenticated={isAuthenticated}
+                  activeGenerating={Boolean(generatingCaptionSceneIds?.has(scene.id))}
+                  batchActive={captionBatchState.active}
+                  activeAudioSceneId={activeAudioSceneId}
+                  onActivateSceneAudio={(token) => onActivateSceneAudio?.(token)}
+                  onGenerateScriptCaptions={(targetId) => onGenerateSceneScriptCaptions?.(targetId)}
+                  onTranscribeAudioCaptions={(targetId) => onTranscribeSceneAudioCaptions?.(targetId)}
+                  onCancelSceneCaptions={(targetId) => onCancelSceneCaptions?.(targetId)}
+                  onUpdateSceneSegments={(targetId, nextSegs) =>
+                    onUpdateSceneCaptionSegments?.(targetId, nextSegs)
+                  }
+                  onRemoveSceneCaptions={(targetId) => onRemoveSceneCaptions?.(targetId)}
+                  onTrimCuesToSceneDuration={(targetId) =>
+                    onTrimSceneCaptionsToDuration?.(targetId)
+                  }
+                  onAdjustSceneDuration={(targetId, nextDuration) =>
+                    handleScenePatch(targetId, { duration: nextDuration })
+                  }
                 />
 
                 {/* Numeric & Dropdown Parameters */}

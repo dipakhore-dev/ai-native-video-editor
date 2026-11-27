@@ -184,11 +184,11 @@ export function corsAllowlistMiddleware(req: Request, res: Response, next: NextF
     );
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With, X-Export-Job-Id, X-TTS-Job-Id, X-Request-Id"
+      "Content-Type, Authorization, X-Requested-With, X-Export-Job-Id, X-TTS-Job-Id, X-Captions-Job-Id, X-Request-Id"
     );
     res.setHeader(
       "Access-Control-Expose-Headers",
-      "X-Request-Id, X-Video-Job-Id, X-Export-Client-Job-Id, X-Export-Profile, X-Export-Encoder, X-Export-Fallback, Content-Disposition, X-Stock-Provider, X-Stock-Asset-Id, X-Stock-Media-Type, X-Stock-Title, X-Stock-Creator, X-Stock-Attribution-Url, X-Stock-License, X-Stock-Width, X-Stock-Height, X-Stock-Duration, X-TTS-Job-Id, X-TTS-Provider, X-TTS-Voice-Id, X-TTS-Voice-Label, X-TTS-Language, X-TTS-Duration, X-TTS-Sample-Rate, X-TTS-Channels, X-TTS-Format"
+      "X-Request-Id, X-Video-Job-Id, X-Export-Client-Job-Id, X-Export-Profile, X-Export-Encoder, X-Export-Fallback, Content-Disposition, X-Stock-Provider, X-Stock-Asset-Id, X-Stock-Media-Type, X-Stock-Title, X-Stock-Creator, X-Stock-Attribution-Url, X-Stock-License, X-Stock-Width, X-Stock-Height, X-Stock-Duration, X-TTS-Job-Id, X-TTS-Provider, X-TTS-Voice-Id, X-TTS-Voice-Label, X-TTS-Language, X-TTS-Duration, X-TTS-Sample-Rate, X-TTS-Channels, X-TTS-Format, X-Captions-Job-Id"
     );
   }
 

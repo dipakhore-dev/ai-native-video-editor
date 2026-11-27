@@ -218,6 +218,38 @@ Phase 5.5.3 adds offline `en` / `hi` / `bn` voiceover synthesis inside `video-pr
 
 ---
 
+## Free Storyboard Captions & Offline `faster-whisper` Audio Transcription (Phase 5.5.4)
+
+Phase 5.5.4 supports two ₹0 caption workflows:
+- **Script Timing (Default)**: Works instantly inside the browser with zero external services or downloads, allocating cue timing across `voiceover.durationSeconds` (or `scene.duration`).
+- **Audio Transcription (`faster-whisper` on CPU)**: Transcribes local scene voiceover audio via Python FastAPI (`POST /api/v1/captions/generate`).
+
+### Pre-Cache Multilingual Whisper Models Once for Offline Windows Use
+
+`video-processor\.env` defaults to `WHISPER_LOCAL_FILES_ONLY="true"` so CPU requests never stall or trigger surprise multi-hundred-MB downloads. Pre-cache a multilingual model (`small` recommended; avoid `*.en` models so **English**, **Hindi**, and **Bengali** all work) once in PowerShell:
+
+```powershell
+cd video-processor
+.\.venv\Scripts\Activate.ps1
+python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+```
+
+Recommended `video-processor\.env` caption settings for Intel Core i3-1115G4 (8 GB RAM):
+
+```env
+WHISPER_MODEL_SIZE="small"
+WHISPER_DEVICE="cpu"
+WHISPER_COMPUTE_TYPE="int8"
+WHISPER_LOCAL_FILES_ONLY="true"
+CAPTIONS_MAX_AUDIO_MB="20"
+CAPTIONS_MAX_DURATION_SEC="90"
+CAPTIONS_MAX_CONCURRENT_JOBS="1"
+```
+
+*(If you want first-run automatic Hugging Face download instead of pre-caching manually, set `WHISPER_LOCAL_FILES_ONLY="false"`. See `docs/STORYBOARD_CAPTION_GENERATION.md` for preset styling, `.srt`/`.vtt` exports, and Phase 5.5.5 boundaries.)*
+
+---
+
 
 ## Deploying to Production (Linux / Docker / Reverse Proxy)
 
